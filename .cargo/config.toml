@@ -1,0 +1,14 @@
+[build]
+target-dir = "target"
+
+[target.aarch64-unknown-none-softfloat]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=-Tlinker_aarch64.ld"]
+
+[target.aarch64-unknown-none]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=-Tlinker_aarch64.ld"]
+
+[target.riscv64gc-unknown-none-elf]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=-Tlinker_riscv64.ld"]

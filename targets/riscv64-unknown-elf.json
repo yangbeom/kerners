@@ -1,0 +1,11 @@
+{
+    "llvm-target": "riscv64-unknown-elf",
+    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n64-S128",
+    "arch": "riscv64",
+    "os": "none",
+    "vendor": "unknown",
+    "linker": "riscv64-unknown-elf-gcc",
+    "executables": true,
+    "cpu": "generic",
+    "features": ""
+}

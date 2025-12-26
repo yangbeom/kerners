@@ -1,0 +1,212 @@
+#!/bin/bash
+# kerners 빌드 및 QEMU 실행 스크립트
+#
+# QEMU virt 머신은 -kernel 옵션 사용 시 자동으로 DTB를 생성하고
+# 레지스터로 전달합니다:
+#   - aarch64: x0 = DTB 주소
+#   - riscv64: a1 = DTB 주소 (a0 = hartid)
+
+set -e
+
+# 기본값
+ARCH="${1:-aarch64}"
+MEMORY="${2:-512}"
+SMP="${3:-1}"  # CPU/Hart 개수 (기본값 1)
+
+# 색상 출력
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+usage() {
+    echo "Usage: $0 [ARCH] [MEMORY_MB] [SMP]"
+    echo ""
+    echo "Arguments:"
+    echo "  ARCH        Target architecture: aarch64 (default) or riscv64"
+    echo "  MEMORY_MB   Memory size in MB (default: 512)"
+    echo "  SMP         Number of CPUs/Harts (default: 1)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                      # Run aarch64 with 512MB, 1 CPU"
+    echo "  $0 aarch64 256          # Run aarch64 with 256MB, 1 CPU"
+    echo "  $0 aarch64 512 4        # Run aarch64 with 512MB, 4 CPUs"
+    echo "  $0 riscv64              # Run riscv64 with 512MB, 1 Hart"
+    echo "  $0 riscv64 1024 4       # Run riscv64 with 1GB, 4 Harts"
+    exit 1
+}
+
+# 도움말 체크
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    usage
+fi
+
+# 아키텍처별 설정
+case "$ARCH" in
+    aarch64)
+        TARGET="aarch64-unknown-none-softfloat"
+        QEMU="qemu-system-aarch64"
+        QEMU_MACHINE="virt"
+        QEMU_CPU="-cpu cortex-a57"
+        ;;
+    riscv64)
+        TARGET="riscv64gc-unknown-none-elf"
+        QEMU="qemu-system-riscv64"
+        QEMU_MACHINE="virt"
+        QEMU_CPU=""
+        EXTRA_OPTS="-bios none"
+        ;;
+    *)
+        print_error "Unknown architecture: $ARCH"
+        usage
+        ;;
+esac
+
+KERNEL_ELF="target/${TARGET}/release/kerners"
+KERNEL_BIN="target/${TARGET}/release/kerners.bin"
+
+# 커널 빌드
+build_kernel() {
+    print_info "Building kernel for $ARCH..."
+    cargo build --release --target "$TARGET"
+
+    # ELF를 raw binary로 변환 (Linux 부트 헤더가 인식되도록)
+    if [[ "$ARCH" == "aarch64" ]]; then
+        print_info "Converting ELF to raw binary for Linux boot protocol..."
+        ${LLVM_OBJCOPY:-llvm-objcopy} -O binary "$KERNEL_ELF" "$KERNEL_BIN" || \
+        ${OBJCOPY:-objcopy} -O binary "$KERNEL_ELF" "$KERNEL_BIN" || {
+            print_warn "objcopy not found, using ELF (DTB may not work)"
+            KERNEL="$KERNEL_ELF"
+            return 0
+        }
+        KERNEL="$KERNEL_BIN"
+        print_info "Binary image created: $KERNEL"
+    else
+        KERNEL="$KERNEL_ELF"
+        print_info "Build complete: $KERNEL"
+    fi
+}
+
+# 모듈 빌드
+build_modules() {
+    local module_dir="modules/hello"
+    if [[ -d "$module_dir" ]]; then
+        print_info "Building test module for $ARCH..."
+        chmod +x "$module_dir/build.sh"
+        "$module_dir/build.sh" "$ARCH" || {
+            print_warn "Module build failed, skipping..."
+            return 1
+        }
+        print_info "Module build complete"
+        return 0
+    fi
+    return 1
+}
+
+# 커널 빌드 (모듈 임베드 포함)
+build_kernel_with_modules() {
+    print_info "Building kernel with embedded test module for $ARCH..."
+    cargo build --release --target "$TARGET" --features embed_test_module
+
+    # ELF를 raw binary로 변환 (Linux 부트 헤더가 인식되도록)
+    if [[ "$ARCH" == "aarch64" ]]; then
+        print_info "Converting ELF to raw binary for Linux boot protocol..."
+        ${LLVM_OBJCOPY:-llvm-objcopy} -O binary "$KERNEL_ELF" "$KERNEL_BIN" || \
+        ${OBJCOPY:-objcopy} -O binary "$KERNEL_ELF" "$KERNEL_BIN" || {
+            print_warn "objcopy not found, using ELF (DTB may not work)"
+            KERNEL="$KERNEL_ELF"
+            return 0
+        }
+        KERNEL="$KERNEL_BIN"
+        print_info "Binary image created: $KERNEL (with embedded module)"
+    else
+        KERNEL="$KERNEL_ELF"
+        print_info "Build complete: $KERNEL (with embedded module)"
+    fi
+}
+
+# 디스크 이미지 생성 (없으면)
+create_disk_image() {
+    local disk_img="disk.img"
+    local disk_size="32"  # MB
+
+    if [[ ! -f "$disk_img" ]]; then
+        print_info "Creating FAT32 disk image ($disk_img, ${disk_size}MB)..."
+        dd if=/dev/zero of="$disk_img" bs=1M count=$disk_size 2>/dev/null
+
+        # FAT32 포맷 (macOS는 newfs_msdos, Linux는 mkfs.vfat)
+        if command -v mkfs.vfat &>/dev/null; then
+            mkfs.vfat -F 32 "$disk_img" >/dev/null 2>&1
+        elif command -v newfs_msdos &>/dev/null; then
+            newfs_msdos -F 32 "$disk_img" >/dev/null 2>&1
+        else
+            print_warn "Cannot format disk image (no mkfs.vfat or newfs_msdos)"
+        fi
+        print_info "Disk image created: $disk_img"
+    fi
+}
+
+# QEMU 실행
+run_qemu() {
+    print_info "Starting QEMU..."
+    print_info "  Architecture: $ARCH"
+    print_info "  Memory: ${MEMORY}MB"
+    print_info "  CPUs/Harts: $SMP"
+    print_info "  Kernel: $KERNEL"
+    print_info "  DTB: auto-generated by QEMU (passed via register)"
+
+    # VirtIO 블록 디바이스 옵션
+    VIRTIO_BLK=""
+    if [[ -f "disk.img" ]]; then
+        print_info "  Disk: disk.img (VirtIO)"
+        VIRTIO_BLK="-drive file=disk.img,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"
+    fi
+
+    echo ""
+    print_warn "Press Ctrl+A then X to exit QEMU"
+    echo ""
+
+    $QEMU \
+        -machine "$QEMU_MACHINE" \
+        $QEMU_CPU \
+        -smp $SMP \
+        -m ${MEMORY}M \
+        -nographic \
+        ${EXTRA_OPTS:-} \
+        $VIRTIO_BLK \
+        -kernel "$KERNEL"
+}
+
+# 메인 실행
+main() {
+    print_info "=== kerners build & run script ==="
+
+    # 디스크 이미지 생성 (필요시)
+    create_disk_image
+
+    # 모듈 빌드 시도
+    if build_modules; then
+        # 모듈 빌드 성공 시 임베드된 커널 빌드
+        build_kernel_with_modules
+    else
+        # 모듈 없이 기본 커널 빌드
+        build_kernel
+    fi
+    
+    # 실행
+    run_qemu
+}
+
+main
