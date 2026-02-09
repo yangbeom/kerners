@@ -66,6 +66,10 @@ pub fn init() {
     *symbols = Some(list);
 
     crate::kprintln!("[symbol] Kernel symbol table initialized");
+
+    // 테스트 모듈용 심볼 등록
+    drop(symbols); // 쓰기 락 해제 후 등록 (register_symbol이 다시 잠금)
+    super::test_symbols::register_test_symbols();
 }
 
 /// 심볼 조회

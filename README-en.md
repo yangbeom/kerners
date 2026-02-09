@@ -16,6 +16,7 @@ A bare-metal Rust kernel for aarch64 and riscv64 architectures.
 - **VirtIO** — MMIO driver framework with Legacy/Modern auto-detection
 - **IPC** — Message queues (unbounded/bounded), Channel, POSIX mq API
 - **Kernel modules** — Dynamic ELF64 loading with symbol resolution and PLT support
+- **Test infrastructure** — Kernel module-based automated testing, runs in QEMU, `make test` automation
 - **System calls** — Linux-compatible ABI (process/filesystem)
 - **Device Tree** — DTB parsing for runtime hardware discovery
 - **Board support** — Runtime board selection via DTB compatible matching
@@ -26,6 +27,7 @@ A bare-metal Rust kernel for aarch64 and riscv64 architectures.
 
 - Rust stable toolchain (1.93.0+, edition 2024)
 - QEMU (`qemu-system-aarch64` / `qemu-system-riscv64`)
+- mtools (required for tests — `brew install mtools` / `apt install mtools`)
 
 ### Build
 
@@ -55,6 +57,21 @@ cargo build --release --target targets/riscv64-unknown-elf.json
 ./run.sh aarch64 512 4  # 4 cores, 512MB
 ./run.sh riscv64 512 2  # 2 cores, 512MB
 ```
+
+### Testing
+
+```bash
+# aarch64 tests (default)
+make test
+
+# riscv64 tests
+make test ARCH=riscv64
+
+# Both architectures
+make test-all
+```
+
+See [docs/testing.md](docs/testing.md) for details.
 
 ## Shell Commands
 
@@ -104,9 +121,11 @@ kerners/
 │   ├── module/          # Kernel module loader (ELF64)
 │   ├── syscall/         # System call interface
 │   └── dtb/             # Device Tree parsing
-├── modules/             # External kernel modules
+├── modules/             # External kernel modules + test modules
+├── scripts/             # Test build/run scripts
 ├── targets/             # Custom target JSON files
 ├── docs/                # Technical documentation
+├── Makefile             # Build/test targets
 └── run.sh               # Build & run script
 ```
 
@@ -160,6 +179,7 @@ kerners/
 | [docs/console.md](docs/console.md) | Console output |
 | [docs/board-module-system.md](docs/board-module-system.md) | Board module system |
 | [docs/qemu-guide.md](docs/qemu-guide.md) | QEMU execution guide |
+| [docs/testing.md](docs/testing.md) | Test infrastructure |
 
 ### Project Docs
 

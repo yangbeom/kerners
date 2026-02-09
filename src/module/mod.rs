@@ -9,6 +9,7 @@
 pub mod elf;
 pub mod loader;
 pub mod symbol;
+pub mod test_symbols;
 
 pub use elf::{Elf64, Elf64Error};
 pub use loader::{LoadedModule, Module, ModuleError, ModuleInfo, ModuleLoader, ModuleRef, ModuleState};

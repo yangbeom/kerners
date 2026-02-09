@@ -16,6 +16,8 @@ lto = false
 default = []
 # 테스트 모듈을 커널에 임베드 (빌드 시 모듈 파일이 필요)
 embed_test_module = []
+# QEMU 테스트 러너 모드: 셸 대신 테스트 모듈을 자동 로드/실행/리포팅
+test_runner = []
 
 [dependencies]
 linked_list_allocator = "0.10"

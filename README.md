@@ -16,6 +16,7 @@ Rust로 작성된 aarch64/riscv64 베어메탈 커널
 - **VirtIO** — MMIO 드라이버 프레임워크, Legacy/Modern 자동 감지
 - **IPC** — 메시지 큐 (무제한/용량제한), Channel, POSIX mq API
 - **커널 모듈** — ELF64 동적 로딩, 심볼 해석, PLT 지원
+- **테스트 인프라** — 커널 모듈 기반 자동 테스트, QEMU에서 실행, `make test`로 자동화
 - **시스템 콜** — Linux 호환 ABI (프로세스/파일시스템)
 - **Device Tree** — DTB 파싱, 런타임 하드웨어 탐색
 - **보드 지원** — DTB compatible 기반 런타임 보드 선택
@@ -26,6 +27,7 @@ Rust로 작성된 aarch64/riscv64 베어메탈 커널
 
 - Rust stable 툴체인 (1.93.0+, edition 2024)
 - QEMU (`qemu-system-aarch64` / `qemu-system-riscv64`)
+- mtools (테스트 실행 시 필요 — `brew install mtools` / `apt install mtools`)
 
 ### 빌드
 
@@ -55,6 +57,21 @@ cargo build --release --target targets/riscv64-unknown-elf.json
 ./run.sh aarch64 512 4  # 4코어, 512MB
 ./run.sh riscv64 512 2  # 2코어, 512MB
 ```
+
+### 테스트
+
+```bash
+# aarch64 테스트 (기본)
+make test
+
+# riscv64 테스트
+make test ARCH=riscv64
+
+# 양쪽 아키텍처 모두
+make test-all
+```
+
+자세한 내용은 [docs/testing.md](docs/testing.md)를 참조하세요.
 
 ## 셸 명령어
 
@@ -104,9 +121,11 @@ kerners/
 │   ├── module/          # 커널 모듈 로더 (ELF64)
 │   ├── syscall/         # 시스템 콜 인터페이스
 │   └── dtb/             # Device Tree 파싱
-├── modules/             # 외부 커널 모듈
+├── modules/             # 외부 커널 모듈 + 테스트 모듈
+├── scripts/             # 테스트 빌드/실행 스크립트
 ├── targets/             # 커스텀 타겟 JSON
 ├── docs/                # 기술 문서
+├── Makefile             # 빌드/테스트 타겟
 └── run.sh               # 빌드 및 실행 스크립트
 ```
 
@@ -160,6 +179,7 @@ kerners/
 | [docs/console.md](docs/console.md) | 콘솔 출력 |
 | [docs/board-module-system.md](docs/board-module-system.md) | 보드 모듈 시스템 |
 | [docs/qemu-guide.md](docs/qemu-guide.md) | QEMU 실행 가이드 |
+| [docs/testing.md](docs/testing.md) | 테스트 인프라 |
 
 ### 프로젝트 문서
 

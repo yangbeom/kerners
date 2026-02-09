@@ -19,6 +19,9 @@ mod sync;
 mod syscall;
 mod virtio;
 
+#[cfg(feature = "test_runner")]
+mod test_runner;
+
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64/mod.rs"]
 mod arch;
@@ -257,11 +260,17 @@ fn aarch64_start(dtb_addr: usize) -> ! {
                                     // SMP 부팅 (secondary CPUs 시작)
                                     start_smp();
 
-                                    // 간단한 쉘 실행
                                     kprintln!("\n[boot] Initialization complete!");
-                                    kprintln!("Welcome to kerners shell!");
-                                    kprintln!("Commands: help, meminfo, uptime, echo <text>");
-                                    simple_shell();
+
+                                    #[cfg(feature = "test_runner")]
+                                    test_runner::run_kernel_tests();
+
+                                    #[cfg(not(feature = "test_runner"))]
+                                    {
+                                        kprintln!("Welcome to kerners shell!");
+                                        kprintln!("Commands: help, meminfo, uptime, echo <text>");
+                                        simple_shell();
+                                    }
                                 }
                                 Err(e) => {
                                     kprintln!("[boot] ERROR: Timer init failed: {}", e);
@@ -1248,11 +1257,17 @@ fn riscv64_start(dtb_addr: usize) -> ! {
                                     // SMP 부팅 (secondary harts 시작)
                                     start_smp();
 
-                                    // 간단한 쉘 실행
                                     kprintln!("\n[boot] Initialization complete!");
-                                    kprintln!("Welcome to kerners shell!");
-                                    kprintln!("Commands: help, meminfo, uptime, echo <text>");
-                                    simple_shell();
+
+                                    #[cfg(feature = "test_runner")]
+                                    test_runner::run_kernel_tests();
+
+                                    #[cfg(not(feature = "test_runner"))]
+                                    {
+                                        kprintln!("Welcome to kerners shell!");
+                                        kprintln!("Commands: help, meminfo, uptime, echo <text>");
+                                        simple_shell();
+                                    }
                                 }
                                 Err(e) => {
                                     kprintln!("[boot] ERROR: Timer init failed: {}", e);
@@ -1355,5 +1370,11 @@ fn is_valid_dtb(addr: usize) -> bool {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     kprintln!("Kernels panic: {}\n", _info);
+    #[cfg(feature = "test_runner")]
+    {
+        kprintln!("TEST_STATUS: FAIL");
+        test_runner::qemu_exit(1);
+    }
+    #[cfg(not(feature = "test_runner"))]
     loop {}
 }
