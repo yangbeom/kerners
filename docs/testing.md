@@ -23,6 +23,7 @@ make test
   │     → target/modules/{arch}/test_block.ko
   │     → target/modules/{arch}/test_vfs.ko
   │     → target/modules/{arch}/test_thread.ko
+  │     → target/modules/{arch}/test_log.ko
   │
   ├─ 2) FAT32 디스크 이미지 생성 + .ko 파일 복사
   │     → disk_test.img (mcopy로 .ko를 FAT32에 넣음)
@@ -171,6 +172,14 @@ make test-all
 | worker execution | 공유 변수(AtomicU32) 변경 확인 |
 | yield_now | `yield_now()` 호출 성공 |
 
+### modules/test_log — 로깅 시스템
+
+| 테스트 | 설명 |
+|--------|------|
+| all log levels | ERROR~TRACE 전 레벨 `kernel_log()` 호출 |
+| rapid logging | 50개 메시지 연속 출력 (스트레스 테스트) |
+| long message | 긴 메시지 링 버퍼 저장 확인 |
+
 ## 커널 심볼 익스포트
 
 테스트 모듈은 `extern "C"` 함수만 호출할 수 있다. 커널 내부 API를 C-compatible 래퍼로 감싸 심볼 테이블에 등록한다.
@@ -226,6 +235,12 @@ make test-all
 |------|---------|
 | `kernel_thread_spawn` | `(entry: extern "C" fn(usize), arg: usize, name: *const u8, name_len: usize) -> i32` |
 | `kernel_sleep_ticks` | `(ticks: u32)` |
+
+### Logging
+
+| 심볼 | 시그니처 |
+|------|---------|
+| `kernel_log` | `(level: u8, msg: *const u8, msg_len: usize)` |
 
 ## 새 테스트 모듈 추가하기
 

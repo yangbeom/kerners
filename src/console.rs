@@ -47,7 +47,7 @@ macro_rules! kprintln {
         $crate::console::kprintln(core::format_args!(""))
     };
     ($($arg:tt)*) => {
-        $crate::console::kprintln(core::format_args!($($arg)*))
+        $crate::log::log($crate::log::LogLevel::Info, core::format_args!($($arg)*))
     };
 }
 

@@ -9,6 +9,7 @@ mod block;
 mod boards;
 mod console;
 mod drivers;
+mod log;
 mod dtb;
 mod fs;
 mod ipc;
@@ -203,6 +204,9 @@ fn aarch64_start(dtb_addr: usize) -> ! {
     kprintln!("");
     match mm::init(ram_base, ram_size) {
         Ok(_layout) => {
+            // 로깅 시스템 초기화 (힙 사용 가능 후)
+            log::init();
+
             // 힙 초기화 완료 후 DTB 디바이스 정보 출력 (디버깅용)
             if let Some(dt) = dtb::get() {
                 dt.dump_devices();
@@ -431,6 +435,8 @@ fn simple_shell() -> ! {
                 kprintln!("  mount    - Mount FAT32 from /dev/vda to /mnt");
                 kprintln!("  mounts   - List mount points");
                 kprintln!("  cpuinfo  - Show CPU/SMP status");
+                kprintln!("  dmesg    - Display kernel ring buffer");
+                kprintln!("  loglevel [level] - Set log level (0-4 or ERROR/WARN/INFO/DEBUG/TRACE)");
             }
             Some("meminfo") => {
                 mm::heap::print_stats();
@@ -785,6 +791,20 @@ fn simple_shell() -> ! {
                 } else {
                     kprintln!("Usage: write <path> <content>");
                     kprintln!("Example: write /test.txt Hello World");
+                }
+            }
+            Some("dmesg") => {
+                log::dump_logs();
+            }
+            Some("loglevel") => {
+                if parts.len() == 1 {
+                    let level = log::get_log_level();
+                    kprintln!("Current log level: {} ({})", level as u8, level);
+                } else if let Some(level) = log::LogLevel::from_str(parts[1]) {
+                    log::set_log_level(level);
+                    kprintln!("Log level set to: {} ({})", level as u8, level);
+                } else {
+                    kprintln!("Invalid log level. Use: 0-4 or ERROR/WARN/INFO/DEBUG/TRACE");
                 }
             }
             Some(unknown) => {
@@ -1215,6 +1235,9 @@ fn riscv64_start(dtb_addr: usize) -> ! {
     kprintln!("");
     match mm::init(ram_base, ram_size) {
         Ok(_layout) => {
+            // 로깅 시스템 초기화 (힙 사용 가능 후)
+            log::init();
+
             // 보드 모듈 시스템 초기화 (DTB compatible 기반 보드 선택)
             init_board_system();
 

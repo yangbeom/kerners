@@ -387,6 +387,20 @@ pub extern "C" fn kernel_sleep_ticks(ticks: u32) {
 }
 
 // ============================================================
+// Logging (로깅)
+// ============================================================
+
+/// 로그 메시지 출력
+/// level: 0=ERROR, 1=WARN, 2=INFO, 3=DEBUG, 4=TRACE
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_log(level: u8, msg: *const u8, msg_len: usize) {
+    let level_enum = crate::log::LogLevel::from_u8(level);
+    if let Some(s) = str_from_raw(msg, msg_len) {
+        crate::log::log(level_enum, core::format_args!("{}", s));
+    }
+}
+
+// ============================================================
 // 심볼 등록
 // ============================================================
 
@@ -420,5 +434,8 @@ pub fn register_test_symbols() {
     register_symbol("kernel_thread_spawn", kernel_thread_spawn as usize);
     register_symbol("kernel_sleep_ticks", kernel_sleep_ticks as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 17);
+    // Logging
+    register_symbol("kernel_log", kernel_log as usize);
+
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 18);
 }

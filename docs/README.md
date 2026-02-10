@@ -19,6 +19,7 @@ kerners 커널의 서브시스템별 설계 및 구현 문서입니다.
 | [drivers.md](drivers.md) | 드라이버 프레임워크 - DTB 탐색, 플랫폼 설정 |
 | [ipc.md](ipc.md) | IPC - 메시지 큐, 채널, POSIX mq API |
 | [console.md](console.md) | 콘솔 출력 - kprint!/kprintln! 매크로 |
+| [log.md](log.md) | 커널 로깅 시스템 - 로그 레벨, 타임스탬프, 링 버퍼(dmesg) |
 | [board-module-system.md](board-module-system.md) | 보드 모듈 시스템 - DTB compatible 기반 런타임 보드 선택 |
 | [qemu-guide.md](qemu-guide.md) | QEMU 실행 가이드 - DTB 설정, 문제 해결 |
 | [testing.md](testing.md) | 테스트 인프라 - QEMU 자동 테스트, 테스트 모듈 작성법 |

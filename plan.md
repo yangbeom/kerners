@@ -12,6 +12,7 @@
 | Phase 6: 파일시스템/스토리지 | ✅ 완료 | VFS, RamFS, DevFS, FAT32, VirtIO 블록 |
 | Phase 7: Multi-core (SMP) | ✅ 완료 | Per-CPU, SMP 부트, IPI, SMP-aware 스케줄러 |
 | Phase 8: 테스트 인프라 | ✅ 완료 | 커널 모듈 기반 QEMU 자동 테스트, `make test` |
+| Phase 9: 커널 로깅 시스템 | ✅ 완료 | 로그 레벨, 타임스탬프, CPU ID, 링 버퍼, dmesg |
 
 ---
 
@@ -61,6 +62,19 @@
 - SMP-aware 스케줄러 — CPU 친화도, per-CPU idle 스레드, per-CPU current_thread_idx
 - IPI — aarch64 GIC SGI (SGI 0 = reschedule), riscv64 CLINT MSIP
 - 보드 모듈 시스템 — DTB compatible 기반 런타임 보드 선택, 싱글/멀티코어 보드 설정
+
+### Phase 8: 테스트 인프라
+
+- 커널 모듈 기반 테스트 프레임워크, QEMU 자동 테스트
+- 테스트 모듈: test_mm, test_ipc, test_block, test_vfs, test_thread
+
+### Phase 9: 커널 로깅 시스템
+
+- 로그 레벨 매크로 (`log_error!` ~ `log_trace!`), `kprintln!` = `log_info!`
+- 타임스탬프 + CPU ID 접두사: `[  0.123456] CPU0  INFO: message`
+- 64KB 정적 링 버퍼 (dmesg), Per-CPU 재귀 방지
+- 런타임 로그 레벨 변경 (`loglevel` 셸 명령어)
+- 모듈 심볼 `kernel_log` 익스포트, 테스트 모듈 `test_log`
 
 ---
 
@@ -118,14 +132,18 @@
   - [ ] aarch64 빌드 + 테스트
   - [ ] riscv64 빌드 + 테스트
 
-### Phase 9: 커널 로깅 시스템 (단기)
+### Phase 9: 커널 로깅 시스템 ✅
 
-- [ ] 로그 레벨: `error!`, `warn!`, `info!`, `debug!`, `trace!`
-- [ ] 런타임 로그 레벨 변경 (셸 명령어 `loglevel <N>`)
-- [ ] 타임스탬프 + CPU ID 접두사: `[  0.123456] CPU0: message`
-- [ ] 커널 링 버퍼 (dmesg 스타일)
-- [ ] `dmesg` 셸 명령어
-- [ ] 테스트: `modules/test_log`
+- [x] 로그 레벨: `log_error!`, `log_warn!`, `log_info!`, `log_debug!`, `log_trace!`
+- [x] `kprintln!` → `log_info!`와 동일 동작 (기존 호출 자동 통합)
+- [x] 런타임 로그 레벨 변경 (셸 명령어 `loglevel <N>`)
+- [x] 타임스탬프 + CPU ID 접두사: `[  0.123456] CPU0  INFO: message`
+- [x] 64KB 커널 링 버퍼 (정적 할당, SMP-safe)
+- [x] `dmesg` 셸 명령어
+- [x] Per-CPU 재귀 방지 (로깅 중 로깅 호출 시 deadlock 방지)
+- [x] 초기화 전 fallback (log::init() 전에는 직접 UART 출력)
+- [x] 모듈 심볼 `kernel_log` 익스포트
+- [x] 테스트: `modules/test_log`
 
 ### Phase 10: 프로세스 관리 강화 (단기)
 
