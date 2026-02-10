@@ -14,7 +14,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 unsafe extern "C" {
     fn kernel_print(s: *const u8, len: usize);
     fn kernel_thread_spawn(entry: extern "C" fn(usize), arg: usize, name: *const u8, name_len: usize) -> i32;
-    fn kernel_sleep_ticks(ticks: u32);
     fn yield_now();
     fn current_tid() -> u32;
 }
@@ -61,8 +60,12 @@ pub extern "C" fn module_init() -> i32 {
 
     // 테스트 3: worker가 실행되어 SHARED_VALUE 변경 확인
     print("[test_thread] test: worker execution ... ");
-    // worker가 실행될 시간을 줌
-    unsafe { kernel_sleep_ticks(20); }
+    // worker가 실행될 시간을 줌 (yield 반복으로 스케줄링 기회 제공)
+    let mut attempts: u32 = 0;
+    while SHARED_VALUE.load(Ordering::SeqCst) != 42 && attempts < 1000 {
+        unsafe { yield_now(); }
+        attempts += 1;
+    }
     let val = SHARED_VALUE.load(Ordering::SeqCst);
     if val != 42 {
         print("FAIL (SHARED_VALUE != 42)\n");

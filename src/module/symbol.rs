@@ -45,6 +45,48 @@ pub extern "C" fn kernel_print(s: *const u8, len: usize) {
     }
 }
 
+// 컴파일러 intrinsic: 모듈에서 배열 초기화/복사 시 컴파일러가 자동 호출
+// volatile 연산 사용 — 컴파일러가 이 루프를 memset/memcpy 호출로 최적화하면
+// 무한 재귀가 발생하므로 반드시 volatile로 작성해야 함
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(dest: *mut u8, val: i32, count: usize) -> *mut u8 {
+    let byte = val as u8;
+    let mut i = 0;
+    while i < count {
+        unsafe { core::ptr::write_volatile(dest.add(i), byte); }
+        i += 1;
+    }
+    dest
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < count {
+        unsafe { core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i))); }
+        i += 1;
+    }
+    dest
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    if (dest as usize) <= (src as usize) {
+        let mut i = 0;
+        while i < count {
+            unsafe { core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i))); }
+            i += 1;
+        }
+    } else {
+        let mut i = count;
+        while i > 0 {
+            i -= 1;
+            unsafe { core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i))); }
+        }
+    }
+    dest
+}
+
 /// 심볼 테이블 초기화
 pub fn init() {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
@@ -57,11 +99,14 @@ pub fn init() {
     // 커널 심볼 등록
     list.push((String::from("console_puts"), crate::console::puts as usize));
     list.push((String::from("console_putc"), crate::console::putc as usize));
-    list.push((String::from("alloc_frame"), crate::mm::page::alloc_frame as usize));
     list.push((String::from("yield_now"), crate::proc::yield_now as usize));
     list.push((String::from("current_tid"), crate::proc::current_tid as usize));
     // 모듈용 출력 함수
     list.push((String::from("kernel_print"), kernel_print as usize));
+    // 컴파일러 intrinsic (배열 초기화 등에서 컴파일러가 자동 생성)
+    list.push((String::from("memset"), memset as usize));
+    list.push((String::from("memcpy"), memcpy as usize));
+    list.push((String::from("memmove"), memmove as usize));
 
     *symbols = Some(list);
 

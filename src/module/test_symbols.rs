@@ -7,6 +7,13 @@
 // MM (메모리 관리)
 // ============================================================
 
+/// 페이지 프레임 할당 (C-ABI 래퍼)
+/// 반환: 할당된 주소 (0 = 실패)
+#[unsafe(no_mangle)]
+pub extern "C" fn alloc_frame() -> usize {
+    crate::mm::page::alloc_frame().unwrap_or(0)
+}
+
 /// 페이지 프레임 해제
 #[unsafe(no_mangle)]
 pub extern "C" fn free_frame(addr: usize) {
@@ -117,8 +124,14 @@ pub extern "C" fn kernel_mq_receive(
     if buf.is_null() || buf_len == 0 {
         return -1;
     }
-    match crate::ipc::message_queue::mq_receive(name) {
-        Ok(data) => {
+    // try_receive 사용 — 빈 큐에서 블로킹하지 않음
+    let mq = match crate::ipc::message_queue::mq_open(name, false) {
+        Ok(mq) => mq,
+        Err(_) => return -1,
+    };
+    match mq.try_receive() {
+        Ok(msg) => {
+            let data = &msg.data;
             let copy_len = core::cmp::min(data.len(), buf_len);
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), buf, copy_len);
@@ -409,6 +422,7 @@ pub fn register_test_symbols() {
     use crate::module::symbol::register_symbol;
 
     // MM
+    register_symbol("alloc_frame", alloc_frame as usize);
     register_symbol("free_frame", free_frame as usize);
     register_symbol("kernel_heap_alloc", kernel_heap_alloc as usize);
     register_symbol("kernel_heap_dealloc", kernel_heap_dealloc as usize);
@@ -437,5 +451,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 18);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 19);
 }

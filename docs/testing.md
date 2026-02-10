@@ -42,7 +42,7 @@ $ make test ARCH=aarch64
    → rustc로 각 테스트 모듈 빌드 → .ko 파일 생성
 
 2) scripts/prepare_test_disk.sh aarch64
-   → dd + mkfs.vfat → disk_test.img (FAT32, 32MB)
+   → dd + mkfs.vfat/mformat → disk_test.img (FAT32, 32MB)
    → mcopy -i disk_test.img target/modules/aarch64/*.ko ::
 
 3) cargo build --release --target aarch64-unknown-none-softfloat --features test_runner
@@ -64,23 +64,45 @@ $ make test ARCH=aarch64
 
 === KERNERS TEST SUITE START ===
 
-[test] Loading /mnt/test_mm.ko ...
-[test_mm] page alloc/free .............. PASS
-[test_mm] heap alloc/free .............. PASS
-[test] test_mm: module_init() returned 0 → OK
+[test] Found 6 test module(s)
 
-[test] Loading /mnt/test_ipc.ko ...
-[test_ipc] message queue send/recv ..... PASS
-[test] test_ipc: module_init() returned 0 → OK
+[test] Loading /mnt/TEST_IPC.KO ...     (FAT32 8.3 대문자)
+[test_ipc] mq create .................. PASS
+[test_ipc] mq send .................... PASS
+[test_ipc] mq receive ................. PASS
+[test_ipc] mq receive empty ........... PASS
 
-... (각 테스트 모듈 순차 실행)
+[test] Loading /mnt/TEST_LOG.KO ...
+[test_log] all log levels ............. PASS
+[test_log] rapid logging (50 msgs) .... PASS
+[test_log] long message ............... PASS
+
+[test] Loading /mnt/TEST_MM.KO ...
+[test_mm] page alloc/free ............. PASS
+[test_mm] heap alloc/free ............. PASS
+[test_mm] multiple frames no overlap .. PASS
+
+[test] Loading /mnt/TEST_VFS.KO ...
+[test_vfs] mkdir ...................... PASS
+[test_vfs] create/write/read/unlink ... PASS
+
+[test] Loading /mnt/test_block.ko ...   (LFN 소문자)
+[test_block] ramdisk create ........... PASS
+[test_block] write/read/isolation ..... PASS
+
+[test] Loading /mnt/test_thread.ko ...
+[test_thread] tid/spawn/worker/yield .. PASS
 
 === KERNERS TEST SUITE END ===
-RESULT: 5 passed, 0 failed
+RESULT: 6 passed, 0 failed
 TEST_STATUS: PASS
 
 → qemu_exit(0)
 ```
+
+> **FAT32 파일명**: 8자 이하 이름(test_ipc, test_log 등)은 8.3 대문자로 저장되고,
+> 9자 이상(test_block, test_thread)은 LFN으로 소문자 유지됩니다.
+> 테스트 러너는 대소문자 무시 비교로 모든 모듈을 탐지합니다.
 
 ### QEMU 종료 메커니즘
 
@@ -95,7 +117,7 @@ TEST_STATUS: PASS
 
 - Rust stable 1.93.0+ (edition 2024)
 - QEMU (`qemu-system-aarch64` / `qemu-system-riscv64`)
-- mtools (`mcopy` — FAT32 이미지 조작)
+- mtools (`mcopy`, `mformat` — FAT32 이미지 생성/조작)
   - macOS: `brew install mtools`
   - Linux: `apt install mtools`
 
@@ -143,7 +165,7 @@ make test-all
 | mq create | `kernel_mq_open("test_q", create=true)` |
 | mq send | 메시지 전송 → 성공 확인 |
 | mq receive | 메시지 수신 → 내용 일치 확인 |
-| empty recv | 빈 큐 receive → 실패(-1) 확인 |
+| empty recv | 빈 큐 non-blocking receive → 실패(-1) 확인 |
 
 ### modules/test_block — 블록 디바이스
 
@@ -169,7 +191,7 @@ make test-all
 |--------|------|
 | current_tid | 현재 스레드 ID 조회 |
 | spawn thread | `kernel_thread_spawn()` → tid > 0 |
-| worker execution | 공유 변수(AtomicU32) 변경 확인 |
+| worker execution | 공유 변수(AtomicU32) 변경 확인 (yield 루프로 대기) |
 | yield_now | `yield_now()` 호출 성공 |
 
 ### modules/test_log — 로깅 시스템
@@ -186,22 +208,31 @@ make test-all
 
 래퍼 함수는 `src/module/test_symbols.rs`에 구현되어 있다.
 
-### 공통
+### 공통 (symbol.rs 등록)
 
-| 심볼 | 시그니처 |
-|------|---------|
-| `kernel_print` | `(s: *const u8, len: usize)` |
-| `alloc_frame` | `() -> usize` |
-| `free_frame` | `(addr: usize)` |
-| `yield_now` | `()` |
-| `current_tid` | `() -> u32` |
+| 심볼 | 시그니처 | 설명 |
+|------|---------|------|
+| `kernel_print` | `(s: *const u8, len: usize)` | UART 직접 출력 |
+| `yield_now` | `()` | 스케줄러 양보 |
+| `current_tid` | `() -> u32` | 현재 스레드 ID |
+| `memset` | `(dest: *mut u8, val: i32, count: usize) -> *mut u8` | 컴파일러 intrinsic |
+| `memcpy` | `(dest: *mut u8, src: *const u8, count: usize) -> *mut u8` | 컴파일러 intrinsic |
+| `memmove` | `(dest: *mut u8, src: *const u8, count: usize) -> *mut u8` | 컴파일러 intrinsic |
 
-### MM
+> `memset`/`memcpy`/`memmove`는 `volatile` 연산으로 구현되어 있습니다.
+> 일반 루프로 작성하면 컴파일러가 release 빌드에서 자기 자신을 호출하는 무한 재귀로 최적화합니다.
 
-| 심볼 | 시그니처 |
-|------|---------|
-| `kernel_heap_alloc` | `(size: usize, align: usize) -> usize` |
-| `kernel_heap_dealloc` | `(ptr: usize, size: usize, align: usize)` |
+### MM (test_symbols.rs 등록)
+
+| 심볼 | 시그니처 | 설명 |
+|------|---------|------|
+| `alloc_frame` | `() -> usize` | C-ABI 래퍼 (0 = 실패) |
+| `free_frame` | `(addr: usize)` | 페이지 프레임 해제 |
+| `kernel_heap_alloc` | `(size: usize, align: usize) -> usize` | 힙 할당 (0 = 실패) |
+| `kernel_heap_dealloc` | `(ptr: usize, size: usize, align: usize)` | 힙 해제 |
+
+> `alloc_frame`은 커널의 `mm::page::alloc_frame() -> Option<usize>`을 C-ABI 래퍼로 감쌉니다.
+> `Option<usize>`는 C ABI와 호환되지 않으므로(discriminant가 반환값으로 오인됨) 반드시 래퍼를 거쳐야 합니다.
 
 ### IPC
 
@@ -209,7 +240,7 @@ make test-all
 |------|---------|
 | `kernel_mq_open` | `(name: *const u8, name_len: usize, create: bool) -> i32` |
 | `kernel_mq_send` | `(name: *const u8, name_len: usize, data: *const u8, data_len: usize) -> i32` |
-| `kernel_mq_receive` | `(name: *const u8, name_len: usize, buf: *mut u8, buf_len: usize) -> i32` |
+| `kernel_mq_receive` | `(name: *const u8, name_len: usize, buf: *mut u8, buf_len: usize) -> i32` (non-blocking) |
 
 ### Block
 
@@ -316,5 +347,6 @@ fn panic(_info: &PanicInfo) -> ! {
 | 파일 | 설명 |
 |------|------|
 | `src/test_runner.rs` | QEMU 내 테스트 러너 (FAT32 마운트 → 모듈 로드 → 실행 → 결과 집계) |
-| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 |
+| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (19개 심볼) |
+| `src/module/symbol.rs` | 커널 심볼 테이블 + 컴파일러 intrinsic (memset/memcpy/memmove) |
 | `Cargo.toml` | `test_runner` feature 정의 |

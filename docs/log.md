@@ -128,6 +128,12 @@ src/log/
 
 `log::init()` 호출 전에 `kprintln!`이 사용될 경우, fallback으로 직접 UART 출력합니다 (타임스탬프/CPU ID/링 버퍼 없이 원본 메시지만 출력).
 
+### 컴파일러 intrinsic 의존성
+
+로깅 시스템은 스택 버퍼(`[0u8; 512]`)와 `copy_from_slice`를 사용합니다. release 빌드에서 컴파일러가 이를 `memset`/`memcpy` 호출로 최적화하므로, 커널에 올바른 구현이 필요합니다.
+
+이 구현들은 `src/module/symbol.rs`에 `volatile` 연산으로 작성되어 있습니다. 일반 루프로 작성하면 컴파일러가 다시 `memcpy` 호출로 최적화하여 무한 재귀가 발생합니다.
+
 ## 커널 모듈에서 사용
 
 ```c

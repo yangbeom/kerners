@@ -98,7 +98,9 @@ fn find_test_modules() -> Vec<String> {
     };
 
     for entry in &entries {
-        if entry.name.starts_with("test_") && entry.name.ends_with(".ko") {
+        // FAT32 8.3 이름은 대문자 — 대소문자 무시 비교
+        let name_lower = entry.name.to_ascii_lowercase();
+        if name_lower.starts_with("test_") && name_lower.ends_with(".ko") {
             let path = alloc::format!("/mnt/{}", entry.name);
             modules.push(path);
         }

@@ -50,10 +50,11 @@ dd if=/dev/zero of="$DISK_IMG" bs=1M count=$DISK_SIZE 2>/dev/null
 # FAT32 포맷
 if command -v mkfs.vfat &>/dev/null; then
     mkfs.vfat -F 32 "$DISK_IMG" >/dev/null 2>&1
-elif command -v newfs_msdos &>/dev/null; then
-    newfs_msdos -F 32 "$DISK_IMG" >/dev/null 2>&1
+elif command -v mformat &>/dev/null; then
+    # macOS: mtools의 mformat 사용 (newfs_msdos는 raw 파일 미지원)
+    mformat -i "$DISK_IMG" -F ::
 else
-    print_error "Cannot format disk image (no mkfs.vfat or newfs_msdos)"
+    print_error "Cannot format disk image (no mkfs.vfat or mformat)"
     exit 1
 fi
 
