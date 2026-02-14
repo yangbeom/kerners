@@ -56,6 +56,9 @@ cargo build --release --target targets/riscv64-unknown-elf.json
 # 멀티코어 (SMP)
 ./run.sh aarch64 512 4  # 4코어, 512MB
 ./run.sh riscv64 512 2  # 2코어, 512MB
+
+# BusyBox init(PID 1) 부팅 경로 테스트용 디스크 자동 준비
+KERNERS_BUSYBOX=/absolute/path/to/busybox ./run.sh aarch64
 ```
 
 ### 테스트

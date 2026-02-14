@@ -16,6 +16,15 @@
 
 ---
 
+## 운영 원칙
+
+- [x] 코드/스크립트 수정 완료 시 `plan.md`를 같은 커밋 단위로 동기화한다.
+- [x] BusyBox init 트랙(Phase 10-1)의 진행/실패 원인은 로그 파일 경로와 함께 기록한다.
+- [x] `docs/` 문서는 변경 이력보다 현재 구현된 모듈 동작/제약 설명을 우선한다.
+- [x] syscall 항목은 `현재 구현된 시스템 콜` 표를 단일 기준으로 유지하고, 이후 Phase는 "고도화/완성 조건"만 기록한다.
+
+---
+
 ## 완료된 기능 요약
 
 ### Phase 1: 기본 인프라
@@ -82,21 +91,54 @@
 
 | 번호 | 이름 | 상태 | 비고 |
 |------|------|------|------|
+| 23 | `dup` | ✅ 구현 | baseline FD 복제 |
+| 24 | `dup3` | ✅ 구현 | baseline, `O_CLOEXEC` no-op |
+| 25 | `fcntl` | ✅ 구현 | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
+| 29 | `ioctl` | ✅ 구현 | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
 | 34 | `mkdirat` | ✅ 구현 | dirfd 무시, path만 사용 |
 | 35 | `unlinkat` | ✅ 구현 | dirfd/flags 무시 |
+| 48 | `faccessat` | ✅ 구현 | baseline 경로 존재 확인 |
+| 49 | `chdir` | ✅ 구현 | baseline 경로 검증만 수행 (cwd 상태 추적 미구현) |
 | 56 | `openat` | ✅ 구현 | O_CREAT, O_TRUNC 지원 |
 | 57 | `close` | ✅ 구현 | |
 | 62 | `lseek` | ✅ 구현 | SEEK_SET/CUR/END |
 | 63 | `read` | ✅ 구현 | VFS + stdin 폴백 |
 | 64 | `write` | ✅ 구현 | VFS + stdout/stderr 폴백 |
-| 80 | `fstat` | ✅ 구현 | 간소화된 stat 구조체 (TODO: Linux 호환) |
+| 79 | `newfstatat` | ✅ 구현 | baseline 경로 stat (dirfd/flags 제한적) |
+| 80 | `fstat` | ✅ 구현 | Linux 호환 `struct stat` baseline |
 | 93 | `exit` | ✅ 구현 | |
 | 94 | `exit_group` | ✅ 구현 | exit으로 포워딩 |
-| 101 | `nanosleep` | ⬜ 번호만 정의 | 미구현 |
+| 95 | `waitid` | ✅ 구현 | `P_ALL/P_PID/P_PGID` + `WEXITED/WNOHANG/WNOWAIT` baseline |
+| 96 | `set_tid_address` | ✅ 구현 | baseline: tid 반환, clear_child_tid 미구현 |
+| 101 | `nanosleep` | ✅ 구현 | baseline: yield 기반 최소 동작 |
+| 113 | `clock_gettime` | ✅ 구현 | baseline: monotonic 기반 realtime/monotonic 반환 |
 | 124 | `sched_yield` | ✅ 구현 | |
+| 134 | `rt_sigaction` | ✅ 구현 | baseline stub (handler delivery 미구현) |
+| 135 | `rt_sigprocmask` | ✅ 구현 | 프로세스별 64-bit 마스크 추적 (`SIG_BLOCK/UNBLOCK/SETMASK`) |
+| 137 | `rt_sigtimedwait` | ✅ 구현 | pending signal queue 조회/소비 (`EAGAIN` 포함) |
+| 144 | `setgid` | ✅ 구현 | baseline no-op 성공 |
+| 146 | `setuid` | ✅ 구현 | baseline no-op 성공 |
+| 154 | `setpgid` | ✅ 구현 | 최소 pgid 추적 갱신 |
+| 155 | `getpgid` | ✅ 구현 | 추적된 pgid 반환 |
+| 156 | `getsid` | ✅ 구현 | 추적된 sid 반환 |
+| 157 | `setsid` | ✅ 구현 | sid/pgid를 현재 tid로 갱신 |
+| 160 | `uname` | ✅ 구현 | `struct utsname` (`Kerners`, machine/domain 포함) |
+| 169 | `gettimeofday` | ✅ 구현 | baseline: monotonic wrapper |
 | 172 | `getpid` | ✅ 구현 | tid 반환 |
-| 214 | `brk` | ⬜ 번호만 정의 | 미구현 |
-| 222 | `mmap` | ⬜ 번호만 정의 | 미구현 |
+| 173 | `getppid` | ✅ 구현 | 부모 PID 추적 반환 |
+| 174 | `getuid` | ✅ 구현 | baseline: 0 반환 |
+| 175 | `geteuid` | ✅ 구현 | baseline: 0 반환 |
+| 176 | `getgid` | ✅ 구현 | baseline: 0 반환 |
+| 177 | `getegid` | ✅ 구현 | baseline: 0 반환 |
+| 178 | `gettid` | ✅ 구현 | tid 반환 |
+| 198 | `socket` | ✅ 구현 | baseline: `EAFNOSUPPORT` |
+| 206 | `sendto` | ✅ 구현 | baseline: `EBADF`/`EAFNOSUPPORT` |
+| 214 | `brk` | ✅ 구현 | 스레드별 고정 16MB 영역 baseline |
+| 215 | `munmap` | ✅ 구현 | full unmap만 지원(부분 해제 미지원) |
+| 220 | `clone` | ✅ 구현 | baseline + aarch64 user-context + CLONE_* 리소스 그룹 추적 |
+| 221 | `execve` | ✅ 구현 | static ELF(`ET_EXEC`) + argv/env 경계검증 + 확장 auxv |
+| 222 | `mmap` | ✅ 구현 | anonymous(private/shared) baseline |
+| 260 | `wait4` | ✅ 구현 | zombie 회수 + Linux wait status + `WNOHANG` + 자식 대기/`ECHILD` |
 
 ---
 
@@ -145,60 +187,133 @@
 - [x] 모듈 심볼 `kernel_log` 익스포트
 - [x] 테스트: `modules/test_log`
 
-### Phase 10: 프로세스 관리 강화 (단기)
+### Phase 10: 프로세스 관리 강화 (단기, BusyBox init 우선)
 
-#### 10-1. 유저 ELF 바이너리 로딩
-- [ ] `sys_execve` (NR 221) 구현
-  - [ ] 유저 ELF64 파서 (ET_EXEC / ET_DYN)
-  - [ ] PT_LOAD 세그먼트 → 유저 주소 공간 매핑
-  - [ ] 유저 스택 초기화 (argc, argv, envp, auxv)
-  - [ ] 프로세스 주소 공간 교체 후 엔트리 점프
-- [ ] 유저 바이너리 빌드 시스템 (cross-compile toolchain)
-- [ ] `/init` 프로세스 실행 (PID 1)
-- [ ] 테스트: `modules/test_execve`
+#### 10-1. BusyBox `init` 부팅 트랙 (최우선)
+- [ ] 목표: static BusyBox `init`를 PID 1로 실행하고 사용자 공간 초기화를 시작
+- [x] 1차 범위: static ELF 우선 (`PT_INTERP` 없는 바이너리)
+- [ ] 1차 마일스톤: BusyBox `init` PID 1 부팅 성공
+
+##### 10-1A. 현재 기준점(Baseline)
+- [x] `sys_execve` (NR 221) 구현 (1차 baseline)
+  - [x] 유저 ELF64 파서 (`ET_EXEC` 중심, `ET_DYN`은 추후)
+  - [x] PT_LOAD 세그먼트 로드/매핑 (aarch64 유저 VA 매핑 baseline)
+  - [x] 유저 스택 초기화 (argc, argv, envp, auxv)
+  - [x] trap 복귀 시 컨텍스트 전이로 새 엔트리 점프 (aarch64/riscv64)
+- [x] BusyBox 반입 경로 준비 (`scripts/prepare_user_disk.sh`, `KERNERS_BUSYBOX`)
+- [x] PID 1 후보 경로 탐색(`/sbin/init` → `/etc/init` → `/bin/init` → `/bin/sh`, `/mnt/*` fallback)
+- [x] PID 1 exec 실패 시 커널 셸 fallback
+- [x] `modules/test_execve` 에러 경로 검증 (`ENOENT`, `ENOEXEC`)
+
+##### 10-1B. 완료 기준(Definition of Done)
+- [x] 부팅 로그에서 PID 1 시작 확인: `launched PID1 candidate ...`
+- [x] fallback 커널 셸로 떨어지지 않고 BusyBox `init` 경로 유지
+- [ ] `/dev/console` 기반 0/1/2 입출력으로 BusyBox 출력 확인
+- [x] 동일 절차 3회 연속 부팅 성공 (aarch64 기준)
+- [x] 실패 시 에러 분류 로그 보존 (`logs/busybox-init-*.log`, ENOSYS/EFAULT/기타)
+- [x] 최신 실패 로그 기준점 갱신 (2026-02-14): `logs/busybox-init-aarch64-20260214-020627-run1.log`
+- [x] 최신 3회 연속 스모크 성공 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-104935.summary.log`
+- [x] 최신 syscall 보강 후 스모크 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-113411.summary.log`
+- [x] 최신 10-1C P2 반영 후 스모크 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-114631.summary.log`
+
+##### 10-1C. 우선순위 실행 계획 (Critical Path)
+- [x] P0. 부팅 스모크 경로 고정 (이번 단계)
+  - [x] prebuilt static BusyBox ELF 디스크 반입 스크립트
+  - [x] `run.sh`의 `KERNERS_BUSYBOX` 자동 연동
+  - [x] 디스크 이미지 경로 통합 (`disk.img` + `KERNERS_DISK_IMG`, run/test 공통)
+  - [x] QEMU 스모크 로그 자동 수집 스크립트 (`scripts/run_busybox_smoke.sh`)
+  - [x] BusyBox PID 1 실패 원인 1차 분류(ENOSYS/EFAULT/EXEC_FAIL/NO_INIT_FALLBACK)
+  - [x] 스모크 분류 오탐 제거 (`EFAULT` 단어 매칭으로 `DEFAULT` 오탐 방지)
+  - [x] 스모크 스크립트 안정화: run별 분리 디스크 + QEMU 락/잔존 프로세스 정리
+  - [x] panic 1차 원인 수정: bootstrap stack 영역을 heap에서 제외
+  - [x] 디스크 이미지 무결성 확인: `/bin/busybox`, `/bin/init`, `/bin/sh`, `/sbin/init` 존재
+  - [x] ELF `PT_LOAD` 유저 가상주소(`p_vaddr`) 실제 매핑
+    - [x] aarch64 런타임 유저 VA 매핑 API 추가
+    - [x] `load_executable`에서 `p_vaddr -> frame` 페이지 단위 매핑 + 권한 반영
+    - [x] 매핑 완료 후 BusyBox init 스모크 3회 재검증
+  - [x] BusyBox PID1 후보 경로 보강: `/mnt/init` 우선 탐색 + user disk에 `/init` 엔트리 추가
+- [x] P1. BusyBox init 최소 syscall 세트 구현 (의존 순서 고정)
+  - [x] 1순위: `sys_getppid`, `sys_gettid`, `sys_brk`
+  - [x] 2순위: `sys_mmap`, `sys_munmap` (anonymous/private 우선)
+  - [x] 3순위(1차): `sys_rt_sigaction`, `sys_rt_sigprocmask` baseline stub
+  - [x] 3순위(완료): `SIGCHLD` 전달(실제 signal queue 기반)
+  - [x] 4순위(1차): `sys_clone`, `sys_wait4` baseline
+  - [x] 4순위(완료): `sys_fork`/`sys_vfork` + 실제 프로세스 복제 의미
+  - [x] 5순위(1차): `sys_setsid`, `sys_getsid`, `sys_setpgid`, `sys_getpgid` baseline stub
+  - [x] 6순위(1차): `sys_ioctl`(TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY), `sys_dup`/`sys_dup3`/`sys_fcntl`
+  - [x] BusyBox 조기부팅 보강: `sys_getuid/geteuid/getgid/getegid`, `sys_set_tid_address`, `sys_chdir`, `sys_newfstatat`, `sys_faccessat`
+  - [x] ENOSYS blocker 1차 해소(2026-02-14): `113/137/169/198/206/220/260/48`
+    - 기준 로그: `logs/busybox-init-aarch64-20260214-104935-run1.log`
+    - 결과: 45초 스모크 구간에서 `Unknown syscall` 0건
+    - 구현 전략: **호환성 우선**
+      - [x] Step 1 (빠른 생존성): `clock_gettime(113)`, `gettimeofday(169)` 최소 호환 구현
+      - [x] Step 2 (시그널 대기 경로): `rt_sigtimedwait(137)` 최소 호환(stub/적절 errno) 구현
+      - [x] Step 3 (네트워크 호출 차단): `socket(198)`, `sendto(206)` 최소 호환(stub/적절 errno) 구현
+      - [x] Step 4 (프로세스 수명주기): `clone(220)` + `wait4(260)` 최소 동작 구현
+      - [x] Step 5 (회귀 확인): BusyBox init 스모크 재실행 후 ENOSYS 잔여 번호 갱신
+    - 수용 기준(이번 전략 완료 기준)
+      - [x] `logs/busybox-init-*.log`에서 `Unknown syscall: 113/137/169/198/206`가 제거됨
+      - [x] PID 1이 즉시 종료하지 않고 다음 단계(`clone/wait4`)로 진행하는 로그가 확인됨
+  - [x] 각 syscall군별 모듈 테스트 추가 (`modules/test_proc` 확장: signal/fork/vfork/wait 경로 검증)
+- [x] P2. BusyBox 호환성 안정화
+  - [x] exec 인자/환경 경계조건 강화 (개수/길이 상한 + fault-safe user pointer)
+  - [x] auxv 최소 호환 확장 (`AT_ENTRY`, `AT_PHDR`, `AT_PHNUM`, `AT_PAGESZ`)
+  - [x] `fstat` Linux 호환 구조체 baseline 정비
+  - [x] exit/wait/reparenting 일관성 보강 (고아 프로세스 init 입양)
+  - [x] 회귀 검증: `./scripts/run_tests.sh aarch64 60` (`RESULT: 9 passed, 0 failed`)
+    - 로그: `logs/test-full-phase10-20260214-120323.log`
 
 #### 10-2. 프로세스 생성/복제
-- [ ] `sys_clone` (NR 220) 구현
-  - [ ] CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND 플래그
-  - [ ] 커널 스택 복제
-  - [ ] 페이지 테이블 복제 (COW 준비)
-  - [ ] 자식 프로세스 tid 반환
-- [ ] `sys_fork` — clone(SIGCHLD) wrapper
-- [ ] `sys_vfork` — clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
-- [ ] 테스트: `modules/test_fork`
+- [x] `sys_clone` (NR 220) baseline 구현 (fake child/zombie)
+- [x] `sys_clone` (NR 220) aarch64 trap-context 기반 자식 복귀 구현
+- [x] `sys_clone` (NR 220) Phase 10 범위 완성
+  - [x] CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND 플래그 기반 리소스 그룹 추적
+  - [x] fake child/aarch64 user-context 경로 모두 parent/pgid/sid/signal mask 동기화
+  - [x] 자식 프로세스 tid 반환
+  - [ ] 커널 스택/페이지 테이블 복제(COW)는 Phase 11-3에서 진행
+- [x] `sys_fork` — clone(SIGCHLD) wrapper
+- [x] `sys_vfork` — clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
+- [x] 테스트: `modules/test_fork`
 
 #### 10-3. 프로세스 종료/대기
-- [ ] `sys_wait4` (NR 260) 구현
-  - [ ] 좀비 프로세스 상태 (TASK_ZOMBIE)
-  - [ ] WEXITSTATUS, WIFEXITED, WIFSIGNALED 매크로 호환
-  - [ ] WNOHANG 옵션
-  - [ ] 부모-자식 관계 트래킹 (ppid)
-- [ ] `sys_waitid` (NR 95)
-- [ ] exit 시 자식 프로세스 init에 입양 (reparenting)
+- [x] `sys_wait4` (NR 260) baseline 구현 (fake child 회수)
+- [x] `sys_wait4` (NR 260) 완성 구현
+  - [x] 좀비 프로세스 상태 (최소 모델)
+  - [x] Linux wait status 인코딩(`exit_code << 8`)으로 `WEXITSTATUS/WIFEXITED` 호환
+  - [ ] signal 종료(`WIFSIGNALED`) 완성은 Phase 13 시그널 종료 경로와 연계
+  - [x] WNOHANG 옵션
+  - [x] 부모-자식 관계 트래킹 (ppid)
+- [x] `sys_waitid` (NR 95)
+- [x] exit 시 자식 프로세스 init에 입양 (reparenting)
 
 #### 10-4. 프로세스 정보
-- [ ] `sys_getppid` (NR 173)
-- [ ] `sys_gettid` (NR 178)
-- [ ] `sys_getuid` / `sys_getgid` (NR 174/176) — 단순히 0 반환
-- [ ] `sys_set_tid_address` (NR 96)
-- [ ] `sys_uname` (NR 160) — "Kerners" 커널명 반환
+- [x] `sys_getppid` (NR 173) — 부모 PID 추적 반환
+- [x] `sys_gettid` (NR 178)
+- [x] `sys_getuid` / `sys_getgid` (NR 174/176) — baseline: 0 반환
+- [x] `sys_set_tid_address` (NR 96) — baseline: tid 반환
+- [x] `sys_setsid` (NR 157) / `sys_getsid` (NR 156) — 최소 sid 추적
+- [x] `sys_setpgid` (NR 154) / `sys_getpgid` (NR 155) — 최소 pgid 추적
+- [x] `sys_uname` (NR 160) — "Kerners" 커널명 반환
 
 ### Phase 11: 메모리 관리 시스템 콜 (단기)
 
-#### 11-1. brk / sbrk
-- [ ] `sys_brk` (NR 214) 구현
+#### 11-1. brk / sbrk 고도화
+- [x] `sys_brk` (NR 214) baseline 구현
+- [ ] `sys_brk` (NR 214) 고도화
   - [ ] 프로세스별 program break 트래킹
   - [ ] 힙 영역 확장/축소
   - [ ] 페이지 단위 매핑/해제
 - [ ] 테스트: `modules/test_brk`
 
-#### 11-2. mmap / munmap
-- [ ] `sys_mmap` (NR 222) 구현
+#### 11-2. mmap / munmap 고도화
+- [x] `sys_mmap` (NR 222) baseline 구현
+- [ ] `sys_mmap` (NR 222) 고도화
   - [ ] MAP_ANONYMOUS | MAP_PRIVATE — 익명 페이지 매핑
   - [ ] MAP_FIXED — 지정 주소 매핑
   - [ ] PROT_READ, PROT_WRITE, PROT_EXEC 페이지 권한
   - [ ] 파일 backed mmap (fd + offset)
-- [ ] `sys_munmap` (NR 215)
+- [x] `sys_munmap` (NR 215) baseline 구현
+- [ ] `sys_munmap` (NR 215) 고도화
   - [ ] 페이지 테이블 엔트리 해제
   - [ ] 물리 페이지 반환
 - [ ] `sys_mprotect` (NR 226)
@@ -214,33 +329,39 @@
 
 ### Phase 12: 시간 및 타이머 시스템 콜 (단기)
 
-- [ ] `sys_nanosleep` (NR 101) 구현
+- [x] `sys_nanosleep` (NR 101) baseline 구현
   - [ ] struct timespec {tv_sec, tv_nsec} 파싱
   - [ ] 스레드를 SLEEPING 상태로 전환
   - [ ] 타이머 만료 시 READY로 복귀
-- [ ] `sys_clock_gettime` (NR 113)
+- [x] `sys_clock_gettime` (NR 113) baseline 구현
+- [ ] `sys_clock_gettime` (NR 113) 고도화
   - [ ] CLOCK_REALTIME — 부팅 후 경과 시간 (에폭 타임 미지원 시 부팅 기준)
   - [ ] CLOCK_MONOTONIC — 아키텍처 타이머 카운터 기반
 - [ ] `sys_clock_getres` (NR 114)
-- [ ] `sys_gettimeofday` (NR 169) — clock_gettime wrapper
+- [x] `sys_gettimeofday` (NR 169) baseline 구현 — clock_gettime wrapper
+- [ ] `sys_gettimeofday` (NR 169) 고도화 (RTC 연동/epoch 기준)
 - [ ] 테스트: `modules/test_timer`
 
 ### Phase 13: 시그널 처리 (중기)
 
 #### 13-1. 시그널 인프라
-- [ ] 프로세스별 시그널 마스크 (sigset_t)
+- [x] 프로세스별 시그널 마스크 (sigset_t, 최소 64-bit)
 - [ ] 시그널 핸들러 테이블 (64개 시그널)
-- [ ] 시그널 큐 (pending signals)
+- [x] 시그널 큐 (pending signals, 최소 FIFO)
 - [ ] 시그널 전달 시점: syscall 복귀 / 인터럽트 복귀
 
 #### 13-2. 시그널 시스템 콜
 - [ ] `sys_kill` (NR 129) — 프로세스에 시그널 전송
 - [ ] `sys_tkill` (NR 130) — 스레드에 시그널 전송
 - [ ] `sys_tgkill` (NR 131)
-- [ ] `sys_rt_sigaction` (NR 134) — 시그널 핸들러 등록
+- [x] `sys_rt_sigaction` (NR 134) baseline stub 구현
+- [ ] `sys_rt_sigaction` (NR 134) 완성 구현 — 시그널 핸들러 등록
   - [ ] SA_SIGINFO, SA_RESTART, SA_NODEFER 플래그
-- [ ] `sys_rt_sigprocmask` (NR 135) — 시그널 마스크 변경
+- [x] `sys_rt_sigprocmask` (NR 135) 최소 구현 — 시그널 마스크 변경
+- [ ] `sys_rt_sigprocmask` (NR 135) 완성 구현 — 시그널 마스크 변경
   - [ ] SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK
+- [x] `sys_rt_sigtimedwait` (NR 137) 최소 구현 — pending queue 조회/소비 + `EAGAIN`
+- [ ] `sys_rt_sigtimedwait` (NR 137) 완성 구현
 - [ ] `sys_rt_sigreturn` (NR 139) — 시그널 핸들러 복귀
   - [ ] 유저 스택에 저장한 컨텍스트 복원
 
@@ -257,25 +378,26 @@
 #### 14-1. 추가 파일 시스템 콜
 - [ ] `sys_getdents64` (NR 61) — 디렉토리 엔트리 읽기
   - [ ] struct linux_dirent64 포맷 호환
-- [ ] `sys_dup` (NR 23) / `sys_dup3` (NR 24)
-  - [ ] FD 복제 (stdout 리다이렉션 등)
-- [ ] `sys_fcntl` (NR 25) — FD 플래그 조작
-  - [ ] F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL
-- [ ] `sys_ioctl` (NR 29) — 디바이스 제어
-  - [ ] TIOCGWINSZ (터미널 크기)
-  - [ ] TCGETS/TCSETS (터미널 속성)
+- [x] `sys_dup` (NR 23) / `sys_dup3` (NR 24) baseline
+  - [x] FD 복제 (stdout 리다이렉션 등)
+- [x] `sys_fcntl` (NR 25) baseline — FD 플래그 조작
+  - [x] F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL
+- [x] `sys_ioctl` (NR 29) baseline — 디바이스 제어
+  - [x] TIOCGWINSZ (터미널 크기)
+  - [x] TCGETS/TCSETS (터미널 속성)
+  - [x] TIOCSCTTY (제어 터미널 설정)
 - [ ] `sys_pipe2` (NR 59) — 파이프 생성
 - [ ] `sys_readlinkat` (NR 78)
-- [ ] `sys_fstatat` (NR 79) — 경로 기반 stat
+- [x] `sys_fstatat` (NR 79, `newfstatat`) baseline — 경로 기반 stat
 - [ ] `sys_statfs` (NR 43) — 파일시스템 정보
 - [ ] `sys_getcwd` (NR 17)
-- [ ] `sys_chdir` (NR 49)
+- [x] `sys_chdir` (NR 49) baseline
 
 #### 14-2. fstat Linux 호환
-- [ ] struct stat 구조체 완전 구현 (Linux asm-generic 호환)
-  - [ ] st_dev, st_ino, st_mode, st_nlink, st_uid, st_gid
-  - [ ] st_rdev, st_size, st_blksize, st_blocks
-  - [ ] st_atime, st_mtime, st_ctime (timespec)
+- [x] struct stat 구조체 baseline 구현 (Linux asm-generic 호환)
+  - [x] st_dev, st_ino, st_mode, st_nlink, st_uid, st_gid
+  - [x] st_rdev, st_size, st_blksize, st_blocks
+  - [x] st_atime, st_mtime, st_ctime (timespec, nsec=0 baseline)
 
 #### 14-3. FAT32 개선
 - [ ] LFN (Long File Name) 쓰기 지원
@@ -296,7 +418,8 @@
 ### Phase 15: 유저스페이스 분리 (중기)
 
 #### 15-1. 유저 바이너리 기반 셸
-- [ ] 유저 ELF 빌드 환경 구축 (Rust no_std + 커스텀 syscall wrapper)
+- [ ] (선택) 유저 ELF 빌드 환경 구축 (Rust no_std + 커스텀 syscall wrapper)
+- [ ] 외부 Linux 크로스 툴체인 산출물과 실행 호환성 검증
 - [ ] 최소 libc 구현 또는 thin syscall wrapper 라이브러리
 - [ ] `/bin/sh` — 기본 셸 (파이프, 리다이렉션)
 - [ ] `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm`
@@ -306,6 +429,16 @@
 - [ ] `sys_execve`로 `/bin/` 바이너리 실행
 - [ ] PATH 환경변수 탐색
 - [ ] Shebang (`#!`) 지원
+
+#### 15-3. 동적 ELF 로더 (추후)
+- [ ] (from Phase 10-1D) BusyBox static init 안정화 이후 착수
+- [ ] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 체인 로딩)
+- [ ] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함)
+- [ ] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석
+- [ ] 런타임 재배치 (`REL`/`RELA`, `JUMP_SLOT`, `GLOB_DAT`)
+- [ ] 공유 라이브러리 의존성 로딩 (`/lib`, `/usr/lib`)
+- [ ] 최소 런타임 ABI 정비 (TLS 등 핵심 항목)
+- [ ] 테스트: 동적 링크된 hello/glibc 또는 musl dyn 바이너리 실행
 
 ### Phase 16: I/O 멀티플렉싱 및 IPC 확장 (중기)
 
@@ -352,12 +485,14 @@
 - [ ] DHCP 클라이언트 (IP 자동 할당)
 
 #### 17-3. 소켓 시스템 콜
-- [ ] `sys_socket` (NR 198) — AF_INET, SOCK_STREAM/SOCK_DGRAM
+- [x] `sys_socket` (NR 198) baseline 구현 (`EAFNOSUPPORT`)
+- [ ] `sys_socket` (NR 198) 완성 구현 — AF_INET, SOCK_STREAM/SOCK_DGRAM
 - [ ] `sys_bind` (NR 200)
 - [ ] `sys_listen` (NR 201)
 - [ ] `sys_accept` (NR 202)
 - [ ] `sys_connect` (NR 203)
-- [ ] `sys_sendto` (NR 206) / `sys_recvfrom` (NR 207)
+- [x] `sys_sendto` (NR 206) baseline 구현 (`EBADF`/`EAFNOSUPPORT`)
+- [ ] `sys_sendto` (NR 206) / `sys_recvfrom` (NR 207) 완성 구현
 - [ ] `sys_setsockopt` (NR 208) / `sys_getsockopt` (NR 209)
 - [ ] `sys_shutdown` (NR 210)
 - [ ] 테스트: `modules/test_net`

@@ -5,6 +5,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::block::BlockDevice;
 use crate::sync::RwLock;
@@ -14,6 +15,13 @@ use super::{DirEntry, FileMode, FileSystem, FsStats, Stat, VfsError, VfsResult, 
 pub mod boot;
 pub mod dir;
 pub mod fat;
+
+#[inline]
+fn is_probably_kernel_ptr(addr: usize) -> bool {
+    addr >= 0x4000_0000 && addr < 0x8000_0000
+}
+
+static FAT32_READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// FAT32 파일시스템
 pub struct Fat32FileSystem {
@@ -170,6 +178,24 @@ impl Fat32Dir {
     /// 모든 클러스터 데이터 읽기 (FAT 체인 따라가기)
     fn read_all_cluster_data(&self) -> VfsResult<Vec<u8>> {
         let fat = fat::FatTable::new(self.device.clone(), &self.boot);
+        let (src_data, src_vtable): (usize, usize) = unsafe { core::mem::transmute_copy(&self.device) };
+        let (fat_data, fat_vtable) = fat.debug_device_ptrs();
+        if src_data != fat_data
+            || src_vtable != fat_vtable
+            || !is_probably_kernel_ptr(src_data)
+            || !is_probably_kernel_ptr(src_vtable)
+            || !is_probably_kernel_ptr(fat_data)
+            || !is_probably_kernel_ptr(fat_vtable)
+        {
+            crate::kprintln!(
+                "[fat32] read() device ptr mismatch/invalid: src=({:#x},{:#x}) fat=({:#x},{:#x})",
+                src_data,
+                src_vtable,
+                fat_data,
+                fat_vtable
+            );
+            return Err(VfsError::IoError);
+        }
         let chain = fat.read_chain(self.cluster).map_err(|_| VfsError::IoError)?;
 
         let cluster_size = self.boot.sectors_per_cluster as usize
@@ -616,6 +642,54 @@ impl Fat32File {
         Ok(data)
     }
 
+    /// 클러스터의 일부를 직접 목적 버퍼로 읽기
+    ///
+    /// 반환값은 실제로 복사한 바이트 수다.
+    fn read_cluster_into(
+        &self,
+        cluster: u32,
+        cluster_offset: usize,
+        out: &mut [u8],
+    ) -> VfsResult<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        let bytes_per_sector = self.boot.bytes_per_sector as usize;
+        let cluster_size = self.boot.sectors_per_cluster as usize * bytes_per_sector;
+        if cluster_offset >= cluster_size {
+            return Ok(0);
+        }
+
+        let start_sector = self.boot.cluster_to_sector(cluster) as u64;
+        let mut copied = 0usize;
+        let mut cur = cluster_offset;
+
+        while cur < cluster_size && copied < out.len() {
+            let sector_idx = cur / bytes_per_sector;
+            let offset_in_sector = cur % bytes_per_sector;
+            let sector = start_sector + sector_idx as u64;
+
+            // 디버깅 안정화: 섹터 버퍼를 항상 힙에 두어 스택 버퍼 경로를 배제한다.
+            let mut sector_buf = alloc::vec![0u8; bytes_per_sector];
+            self.device
+                .read_block(sector, &mut sector_buf)
+                .map_err(|_| VfsError::IoError)?;
+
+            let copied_this_sector = {
+                let n = core::cmp::min(bytes_per_sector - offset_in_sector, out.len() - copied);
+                out[copied..copied + n]
+                    .copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + n]);
+                n
+            };
+
+            copied += copied_this_sector;
+            cur += copied_this_sector;
+        }
+
+        Ok(copied)
+    }
+
     /// 클러스터 데이터 쓰기
     fn write_cluster(&self, cluster: u32, data: &[u8]) -> VfsResult<()> {
         let cluster_size = self.boot.sectors_per_cluster as usize
@@ -684,6 +758,33 @@ impl VNode for Fat32File {
     }
 
     fn read(&self, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+        let buf_ptr = buf.as_mut_ptr() as usize;
+        let log_idx = FAT32_READ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if log_idx < 32 {
+            crate::kprintln!(
+                "[fat32] read#{} file='{}' offset={} len={} buf={:#x}",
+                log_idx,
+                self.name,
+                offset,
+                buf.len(),
+                buf_ptr
+            );
+        }
+        if !is_probably_kernel_ptr(buf_ptr) {
+            crate::kprintln!(
+                "[fat32] invalid read buffer pointer: file='{}' offset={} len={} buf={:#x}",
+                self.name,
+                offset,
+                buf.len(),
+                buf_ptr
+            );
+            return Err(VfsError::IoError);
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
         let size = *self.size.read();
         let start_cluster = *self.start_cluster.read();
 
@@ -697,36 +798,99 @@ impl VNode for Fat32File {
         }
 
         let fat = fat::FatTable::new(self.device.clone(), &self.boot);
-        let chain = fat.read_chain(start_cluster).map_err(|_| VfsError::IoError)?;
 
         let cluster_size = self.boot.sectors_per_cluster as usize
             * self.boot.bytes_per_sector as usize;
 
         // 읽을 바이트 수 계산
         let bytes_to_read = core::cmp::min(buf.len(), size as usize - offset);
-        let mut bytes_read = 0;
+        let mut bytes_read = 0usize;
 
-        // 시작 클러스터 및 오프셋 계산
-        let start_cluster_idx = offset / cluster_size;
+        // 시작 클러스터 계산 (offset이 포함된 클러스터까지 FAT 체인 순회)
+        let mut current_cluster = start_cluster;
+        let mut skip_clusters = offset / cluster_size;
+        while skip_clusters > 0 {
+            let (src_data_now, src_vtable_now): (usize, usize) =
+                unsafe { core::mem::transmute_copy(&self.device) };
+            let (fat_data_now, fat_vtable_now) = fat.debug_device_ptrs();
+            if src_data_now != fat_data_now
+                || src_vtable_now != fat_vtable_now
+                || !is_probably_kernel_ptr(src_data_now)
+                || !is_probably_kernel_ptr(src_vtable_now)
+                || !is_probably_kernel_ptr(fat_data_now)
+                || !is_probably_kernel_ptr(fat_vtable_now)
+            {
+                crate::kprintln!(
+                    "[fat32] read(skip) device ptr mismatch/invalid: src=({:#x},{:#x}) fat=({:#x},{:#x}) skip_clusters={} current_cluster={}",
+                    src_data_now,
+                    src_vtable_now,
+                    fat_data_now,
+                    fat_vtable_now,
+                    skip_clusters,
+                    current_cluster
+                );
+                return Err(VfsError::IoError);
+            }
+            let next = fat.read_entry(current_cluster).map_err(|_| VfsError::IoError)?;
+            if next < 2 || next >= fat::FAT_RESERVED_MIN {
+                return Ok(bytes_read);
+            }
+            current_cluster = next;
+            skip_clusters -= 1;
+        }
+
+        // 현재 클러스터 내 시작 오프셋
         let mut cluster_offset = offset % cluster_size;
 
-        for (_i, &cluster) in chain.iter().enumerate().skip(start_cluster_idx) {
+        loop {
             if bytes_read >= bytes_to_read {
                 break;
             }
 
-            // 클러스터 데이터 읽기
-            let cluster_data = self.read_cluster(cluster)?;
+            // 클러스터의 필요한 구간만 직접 복사
+            let copied = self.read_cluster_into(
+                current_cluster,
+                cluster_offset,
+                &mut buf[bytes_read..bytes_to_read],
+            )?;
+            if copied == 0 {
+                break;
+            }
+            bytes_read += copied;
 
-            // 데이터 복사
-            let copy_start = cluster_offset;
-            let copy_len = core::cmp::min(cluster_size - copy_start, bytes_to_read - bytes_read);
+            if bytes_read >= bytes_to_read {
+                break;
+            }
 
-            buf[bytes_read..bytes_read + copy_len]
-                .copy_from_slice(&cluster_data[copy_start..copy_start + copy_len]);
-
-            bytes_read += copy_len;
-            cluster_offset = 0; // 첫 클러스터 이후는 0부터 시작
+            // 다음 클러스터로 이동
+            let (src_data_now, src_vtable_now): (usize, usize) =
+                unsafe { core::mem::transmute_copy(&self.device) };
+            let (fat_data_now, fat_vtable_now) = fat.debug_device_ptrs();
+            if src_data_now != fat_data_now
+                || src_vtable_now != fat_vtable_now
+                || !is_probably_kernel_ptr(src_data_now)
+                || !is_probably_kernel_ptr(src_vtable_now)
+                || !is_probably_kernel_ptr(fat_data_now)
+                || !is_probably_kernel_ptr(fat_vtable_now)
+            {
+                crate::kprintln!(
+                    "[fat32] read(loop) device ptr mismatch/invalid: src=({:#x},{:#x}) fat=({:#x},{:#x}) bytes_read={} bytes_to_read={} cluster={}",
+                    src_data_now,
+                    src_vtable_now,
+                    fat_data_now,
+                    fat_vtable_now,
+                    bytes_read,
+                    bytes_to_read,
+                    current_cluster
+                );
+                break;
+            }
+            let next = fat.read_entry(current_cluster).map_err(|_| VfsError::IoError)?;
+            if next < 2 || next >= fat::FAT_RESERVED_MIN {
+                break;
+            }
+            current_cluster = next;
+            cluster_offset = 0;
         }
 
         Ok(bytes_read)

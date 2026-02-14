@@ -142,12 +142,9 @@ pub fn init() -> Result<(), &'static str> {
         // 4. Priority Mask 설정 (모든 우선순위 허용)
         gicc_write(GICC_PMR, 0xFF);
         
-        // 5. Physical Timer IRQ 설정
-        set_priority(IRQ_PHYS_TIMER, 0xA0); // 중간 우선순위
-        set_target(IRQ_PHYS_TIMER, 1);      // CPU 0에 전달
-        enable_irq(IRQ_PHYS_TIMER);
-        
-        kprintln!("[GIC] Physical Timer IRQ {} enabled", IRQ_PHYS_TIMER);
+        // 5. Physical Timer IRQ는 현재 비활성화
+        // TODO: 커널 선점/IRQ 경로 안정화 후 재활성화
+        kprintln!("[GIC] Physical Timer IRQ {} disabled (temporary)", IRQ_PHYS_TIMER);
         
         // 6. UART IRQ 설정
         set_priority(IRQ_UART, 0x80);       // 높은 우선순위

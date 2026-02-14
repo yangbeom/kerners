@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ARCH="${1:-aarch64}"
-DISK_IMG="$PROJECT_ROOT/disk_test.img"
+DISK_IMG="${KERNERS_DISK_IMG:-$PROJECT_ROOT/disk.img}"
 DISK_SIZE=32  # MB
 MODULE_DIR="$PROJECT_ROOT/target/modules/$ARCH"
 

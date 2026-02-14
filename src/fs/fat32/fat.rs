@@ -53,24 +53,44 @@ impl FatTable {
         }
     }
 
+    /// 디버깅용: Arc<dyn BlockDevice>의 (data, vtable) 포인터 반환
+    pub fn debug_device_ptrs(&self) -> (usize, usize) {
+        unsafe { core::mem::transmute_copy(&self.device) }
+    }
+
     /// 클러스터의 다음 클러스터 읽기
     pub fn read_entry(&self, cluster: u32) -> Result<u32, FatError> {
-        if cluster < 2 || cluster >= self.total_clusters + 2 {
+        let total_clusters = self.total_clusters;
+        let fat_start = self.fat_start;
+        let bytes_per_sector = self.bytes_per_sector as u32;
+
+        if cluster < 2 || cluster >= total_clusters + 2 {
             return Err(FatError::InvalidCluster);
         }
 
         // FAT 엔트리 위치 계산
         let fat_offset = cluster * 4; // FAT32는 4바이트 엔트리
-        let fat_sector = self.fat_start + (fat_offset / self.bytes_per_sector as u32);
-        let entry_offset = (fat_offset % self.bytes_per_sector as u32) as usize;
+        let fat_sector = fat_start + (fat_offset / bytes_per_sector);
+        let entry_offset = (fat_offset % bytes_per_sector) as usize;
 
-        // 섹터 읽기
-        let mut buf = vec![0u8; self.bytes_per_sector as usize];
+        // 커널 주소 공간 밖의 손상된 fat pointer는 즉시 거부하여 data abort를 방지한다.
+        let (device_data, device_vtable): (usize, usize) =
+            unsafe { core::mem::transmute_copy(&self.device) };
+        if !is_probably_kernel_ptr(device_data) || !is_probably_kernel_ptr(device_vtable) {
+            crate::kprintln!(
+                "[fat32] invalid block device pointer in read_entry: data={:#x}, vtable={:#x}, cluster={}",
+                device_data,
+                device_vtable,
+                cluster
+            );
+            return Err(FatError::IoError);
+        }
+
+        // 디버깅 안정화: FAT 섹터는 힙 버퍼로만 읽어 스택 버퍼 경로를 배제한다.
+        let mut buf = vec![0u8; bytes_per_sector as usize];
         self.device
             .read_block(fat_sector as u64, &mut buf)
             .map_err(|_| FatError::IoError)?;
-
-        // 엔트리 읽기 (리틀 엔디안)
         let entry = u32::from_le_bytes([
             buf[entry_offset],
             buf[entry_offset + 1],
@@ -298,6 +318,12 @@ impl FatTable {
         *self.free_count.lock() = Some(count);
         Ok(count)
     }
+}
+
+#[inline]
+fn is_probably_kernel_ptr(addr: usize) -> bool {
+    // 현재 QEMU virt 환경에서 커널/힙/텍스트가 0x4000_0000 이상에 배치된다.
+    addr >= 0x4000_0000 && addr < 0x8000_0000
 }
 
 /// FAT 테이블 에러

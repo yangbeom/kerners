@@ -38,7 +38,7 @@ RAM 시작: 0x40000000
            │  .data                   │  초기화된 데이터
            │  .bss                    │  미초기화 데이터
            ├──────────────────────────┤  ← 커널 끝 (_end), 4KB 정렬
-           │  Stack                   │  256KB
+           │  Bootstrap Stack         │  링커 예약 영역 (aarch64 기본 1MB)
            ├──────────────────────────┤
            │                          │
            │  Heap                    │  RAM의 1/4, 최대 128MB
@@ -83,7 +83,7 @@ static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 mm::heap::init(heap_start, heap_size)?;
 ```
 
-- `heap_start`: 커널 끝(`_end`) 이후, 4KB 정렬된 주소
+- `heap_start`: bootstrap stack top(`_stack_start`) 이후, 4KB 정렬된 주소
 - `heap_size`: RAM의 1/4, 최대 128MB
 
 ### API
@@ -241,7 +241,8 @@ _entry()
               │
               ├─► 메모리 레이아웃 계산
               │     ├─► kernel_end = _end (링커 심볼)
-              │     ├─► heap_start = align_4k(kernel_end)
+              │     ├─► boot_stack_top = _stack_start (링커 심볼)
+              │     ├─► heap_start = align_4k(boot_stack_top)
               │     ├─► heap_size = min(ram_size/4, 128MB)
               │     └─► frame_alloc = heap_end ~ (ram_end - 4MB)
               │
@@ -261,17 +262,8 @@ _entry()
 |-----------|------|--------|------|
 | `max_heap_size` | `mm/mod.rs` | 128MB | 힙 최대 크기 |
 | `reserved_at_end` | `mm/mod.rs` | 4MB | RAM 끝 예약 영역 (DTB 등) |
+| `_stack_start - _end` | 링커 스크립트 | aarch64: 1MB, riscv64: 256KB | bootstrap 스택 예약 영역 |
 | `PAGE_SIZE` | `mm/page.rs` | 4096 | 페이지 크기 |
-
----
-
-## 향후 개선 사항
-
-- [ ] **Buddy Allocator**: 현재 비트맵 방식을 Buddy 시스템으로 대체하여 단편화 감소
-- [ ] **NUMA 지원**: 다중 메모리 노드 지원
-- [ ] **Memory Zones**: DMA, Normal, High 영역 구분
-- [ ] **Page Cache**: 파일 시스템 캐시 지원
-- [ ] **Slab Allocator**: 커널 객체 캐싱
 
 ---
 

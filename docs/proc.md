@@ -6,6 +6,9 @@
 
 `src/proc/` 모듈은 커널 스레드 추상화와 스케줄링을 제공합니다.
 
+프로세스 관련 syscall의 최소 메타데이터(`ppid/pgid/sid/signal_mask/pending`)는
+`src/syscall/process.rs`에서 별도로 관리합니다.
+
 ## Thread Model
 
 현재 커널은 커널 스레드만 지원하며, 각 스레드는 독립적인 스택과 실행 컨텍스트를 가집니다.
@@ -19,6 +22,7 @@ pub struct Thread {
     pub state: ThreadState,    // 상태
     pub context: Context,      // CPU 컨텍스트
     pub kernel_stack: Vec<u8>, // 커널 스택
+    pub user_stack: Option<Vec<u8>>, // execve 후 유저 스택 보관
 }
 ```
 
@@ -173,6 +177,36 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 }
 ```
 
+### execve 전이
+
+- `sys_execve`는 즉시 `eret/mret` 하지 않고 pending 전이 정보를 저장합니다.
+- syscall trap 복귀 경로에서 현재 컨텍스트의 `PC/SP`를 새 ELF 이미지의 엔트리/스택으로 교체합니다.
+- 유저 스택 메모리는 현재 스레드(`Thread.user_stack`)에 바인딩해 수명을 보장합니다.
+- 유저 초기 스택의 auxv에는 최소 호환 키를 포함합니다:
+  - `AT_ENTRY`, `AT_PHDR`, `AT_PHNUM`, `AT_PAGESZ`
+- aarch64 경로에서는 `path/argv/envp` 유저 포인터 범위를 선검증합니다.
+- 실행 파일은 static ELF(`ET_EXEC`) 기준이며, `PT_INTERP`를 포함한 동적 ELF는 지원하지 않습니다.
+- ELF `PT_LOAD` 세그먼트의 가상주소가 현재 identity-mapped RAM 범위를 벗어나면 exec 준비가 실패합니다.
+
+### fork/vfork/wait 최소 동작
+
+- aarch64 유저 syscall 경로에서는 부모 trap context를 복사해 자식이 `sys_clone/fork/vfork`에서 0을 반환하도록 복귀합니다.
+- `sys_clone`는 `CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_SIGHAND` 플래그를 리소스 그룹 메타데이터로 추적합니다.
+- `sys_exit`는 부모의 zombie 리스트에 종료 상태를 등록하고 `SIGCHLD`를 큐잉합니다.
+- `sys_wait4`는 zombie를 회수하고 Linux wait status(`exit_code << 8`)를 기록합니다.
+- `sys_waitid`는 `P_ALL/P_PID/P_PGID` + `WEXITED/WNOHANG/WNOWAIT` 최소 조합을 지원합니다.
+- 부모가 먼저 종료되면 자식/좀비를 init(`pid=1`)으로 reparent합니다.
+
+### 부팅 시 PID 1 실행 경로
+
+- 커널은 부팅 후 init 후보 경로를 순서대로 탐색합니다:
+  - `/sbin/init` → `/etc/init` → `/bin/init` → `/bin/sh`
+  - 현재 루트(RamFS)에 없으면 `/mnt/*` 경로를 fallback으로 탐색
+- `/dev/vda`가 존재하면 FAT32를 `/mnt`에 자동 마운트하여 외부 ELF 탐색 경로를 확보합니다.
+- init 스레드(`tid=1`)는 `prepare_exec_image()`로 준비한 `PreparedExecImage`를 받아
+  아키텍처별 `eret/mret`로 직접 유저 모드 진입합니다.
+- init 실행에 실패하면 커널 셸로 fallback합니다.
+
 ## Stack Layout
 
 ```
@@ -186,9 +220,8 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 └─────────────────────┘ Low address
 ```
 
-## Future Work
+## 현재 제약
 
-- [ ] 프로세스 추상화 (주소 공간 분리)
-- [ ] 우선순위 기반 스케줄링
-- [ ] SMP 지원
-- [ ] 프로세스 그룹 / 세션
+- 프로세스별 독립 주소 공간(페이지 테이블 분리)은 아직 미구현입니다.
+- COW 기반 `fork` 메모리 공유/분리는 아직 미구현입니다.
+- signal handler delivery(`rt_sigaction` 실제 핸들러 진입)는 아직 미구현입니다.

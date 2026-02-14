@@ -89,6 +89,11 @@ kerners/
 │   └── dtb/                 # Device Tree Blob 파싱
 │       └── mod.rs           # DTB 파서
 ├── modules/hello/           # 테스트 커널 모듈
+├── modules/test_execve/     # execve 에러 경로 테스트 모듈
+├── modules/test_proc/       # process syscall baseline 테스트 모듈
+├── modules/test_fork/       # fork/waitid/uname 호환성 테스트 모듈
+├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
+├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
 ├── docs/                    # 문서 (전체 목록은 docs/README.md 참조)
 ├── linker_aarch64.ld        # aarch64 링커 스크립트
@@ -112,6 +117,9 @@ cargo build --release --target targets/riscv64-unknown-elf.json
 # 아키텍처 및 메모리 크기 지정
 ./run.sh aarch64 512    # ARM64, 512MB
 ./run.sh riscv64 1024   # RISC-V, 1GB
+
+# BusyBox init 디스크 자동 준비 후 실행
+KERNERS_BUSYBOX=/absolute/path/to/busybox ./run.sh aarch64
 ```
 
 ## Shell Commands

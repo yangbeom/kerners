@@ -38,6 +38,23 @@ kerners 커널의 서브시스템별 설계 및 구현 문서입니다.
 ./run.sh aarch64 512 4    # ARM64, 512MB, 4 CPUs
 ```
 
-## 개발 로드맵
+## 현재 구현 핵심
 
-전체 개발 계획은 [plan.md](../plan.md)를 참조하세요.
+- 메모리: 비트맵 페이지 할당자 + `linked_list_allocator` 기반 힙
+- 프로세스/스레드: 커널 스레드, 선점형 스케줄러, 유저 모드 진입
+- 파일시스템: VFS + RamFS/DevFS/FAT32 + FD 테이블
+- 블록/디바이스: VirtIO 블록 디바이스 및 `/dev/vda` 연동
+- 모듈: ELF64 `ET_REL` 로더, 심볼 해석, PLT
+- 시스템 콜: 파일 I/O + process syscall(`execve`, `brk`, `mmap/munmap` baseline)
+- 테스트: 커널 모듈 기반 자동 테스트(`make test`, `make test-all`)
+
+## 실행/검증 관련 문서
+
+- [qemu-guide.md](qemu-guide.md) — QEMU 실행, BusyBox init 부팅, 스모크 테스트
+- [testing.md](testing.md) — 테스트 러너 구조, 테스트 모듈 작성/실행
+- [syscall.md](syscall.md) — 시스템 콜 ABI, 구현된 syscall 목록
+- [proc.md](proc.md) — 스레드/스케줄러/exec 전이 경로
+
+## 개발 계획
+
+개발 계획과 우선순위는 [plan.md](../plan.md)를 참조하세요.

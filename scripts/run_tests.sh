@@ -83,7 +83,7 @@ else
 fi
 
 # ---- Step 4: QEMU 실행 ----
-DISK_IMG="$PROJECT_ROOT/disk_test.img"
+DISK_IMG="${KERNERS_DISK_IMG:-$PROJECT_ROOT/disk.img}"
 VIRTIO_BLK=""
 if [ -f "$DISK_IMG" ]; then
     VIRTIO_BLK="-drive file=$DISK_IMG,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"

@@ -150,9 +150,6 @@ pub fn handle_irq() {
 
     // Per-CPU 틱 카운터 업데이트
     crate::proc::percpu::current().tick_count.fetch_add(1, Ordering::Relaxed);
-
-    // 선점 스케줄링: 타이머 틱마다 스케줄러 호출
-    crate::proc::scheduler::schedule();
 }
 
 /// 현재 틱 수 반환

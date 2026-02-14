@@ -191,8 +191,29 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
             ];
             
             let ret = crate::syscall::syscall_handler(syscall_num, args);
-            ctx.gpr[10] = ret as u64;  // 반환값을 a0에 저장
-            ctx.mepc += 4;  // ecall 다음 명령어로 (ecall은 4바이트)
+
+            if let Some(exec) = crate::syscall::take_exec_transition_for_current() {
+                if crate::proc::set_current_user_stack(exec.user_stack) {
+                    // execve 성공: 다음 복귀 지점을 새 엔트리로 교체
+                    ctx.mepc = exec.entry as u64;
+                    ctx.gpr[2] = exec.stack_top as u64; // sp
+                    ctx.gpr[10] = exec.argc as u64; // a0
+                    ctx.gpr[11] = exec.argv as u64; // a1
+                    ctx.gpr[12] = exec.envp as u64; // a2
+                    kprintln!(
+                        "[syscall] execve applied: entry={:#x}, sp={:#x}, argc={}",
+                        exec.entry,
+                        exec.stack_top,
+                        exec.argc
+                    );
+                } else {
+                    ctx.gpr[10] = crate::syscall::errno::EPERM as u64;
+                    ctx.mepc += 4;
+                }
+            } else {
+                ctx.gpr[10] = ret as u64; // 반환값을 a0에 저장
+                ctx.mepc += 4; // ecall 다음 명령어로 (ecall은 4바이트)
+            }
         }
         12 => {
             // Instruction page fault

@@ -410,16 +410,49 @@ impl Virtqueue {
 
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
-            // Descriptor 해제
-            self.free_descriptor_chain(elem.id as u16);
+            let head = elem.id as u16;
+            if head >= self.queue_size {
+                crate::kprintln!(
+                    "[VirtIO] invalid used id: {} (queue size={})",
+                    head,
+                    self.queue_size
+                );
+                return Some((self.queue_size, elem.len));
+            }
+            if !self.validate_descriptor_chain(head) {
+                crate::kprintln!(
+                    "[VirtIO] corrupted descriptor chain from used id {}",
+                    head
+                );
+                return Some((self.queue_size, elem.len));
+            }
 
-            Some((elem.id as u16, elem.len))
+            // Descriptor 해제
+            self.free_descriptor_chain(head);
+
+            Some((head, elem.len))
         }
     }
 
     /// Descriptor 체인 해제
     fn free_descriptor_chain(&mut self, mut head: u16) {
+        let mut freed = 0u16;
         loop {
+            if head >= self.queue_size {
+                crate::kprintln!(
+                    "[VirtIO] free_descriptor_chain: head out of range {} (size={})",
+                    head,
+                    self.queue_size
+                );
+                break;
+            }
+            if freed >= self.queue_size {
+                crate::kprintln!(
+                    "[VirtIO] free_descriptor_chain: chain too long (possible cycle)"
+                );
+                break;
+            }
+
             unsafe {
                 let desc = &mut *self.desc_table.add(head as usize);
                 let has_next = desc.flags & desc_flags::NEXT != 0;
@@ -435,6 +468,29 @@ impl Virtqueue {
                     break;
                 }
             }
+            freed = freed.wrapping_add(1);
+        }
+    }
+
+    /// Descriptor 체인 무결성 검증
+    fn validate_descriptor_chain(&self, mut head: u16) -> bool {
+        let mut visited = 0u16;
+        loop {
+            if head >= self.queue_size {
+                return false;
+            }
+            if visited >= self.queue_size {
+                return false;
+            }
+
+            unsafe {
+                let desc = &*self.desc_table.add(head as usize);
+                if desc.flags & desc_flags::NEXT == 0 {
+                    return true;
+                }
+                head = desc.next;
+            }
+            visited = visited.wrapping_add(1);
         }
     }
 
@@ -463,6 +519,20 @@ impl Virtqueue {
     /// Last used 인덱스 (디버그용)
     pub fn last_used_idx(&self) -> u16 {
         self.last_used_idx
+    }
+
+    /// 특정 avail 인덱스 슬롯의 head descriptor 값 조회 (디버그용)
+    pub fn avail_head_at(&self, avail_idx: u16) -> u16 {
+        unsafe {
+            let avail = &*self.avail_ring;
+            let ring_ptr = (avail as *const VirtqAvail).add(1) as *const u16;
+            read_volatile(ring_ptr.add((avail_idx % self.queue_size) as usize))
+        }
+    }
+
+    /// descriptor 하나를 직접 조회 (디버그용)
+    pub fn descriptor(&self, idx: u16) -> VirtqDesc {
+        unsafe { read_volatile(self.desc_table.add(idx as usize)) }
     }
 
     /// Used 링 인덱스 (디버그용)

@@ -24,9 +24,11 @@ make test
   │     → target/modules/{arch}/test_vfs.ko
   │     → target/modules/{arch}/test_thread.ko
   │     → target/modules/{arch}/test_log.ko
+  │     → target/modules/{arch}/test_proc.ko
+  │     → target/modules/{arch}/test_fork.ko
   │
   ├─ 2) FAT32 디스크 이미지 생성 + .ko 파일 복사
-  │     → disk_test.img (mcopy로 .ko를 FAT32에 넣음)
+  │     → disk.img (mcopy로 .ko를 FAT32에 넣음, `KERNERS_DISK_IMG`로 경로 override 가능)
   │
   ├─ 3) 커널 빌드 (--features test_runner)
   │
@@ -42,15 +44,15 @@ $ make test ARCH=aarch64
    → rustc로 각 테스트 모듈 빌드 → .ko 파일 생성
 
 2) scripts/prepare_test_disk.sh aarch64
-   → dd + mkfs.vfat/mformat → disk_test.img (FAT32, 32MB)
-   → mcopy -i disk_test.img target/modules/aarch64/*.ko ::
+   → dd + mkfs.vfat/mformat → disk.img (FAT32, 32MB)
+   → mcopy -i disk.img target/modules/aarch64/*.ko ::
 
 3) cargo build --release --target aarch64-unknown-none-softfloat --features test_runner
 
 4) qemu-system-aarch64 -machine virt -cpu cortex-a57 \
      -semihosting-config enable=on,target=native \
      -m 512M -nographic \
-     -drive file=disk_test.img,format=raw,if=none,id=hd0 \
+     -drive file=disk.img,format=raw,if=none,id=hd0 \
      -device virtio-blk-device,drive=hd0 \
      -kernel kerners.bin
 ```
@@ -64,7 +66,7 @@ $ make test ARCH=aarch64
 
 === KERNERS TEST SUITE START ===
 
-[test] Found 6 test module(s)
+[test] Found 9 test module(s)
 
 [test] Loading /mnt/TEST_IPC.KO ...     (FAT32 8.3 대문자)
 [test_ipc] mq create .................. PASS
@@ -93,8 +95,19 @@ $ make test ARCH=aarch64
 [test] Loading /mnt/test_thread.ko ...
 [test_thread] tid/spawn/worker/yield .. PASS
 
+[test] Loading /mnt/test_fork.ko ...
+[test_fork] fork/wait4 status macros .. PASS
+[test_fork] waitid(WNOWAIT) + wait4 ... PASS
+[test_fork] vfork/waitid consume ...... PASS
+[test_fork] uname basics .............. PASS
+
+[test] Loading /mnt/test_proc.ko ...
+[test_proc] getpid/gettid/getppid ..... PASS
+[test_proc] brk grow/shrink ........... PASS
+[test_proc] mmap/munmap ............... PASS
+
 === KERNERS TEST SUITE END ===
-RESULT: 6 passed, 0 failed
+RESULT: 9 passed, 0 failed
 TEST_STATUS: PASS
 
 → qemu_exit(0)
@@ -150,6 +163,21 @@ make test-all
 각 테스트 모듈은 `modules/hello/`와 동일한 구조의 독립 커널 모듈이다.
 `module_init()`이 테스트를 실행하고, 반환값으로 결과를 알린다 (0 = pass, non-zero = fail).
 
+## execve / process 테스트 모듈
+
+- `modules/test_execve`
+  - 존재하지 않는 경로(`ENOENT`)
+  - 비 ELF 파일 실행 시도(`ENOEXEC`)
+- `modules/test_proc`
+  - `getpid/gettid/getppid`
+  - `brk` 증가/감소
+  - `mmap/munmap` (anonymous/private baseline)
+  - `rt_sigprocmask/rt_sigtimedwait` (pending signal queue)
+  - `fork/vfork/wait4` 최소 경로
+- `modules/test_fork`
+  - `fork/vfork` + `wait4/waitid` 호환 경로
+  - `uname` 반환값 검증
+
 ### modules/test_mm — 메모리 관리
 
 | 테스트 | 설명 |
@@ -201,6 +229,35 @@ make test-all
 | all log levels | ERROR~TRACE 전 레벨 `kernel_log()` 호출 |
 | rapid logging | 50개 메시지 연속 출력 (스트레스 테스트) |
 | long message | 긴 메시지 링 버퍼 저장 확인 |
+
+### modules/test_execve — exec 준비 경로
+
+| 테스트 | 설명 |
+|--------|------|
+| missing path | 존재하지 않는 경로에 대해 `kernel_exec_prepare()`가 `ENOENT(-2)` 반환 |
+| non-ELF | 일반 파일에 대해 `kernel_exec_prepare()`가 `ENOEXEC(-8)` 반환 |
+
+### modules/test_proc — process syscall baseline
+
+| 테스트 | 설명 |
+|--------|------|
+| getpid/gettid/getppid | PID/TID/PPID 기본 조회 검증 |
+| brk grow/shrink | `brk(0)` 조회 및 증가/감소 경로 검증 |
+| mmap/munmap | anonymous/private 매핑 + 읽기/쓰기 + 해제 검증 |
+| unsupported mode | file-backed mmap 미지원 시 `ENOSYS(-38)` 검증 |
+| signal queue | `rt_sigprocmask` + `rt_sigtimedwait`로 pending signal 소비 검증 |
+| fork/wait4 | `fork` 후 `wait4`로 자식 회수 및 상태 검증 |
+| vfork/wait4 | `vfork` 후 `wait4`로 자식 회수 검증 |
+| no child (`WNOHANG`) | 자식이 없을 때 `wait4(..., WNOHANG)`의 `ECHILD(-10)` 검증 |
+
+### modules/test_fork — fork/waitid/uname
+
+| 테스트 | 설명 |
+|--------|------|
+| fork/wait4 status macros | `WIFEXITED/WEXITSTATUS` 호환 wait status 인코딩 검증 |
+| waitid(WNOWAIT) + wait4 | `waitid(..., WNOWAIT)` 이후 `wait4` 회수 가능 여부 검증 |
+| vfork/waitid consume | `waitid`가 자식을 회수하고 재대기 시 `ECHILD` 반환 확인 |
+| uname basics | `sys_uname`의 `sysname=Kerners`, machine 필드 기본값 검증 |
 
 ## 커널 심볼 익스포트
 
@@ -259,6 +316,7 @@ make test-all
 | `kernel_vfs_write` | `(path: *const u8, path_len: usize, offset: usize, data: *const u8, data_len: usize) -> i32` |
 | `kernel_vfs_read` | `(path: *const u8, path_len: usize, offset: usize, buf: *mut u8, buf_len: usize) -> i32` |
 | `kernel_vfs_unlink` | `(path: *const u8, path_len: usize) -> i32` |
+| `kernel_exec_prepare` | `(path: *const u8, path_len: usize) -> i32` |
 
 ### Thread
 
@@ -339,7 +397,8 @@ fn panic(_info: &PanicInfo) -> ! {
 | 스크립트 | 설명 |
 |----------|------|
 | `scripts/build_test_modules.sh [ARCH]` | `modules/test_*/`를 순회하여 `.ko` 빌드 |
-| `scripts/prepare_test_disk.sh [ARCH]` | FAT32 `disk_test.img` 생성 + `.ko` 복사 |
+| `scripts/prepare_test_disk.sh [ARCH]` | FAT32 `disk.img` 생성 + `.ko` 복사 (`KERNERS_DISK_IMG` 지원) |
+| `scripts/prepare_user_disk.sh [ARCH] [BUSYBOX_PATH] [DISK_IMG]` | BusyBox 기반 `disk.img` 생성 (`/sbin/init`, `/bin/init` 포함) |
 | `scripts/run_tests.sh [ARCH] [TIMEOUT]` | 전체 오케스트레이션 (빌드 → 디스크 → 커널 → QEMU → 결과 파싱) |
 
 ## 관련 소스
@@ -347,6 +406,6 @@ fn panic(_info: &PanicInfo) -> ! {
 | 파일 | 설명 |
 |------|------|
 | `src/test_runner.rs` | QEMU 내 테스트 러너 (FAT32 마운트 → 모듈 로드 → 실행 → 결과 집계) |
-| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (19개 심볼) |
+| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (34개 심볼) |
 | `src/module/symbol.rs` | 커널 심볼 테이블 + 컴파일러 intrinsic (memset/memcpy/memmove) |
 | `Cargo.toml` | `test_runner` feature 정의 |

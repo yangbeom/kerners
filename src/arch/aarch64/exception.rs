@@ -97,9 +97,54 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
             ctx.gpr[5] as usize,  // x5
         ];
         
-        let ret = crate::syscall::syscall_handler(syscall_num, args);
-        ctx.gpr[0] = ret as u64;  // 반환값을 x0에 저장
-        // elr은 이미 svc 다음 명령어를 가리킴 (자동)
+        let user_sp: usize;
+        unsafe {
+            // SAFETY: SVC 예외 진입 시점의 현재 EL0 스택 포인터를 읽어 clone/fork 경로에 전달한다.
+            core::arch::asm!(
+                "mrs {sp}, sp_el0",
+                sp = out(reg) user_sp,
+                options(nostack, nomem)
+            );
+        }
+
+        let ret = crate::syscall::syscall_handler_aarch64_with_user_context(
+            syscall_num,
+            args,
+            ctx.gpr,
+            ctx.elr,
+            ctx.spsr,
+            user_sp,
+        );
+
+        if let Some(exec) = crate::syscall::take_exec_transition_for_current() {
+            if crate::proc::set_current_user_stack(exec.user_stack) {
+                // execve 성공: 복귀 지점을 새 엔트리로 교체
+                ctx.elr = exec.entry as u64;
+                ctx.gpr[0] = exec.argc as u64;
+                ctx.gpr[1] = exec.argv as u64;
+                ctx.gpr[2] = exec.envp as u64;
+                unsafe {
+                    // SAFETY: EL1 예외 컨텍스트에서 EL0 사용자 스택 포인터를 갱신한다.
+                    core::arch::asm!(
+                        "msr sp_el0, {sp}",
+                        sp = in(reg) exec.stack_top,
+                        options(nostack, nomem)
+                    );
+                }
+                kprintln!(
+                    "[syscall] execve applied: entry={:#x}, sp={:#x}, argc={}",
+                    exec.entry,
+                    exec.stack_top,
+                    exec.argc
+                );
+            } else {
+                // 현재 스레드 정보가 없으면 exec 실패로 반환
+                ctx.gpr[0] = crate::syscall::errno::EPERM as u64;
+            }
+        } else {
+            ctx.gpr[0] = ret as u64; // 일반 syscall 반환값
+        }
+        // elr은 기본적으로 svc 다음 명령어를 가리킴
         return;
     }
 
@@ -676,6 +721,21 @@ pub fn init() {
     }
 
     unsafe {
+        // EL0/EL1에서 FP/SIMD(NEON) 접근 허용
+        let mut cpacr_el1: u64;
+        core::arch::asm!(
+            "mrs {cpacr}, cpacr_el1",
+            cpacr = out(reg) cpacr_el1,
+            options(nomem, nostack)
+        );
+        cpacr_el1 |= 0b11 << 20; // FPEN[21:20] = 0b11
+        core::arch::asm!(
+            "msr cpacr_el1, {cpacr}",
+            "isb",
+            cpacr = in(reg) cpacr_el1,
+            options(nomem, nostack)
+        );
+
         let vectors = &raw const exception_vectors as u64;
         core::arch::asm!(
             "msr vbar_el1, {0}",
@@ -684,6 +744,7 @@ pub fn init() {
             options(nomem, nostack)
         );
 
+        crate::kprintln!("[aarch64] FP/SIMD enabled for EL0/EL1");
         crate::kprintln!("[aarch64] Exception vectors initialized at {:#x}", vectors);
     }
 }

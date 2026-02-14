@@ -48,6 +48,8 @@ pub struct Thread {
     pub context: Context,
     /// 커널 스택 (Box로 관리)
     pub kernel_stack: Vec<u8>,
+    /// 유저 스택 (execve 등으로 유저 모드 진입 시 보관)
+    pub user_stack: Option<Vec<u8>>,
     /// CPU 친화도 (None = 모든 CPU에서 실행 가능, Some(id) = 특정 CPU에 고정)
     pub cpu_affinity: Option<u32>,
 }
@@ -78,6 +80,7 @@ impl Thread {
             state: ThreadState::Ready,
             context,
             kernel_stack,
+            user_stack: None,
             cpu_affinity: None, // 모든 CPU에서 실행 가능
         }
     }
@@ -95,6 +98,7 @@ impl Thread {
             state: ThreadState::Running,
             context: Context::empty(),
             kernel_stack,
+            user_stack: None,
             cpu_affinity: Some(0),
         }
     }
@@ -109,6 +113,7 @@ impl Thread {
             state: ThreadState::Running,
             context: Context::empty(),
             kernel_stack: Vec::new(), // 스택은 percpu::stacks에서 관리
+            user_stack: None,
             cpu_affinity: Some(cpu_id),
         }
     }
@@ -215,6 +220,24 @@ pub fn current_context_ptr() -> Option<*mut Context> {
     }
     let mut threads = THREADS.lock();
     threads.get_mut(idx as usize).map(|t| &mut t.context as *mut Context)
+}
+
+/// 현재 스레드의 유저 스택을 설정
+///
+/// execve 이후 유저 스택 메모리를 스레드 수명과 함께 유지하기 위해 사용한다.
+pub fn set_current_user_stack(user_stack: Vec<u8>) -> bool {
+    let idx = percpu::current().current_thread_idx.load(Ordering::Acquire);
+    if idx == u32::MAX {
+        return false;
+    }
+
+    let mut threads = THREADS.lock();
+    if let Some(thread) = threads.get_mut(idx as usize) {
+        thread.user_stack = Some(user_stack);
+        true
+    } else {
+        false
+    }
 }
 
 /// 스레드 상태 출력

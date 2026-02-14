@@ -344,6 +344,161 @@ pub extern "C" fn kernel_vfs_unlink(path: *const u8, path_len: usize) -> i32 {
 }
 
 // ============================================================
+// Exec (유저 ELF 준비)
+// ============================================================
+
+/// exec 준비 검증 (실행 전 단계)
+/// 반환: 0 = 성공, 음수 = errno 스타일 에러
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_exec_prepare(path: *const u8, path_len: usize) -> i32 {
+    let path_str = match str_from_raw(path, path_len) {
+        Some(s) => s,
+        None => return -14, // EFAULT
+    };
+
+    let mut argv = alloc::vec::Vec::new();
+    argv.push(alloc::string::String::from(path_str));
+    let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+
+    match crate::proc::user::prepare_exec_image(path_str, &argv, &envp) {
+        Ok(_) => 0,
+        Err(crate::proc::user::ExecError::NotFound) => -2, // ENOENT
+        Err(crate::proc::user::ExecError::OutOfMemory) => -12, // ENOMEM
+        Err(crate::proc::user::ExecError::InvalidArgument) => -22, // EINVAL
+        Err(crate::proc::user::ExecError::InvalidElf)
+        | Err(crate::proc::user::ExecError::UnsupportedExecutableType)
+        | Err(crate::proc::user::ExecError::DynamicElfNotSupported) => -8, // ENOEXEC
+        Err(crate::proc::user::ExecError::IoError) => -5, // EIO
+    }
+}
+
+// ============================================================
+// Process Syscalls (10-1B)
+// ============================================================
+
+/// getpid syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_getpid() -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_GETPID, [0; 6]) as i64
+}
+
+/// getppid syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_getppid() -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_GETPPID, [0; 6]) as i64
+}
+
+/// gettid syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_gettid() -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_GETTID, [0; 6]) as i64
+}
+
+/// brk syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_brk(addr: usize) -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_BRK, [addr, 0, 0, 0, 0, 0]) as i64
+}
+
+/// mmap syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: i64,
+    offset: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_MMAP,
+        [addr, len, prot, flags, fd as usize, offset],
+    ) as i64
+}
+
+/// munmap syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_munmap(addr: usize, len: usize) -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_MUNMAP, [addr, len, 0, 0, 0, 0]) as i64
+}
+
+/// rt_sigprocmask syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_rt_sigprocmask(
+    how: i32,
+    set: *const u8,
+    oldset: *mut u8,
+    sigsetsize: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_RT_SIGPROCMASK,
+        [how as usize, set as usize, oldset as usize, sigsetsize, 0, 0],
+    ) as i64
+}
+
+/// rt_sigtimedwait syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_rt_sigtimedwait(
+    set: *const u8,
+    info: *mut u8,
+    timeout: *const u8,
+    sigsetsize: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_RT_SIGTIMEDWAIT,
+        [set as usize, info as usize, timeout as usize, sigsetsize, 0, 0],
+    ) as i64
+}
+
+/// wait4 syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_wait4(pid: isize, status: *mut i32, options: i32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_WAIT4,
+        [pid as usize, status as usize, options as usize, 0, 0, 0],
+    ) as i64
+}
+
+/// waitid syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_waitid(
+    idtype: i32,
+    id: usize,
+    infop: *mut u8,
+    options: i32,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_WAITID,
+        [idtype as usize, id, infop as usize, options as usize, 0, 0],
+    ) as i64
+}
+
+/// uname syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_uname(buf: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_UNAME, [buf as usize, 0, 0, 0, 0, 0])
+        as i64
+}
+
+/// fork 래퍼 (테스트 경로)
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_fork() -> i64 {
+    crate::syscall::fork_for_test() as i64
+}
+
+/// vfork 래퍼 (테스트 경로)
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_vfork() -> i64 {
+    crate::syscall::vfork_for_test() as i64
+}
+
+/// 테스트용 pending signal 삽입
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_test_enqueue_signal(signum: u32) -> i64 {
+    crate::syscall::enqueue_signal_for_test(signum) as i64
+}
+
+// ============================================================
 // Thread (스레드)
 // ============================================================
 
@@ -443,6 +598,23 @@ pub fn register_test_symbols() {
     register_symbol("kernel_vfs_write", kernel_vfs_write as usize);
     register_symbol("kernel_vfs_read", kernel_vfs_read as usize);
     register_symbol("kernel_vfs_unlink", kernel_vfs_unlink as usize);
+    register_symbol("kernel_exec_prepare", kernel_exec_prepare as usize);
+
+    // Process syscalls
+    register_symbol("kernel_sys_getpid", kernel_sys_getpid as usize);
+    register_symbol("kernel_sys_getppid", kernel_sys_getppid as usize);
+    register_symbol("kernel_sys_gettid", kernel_sys_gettid as usize);
+    register_symbol("kernel_sys_brk", kernel_sys_brk as usize);
+    register_symbol("kernel_sys_mmap", kernel_sys_mmap as usize);
+    register_symbol("kernel_sys_munmap", kernel_sys_munmap as usize);
+    register_symbol("kernel_sys_rt_sigprocmask", kernel_sys_rt_sigprocmask as usize);
+    register_symbol("kernel_sys_rt_sigtimedwait", kernel_sys_rt_sigtimedwait as usize);
+    register_symbol("kernel_sys_wait4", kernel_sys_wait4 as usize);
+    register_symbol("kernel_sys_waitid", kernel_sys_waitid as usize);
+    register_symbol("kernel_sys_uname", kernel_sys_uname as usize);
+    register_symbol("kernel_sys_fork", kernel_sys_fork as usize);
+    register_symbol("kernel_sys_vfork", kernel_sys_vfork as usize);
+    register_symbol("kernel_test_enqueue_signal", kernel_test_enqueue_signal as usize);
 
     // Thread
     register_symbol("kernel_thread_spawn", kernel_thread_spawn as usize);
@@ -451,5 +623,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 19);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 34);
 }

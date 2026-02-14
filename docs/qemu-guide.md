@@ -24,16 +24,56 @@ kerners 커널을 QEMU에서 빌드하고 실행하는 방법을 설명합니다
 ./run.sh aarch64 128 --dtb-only
 ```
 
+## BusyBox `init` 부팅
+
+prebuilt static BusyBox ELF가 있으면 `KERNERS_BUSYBOX` 환경변수로 `disk.img`를 자동 준비할 수 있습니다.
+디스크 이미지는 `KERNERS_DISK_IMG` 환경변수로 경로를 통일해 사용할 수 있습니다
+(`run.sh`, `scripts/run_tests.sh`, `scripts/prepare_test_disk.sh`, `scripts/prepare_user_disk.sh` 공통).
+
+### BusyBox static 빌드
+
+```bash
+# kerners 워크스페이스에서 BusyBox static ELF 빌드
+./scripts/build_busybox_static.sh aarch64 /Users/yangbeom/github/busybox
+
+# 결과: target/user/aarch64/busybox
+file target/user/aarch64/busybox
+```
+
+```bash
+# BusyBox를 disk.img에 설치(/bin/busybox, /sbin/init, /bin/init, /bin/sh) 후 실행
+KERNERS_BUSYBOX=/absolute/path/to/busybox ./run.sh aarch64
+
+# 또는 스크립트만 단독 실행
+./scripts/prepare_user_disk.sh aarch64 /absolute/path/to/busybox disk.img
+```
+
+커널은 부팅 후 기본 init 경로(`/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh`)를 먼저 탐색하고,
+필요 시 `/mnt/*` 경로를 fallback으로 탐색합니다. 실행 실패 시 커널 셸로 복귀합니다.
+
+### BusyBox init 스모크 테스트(로그 자동 수집)
+
+```bash
+# 3회 반복, 각 30초 타임아웃, logs/busybox-init-*.log 저장
+./scripts/run_busybox_smoke.sh aarch64 /absolute/path/to/busybox 3 30
+
+# 또는 Makefile 래퍼
+make busybox-smoke ARCH=aarch64 BUSYBOX=/absolute/path/to/busybox
+```
+
+스모크 스크립트는 run별 로그와 summary 로그를 생성하고, 실패 시 원인을 1차 분류합니다.
+(`ENOSYS`, `EFAULT`, `EXEC_FAIL`, `NO_INIT_FALLBACK`)
+
 ## 수동 실행 방법
 
 ### 1. 빌드
 
 ```bash
 # aarch64
-cargo build --release --target targets/aarch64-unknown-none.json
+cargo build --release --target aarch64-unknown-none-softfloat
 
 # riscv64
-cargo build --release --target targets/riscv64-unknown-elf.json
+cargo build --release --target riscv64gc-unknown-none-elf
 ```
 
 ### 2. DTB 파일 생성

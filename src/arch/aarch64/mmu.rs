@@ -5,10 +5,17 @@
 
 use crate::kprintln;
 use crate::mm;
+use crate::sync::Mutex;
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Higher-half 커널 베이스 주소
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_0000_0000_0000;
+
+/// 활성 커널 루트 페이지 테이블 주소
+static ROOT_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
+/// 런타임 매핑 수정 시 동기화용 락
+static MMU_MAP_LOCK: Mutex<()> = Mutex::new(());
 
 /// 페이지 테이블 엔트리 (8 bytes)
 #[repr(transparent)]
@@ -63,6 +70,7 @@ pub struct PageFlags {
     pub attr_idx: u8, // MAIR 인덱스
     pub write: bool,
     pub execute: bool,
+    pub user: bool,
 }
 
 impl PageFlags {
@@ -71,6 +79,25 @@ impl PageFlags {
             attr_idx: 1, // Normal memory
             write: true,
             execute: true,
+            user: false,
+        }
+    }
+
+    pub fn user_rwx() -> Self {
+        Self {
+            attr_idx: 1, // Normal memory
+            write: true,
+            execute: true,
+            user: true,
+        }
+    }
+
+    pub fn user_from_segment(write: bool, execute: bool) -> Self {
+        Self {
+            attr_idx: 1, // Normal memory
+            write,
+            execute,
+            user: true,
         }
     }
 
@@ -79,6 +106,7 @@ impl PageFlags {
             attr_idx: 0, // Device memory
             write: true,
             execute: false,
+            user: false,
         }
     }
 
@@ -86,8 +114,19 @@ impl PageFlags {
         let mut bits = 0u64;
 
         // AP[2:1] - Access Permissions
-        if !self.write {
-            bits |= 1 << 7; // Read-only
+        // Kernel:
+        //   write=true  -> AP=00 (EL1 RW)
+        //   write=false -> AP=10 (EL1 RO)
+        // User:
+        //   write=true  -> AP=01 (EL0 RW)
+        //   write=false -> AP=11 (EL0 RO)
+        if self.user {
+            bits |= 1 << 6; // AP[1] = 1 (EL0 접근 허용)
+            if !self.write {
+                bits |= 1 << 7;
+            }
+        } else if !self.write {
+            bits |= 1 << 7;
         }
 
         // UXN/PXN - Execute Never
@@ -250,6 +289,7 @@ pub fn create_identity_mapping(
     let block_size = 2 * 1024 * 1024; // 2MB
 
     // Identity mapping (물리 주소 = 가상 주소)
+    // 커널 기본 RAM 영역은 EL1 전용으로 유지한다.
     kprintln!("[MMU] Identity mapping RAM...");
     for offset in (0..ram_size).step_by(block_size) {
         let addr = ram_start + offset;
@@ -341,6 +381,7 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<(), &'static str> {
 
     // 1. Identity mapping 페이지 테이블 생성
     let pt_mgr = create_identity_mapping(ram_start, ram_size)?;
+    ROOT_TABLE_ADDR.store(pt_mgr.root_table_addr(), Ordering::Release);
 
     // 2. MMU 활성화
     unsafe {
@@ -359,5 +400,69 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<(), &'static str> {
 
     kprintln!("[MMU] Test passed: Memory access works!");
 
+    Ok(())
+}
+
+/// TLB 전체 flush
+pub fn flush_tlb_all() {
+    unsafe {
+        // SAFETY: 페이지 테이블 업데이트 후 전역 TLB 무효화를 수행한다.
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+}
+
+fn map_user_page_inner(
+    virt_addr: usize,
+    phys_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    if virt_addr & 0xFFF != 0 || phys_addr & 0xFFF != 0 {
+        return Err("Address must be 4KB aligned");
+    }
+
+    let root = ROOT_TABLE_ADDR.load(Ordering::Acquire);
+    if root == 0 {
+        return Err("MMU root table not initialized");
+    }
+
+    let l0_table = unsafe { &mut *(root as *mut PageTable) };
+    let mut pt_mgr = PageTableManager { l0_table };
+    pt_mgr.map_page(
+        virt_addr,
+        phys_addr,
+        PageFlags::user_from_segment(write, execute),
+    )
+}
+
+/// 유저 페이지 1개 매핑 (flush 없음)
+///
+/// 주로 다수 페이지를 연속 매핑할 때 사용한다.
+pub fn map_user_page_noflush(
+    virt_addr: usize,
+    phys_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    let _guard = MMU_MAP_LOCK.lock();
+    map_user_page_inner(virt_addr, phys_addr, write, execute)
+}
+
+/// 유저 페이지 1개 매핑 + TLB flush
+pub fn map_user_page(
+    virt_addr: usize,
+    phys_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    let _guard = MMU_MAP_LOCK.lock();
+    map_user_page_inner(virt_addr, phys_addr, write, execute)?;
+    flush_tlb_all();
     Ok(())
 }

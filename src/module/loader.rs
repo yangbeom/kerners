@@ -328,6 +328,24 @@ static LOADED_MODULES: RwLock<Vec<Box<LoadedModule>>> = RwLock::new(Vec::new());
 pub struct ModuleLoader;
 
 impl ModuleLoader {
+    #[cfg(target_arch = "aarch64")]
+    const EXEC_VADDR_MIN: usize = 0x0010_0000;
+    #[cfg(target_arch = "aarch64")]
+    const EXEC_VADDR_MAX: usize = 0x0800_0000;
+
+    #[cfg(not(target_arch = "aarch64"))]
+    const EXEC_VADDR_MIN: usize = 0x4000_0000;
+    #[cfg(not(target_arch = "aarch64"))]
+    const EXEC_VADDR_MAX: usize = 0x8000_0000;
+
+    fn cleanup_exec_frames(frames: &mut Vec<usize>) {
+        for frame in frames.drain(..) {
+            unsafe {
+                page::free_frame(frame);
+            }
+        }
+    }
+
     /// Relocatable object (.o) 로드
     pub fn load_object(data: &[u8], name: &str) -> Result<&'static LoadedModule, ModuleError> {
         kprintln!("[module] Loading relocatable object: {}", name);
@@ -497,6 +515,8 @@ impl ModuleLoader {
     /// 실행 파일 로드 (ELF executable)
     pub fn load_executable(data: &[u8]) -> Result<usize, ModuleError> {
         kprintln!("[module] Loading executable");
+        const PF_X: u32 = 0x1;
+        const PF_W: u32 = 0x2;
 
         // ELF 파싱
         let elf = Elf64::parse(data)?;
@@ -513,12 +533,23 @@ impl ModuleLoader {
             }
         }
 
+        let mut allocated_frames: Vec<usize> = Vec::new();
+
         // LOAD 세그먼트 로드
         for ph in elf.load_segments() {
             let file_offset = ph.p_offset as usize;
             let file_size = ph.p_filesz as usize;
             let mem_size = ph.p_memsz as usize;
             let vaddr = ph.p_vaddr as usize;
+            let writable = (ph.p_flags & PF_W) != 0;
+            let executable = (ph.p_flags & PF_X) != 0;
+            let vend = match vaddr.checked_add(mem_size) {
+                Some(end) => end,
+                None => {
+                    Self::cleanup_exec_frames(&mut allocated_frames);
+                    return Err(ModuleError::InvalidFormat);
+                }
+            };
 
             kprintln!(
                 "[module] LOAD segment: vaddr=0x{:x}, filesz={}, memsz={}",
@@ -527,33 +558,87 @@ impl ModuleLoader {
                 mem_size
             );
 
-            // 페이지 할당 및 데이터 복사
-            let num_pages = (mem_size + PAGE_SIZE - 1) / PAGE_SIZE;
+            if file_size > mem_size {
+                Self::cleanup_exec_frames(&mut allocated_frames);
+                return Err(ModuleError::InvalidFormat);
+            }
 
-            for i in 0..num_pages {
-                let page_addr = vaddr + i * PAGE_SIZE;
+            let file_end = match file_offset.checked_add(file_size) {
+                Some(v) => v,
+                None => {
+                    Self::cleanup_exec_frames(&mut allocated_frames);
+                    return Err(ModuleError::InvalidFormat);
+                }
+            };
+            if file_end > data.len() {
+                Self::cleanup_exec_frames(&mut allocated_frames);
+                return Err(ModuleError::InvalidFormat);
+            }
 
-                // 페이지 할당 (가상 주소에 매핑 필요 - 현재는 identity mapping 가정)
-                if let Some(_frame) = page::alloc_frame() {
-                    // 파일 데이터 복사
-                    let copy_start = i * PAGE_SIZE;
-                    let copy_end = core::cmp::min((i + 1) * PAGE_SIZE, file_size);
+            // 사용자 공간 로드 허용 범위 검사
+            if vaddr < Self::EXEC_VADDR_MIN || vend > Self::EXEC_VADDR_MAX {
+                kprintln!(
+                    "[module] executable segment vaddr out of supported range: 0x{:x}-0x{:x}",
+                    vaddr,
+                    vend
+                );
+                Self::cleanup_exec_frames(&mut allocated_frames);
+                return Err(ModuleError::InvalidFormat);
+            }
 
-                    if copy_start < file_size {
-                        let src = &data[file_offset + copy_start..file_offset + copy_end];
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                src.as_ptr(),
-                                page_addr as *mut u8,
-                                src.len(),
-                            );
-                        }
-                    }
+            let seg_page_start = vaddr & !(PAGE_SIZE - 1);
+            let seg_page_end = (vend + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+            for page_addr in (seg_page_start..seg_page_end).step_by(PAGE_SIZE) {
+                let frame = if let Some(frame) = page::alloc_frame() {
+                    frame
                 } else {
+                    Self::cleanup_exec_frames(&mut allocated_frames);
                     return Err(ModuleError::OutOfMemory);
+                };
+                allocated_frames.push(frame);
+
+                unsafe {
+                    // SAFETY: alloc_frame()로 받은 유효한 4KB 프레임을 초기화한다.
+                    core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                if crate::arch::mmu::map_user_page_noflush(page_addr, frame, writable, executable)
+                    .is_err()
+                {
+                    Self::cleanup_exec_frames(&mut allocated_frames);
+                    return Err(ModuleError::InvalidFormat);
+                }
+
+                // 파일 데이터 복사 (BSS는 0으로 유지)
+                let copy_start = core::cmp::max(page_addr, vaddr);
+                let file_vend = vaddr + file_size;
+                let copy_end = core::cmp::min(page_addr + PAGE_SIZE, file_vend);
+                if copy_start < copy_end {
+                    let copy_len = copy_end - copy_start;
+                    let src_off = file_offset + (copy_start - vaddr);
+                    let src_end = src_off + copy_len;
+                    if src_end > data.len() {
+                        Self::cleanup_exec_frames(&mut allocated_frames);
+                        return Err(ModuleError::InvalidFormat);
+                    }
+
+                    let dst_off = copy_start - page_addr;
+                    unsafe {
+                        // SAFETY: src는 ELF 버퍼 내 유효 범위이며 dst는 할당한 프레임 내 유효 범위다.
+                        core::ptr::copy_nonoverlapping(
+                            data[src_off..src_end].as_ptr(),
+                            (frame + dst_off) as *mut u8,
+                            copy_len,
+                        );
+                    }
                 }
             }
         }
+
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::mmu::flush_tlb_all();
 
         // 엔트리 포인트 반환
         let entry = elf.entry_point() as usize;

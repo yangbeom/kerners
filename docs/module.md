@@ -1,218 +1,132 @@
 # Kernel Module System
 
-커널 모듈 시스템 문서
+커널 모듈 시스템(`src/module/`)은 ELF64 기반 로딩 기능을 제공합니다.
 
-## Overview
-
-`src/module/` 모듈은 ELF64 relocatable object 파일을 동적으로 로드하고 실행하는 기능을 제공합니다.
-
-## Architecture
+## 개요
 
 ```
-┌─────────────────────────────────────────┐
-│            Module Loader                 │
-│         (module/loader.rs)               │
-├──────────┬──────────────────────────────┤
-│ ELF Parser│    Symbol Resolution        │
-│ (elf.rs)  │     (symbol.rs)             │
-├──────────┴──────────────────────────────┤
-│           Memory Allocation              │
-│              (mm module)                 │
-└─────────────────────────────────────────┘
+src/module/
+├── elf.rs      # ELF64 파서
+├── loader.rs   # 모듈/실행파일 로더
+├── symbol.rs   # 커널 심볼 테이블
+└── test_symbols.rs
 ```
 
-## Module Format
+현재 모듈 시스템은 두 가지 로딩 경로를 제공합니다.
 
-모듈은 ELF64 relocatable object 파일 형식 (.o)을 사용합니다.
+- 로더블 커널 모듈 로드: ELF64 relocatable(`ET_REL`)
+- 사용자 실행 파일 준비용 로드: ELF64 executable(`ET_EXEC` 중심)
 
-### 필수 심볼
+## 모듈 형식
+
+### 1) 로더블 커널 모듈 (`ET_REL`)
+
+- 입력: `.ko`/`.o` (ELF64 relocatable)
+- 섹션 로드 + 재배치 + `module_init()` 호출
+- 필요 시 `module_exit()` 호출 후 언로드
+
+권장 심볼 형식:
 
 ```rust
-// 모듈 초기화 함수 (필수)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn module_init() -> i32 {
-    // 초기화 코드
-    0 // 성공
-}
-
-// 모듈 정리 함수 (선택)
-#[no_mangle]
-pub extern "C" fn module_exit() {
-    // 정리 코드
-}
-
-// 모듈 이름 (선택)
-#[no_mangle]
-pub static MODULE_NAME: &str = "hello";
-```
-
-## ELF64 Parser
-
-`src/module/elf.rs`에서 ELF64 파싱 처리.
-
-### 지원 섹션
-
-- `.text` - 코드
-- `.rodata` - 읽기 전용 데이터
-- `.data` - 초기화된 데이터
-- `.bss` - 미초기화 데이터
-- `.symtab` - 심볼 테이블
-- `.strtab` - 문자열 테이블
-- `.rela.*` - 재배치 정보
-
-### Relocation Types
-
-**aarch64:**
-- `R_AARCH64_CALL26` - 함수 호출
-- `R_AARCH64_ADR_PREL_PG_HI21` - 페이지 상대 주소
-- `R_AARCH64_ADD_ABS_LO12_NC` - 12비트 오프셋
-- `R_AARCH64_ABS64` - 64비트 절대 주소
-
-**riscv64:**
-- `R_RISCV_CALL` - 함수 호출
-- `R_RISCV_PCREL_HI20` - PC 상대 상위 20비트
-- `R_RISCV_PCREL_LO12_I` - PC 상대 하위 12비트
-- `R_RISCV_64` - 64비트 절대 주소
-
-## Symbol Table
-
-`src/module/symbol.rs`에서 커널 심볼 관리.
-
-### 심볼 등록
-
-```rust
-use crate::module::symbol;
-
-// 커널 함수를 모듈에 노출
-symbol::register_symbol("kprintln", kprintln as usize);
-symbol::register_symbol("alloc_page", mm::alloc_frame as usize);
-```
-
-### 심볼 조회
-
-```rust
-if let Some(addr) = symbol::lookup_symbol("kprintln") {
-    // addr를 함수 포인터로 사용
-}
-```
-
-## Module Loading
-
-### 로딩 과정
-
-1. **ELF 검증**: 매직 넘버, 아키텍처 확인
-2. **메모리 할당**: 각 섹션에 메모리 할당
-3. **섹션 로드**: 코드, 데이터 복사
-4. **심볼 해석**: 외부 심볼 주소 해석
-5. **재배치**: 심볼 참조 패치
-6. **초기화**: `module_init()` 호출
-
-### API
-
-```rust
-use crate::module::{ModuleLoader, ModuleInfo};
-
-// 모듈 로더 생성
-let loader = ModuleLoader::new();
-
-// ELF 바이트에서 모듈 로드
-let module = loader.load(elf_bytes)?;
-
-// 모듈 정보 조회
-let info: ModuleInfo = module.info();
-println!("Module: {} at {:p}", info.name, info.base);
-
-// 모듈 언로드
-module.unload()?;
-```
-
-## Module States
-
-```rust
-pub enum ModuleState {
-    Loading,    // 로딩 중
-    Live,       // 실행 중
-    Unloading,  // 언로드 중
-    Failed,     // 로딩 실패
-}
-```
-
-## Building Modules
-
-### 모듈 소스 예시
-
-```rust
-// modules/hello/src/lib.rs
-#![no_std]
-
-extern "C" {
-    fn kprintln(s: *const u8);
-}
-
-#[no_mangle]
-pub extern "C" fn module_init() -> i32 {
-    unsafe {
-        kprintln(b"Hello from module!\0".as_ptr());
-    }
     0
 }
 
-#[no_mangle]
-pub extern "C" fn module_exit() {
-    unsafe {
-        kprintln(b"Goodbye from module!\0".as_ptr());
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn module_exit() {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn module_name() -> *const u8 {
+    b"my_module\0".as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn module_version() -> *const u8 {
+    b"0.1.0\0".as_ptr()
 }
 ```
 
-### 빌드 명령
+### 2) 실행 파일 로드 (`execve` 경로)
+
+- 입력: ELF64 executable (`ET_EXEC`/`ET_DYN` 헤더 파싱)
+- `PT_LOAD` 세그먼트를 읽어 엔트리 포인트를 반환
+- `proc::user::prepare_exec_image()`에서 호출됨
+
+현재 제약:
+
+- 유저 가상주소 매핑(`p_vaddr -> page table mapping`)은 아직 미구현
+- 따라서 `PT_LOAD`의 `p_vaddr` 범위가 현재 identity-mapped RAM 범위를 벗어나면 로드 실패
+  - 현재 가드 범위: `0x4000_0000..0x8000_0000`
+
+## 로딩/언로딩 흐름
+
+### 로더블 모듈 로드
+
+1. ELF 파싱 (`ET_REL` 확인)
+2. 메모리 페이지 할당(섹션 + PLT)
+3. 섹션 복사 및 재배치 적용
+4. export 심볼 등록
+5. `module_init()` 호출
+6. 성공 시 `LOADED_MODULES`에 등록
+
+### 언로드
+
+1. 모듈 언로딩 플래그 설정
+2. 참조 카운트 확인
+3. `module_exit()` 호출
+4. 할당 페이지 해제 및 목록에서 제거
+
+## 주요 API
+
+| API | 설명 |
+|-----|------|
+| `ModuleLoader::load_from_path(path)` | VFS 경로에서 모듈 파일을 읽어 로드 |
+| `ModuleLoader::load_object(data, name)` | 메모리 버퍼의 `ET_REL` 모듈 로드 |
+| `ModuleLoader::unload(name)` | 모듈 언로드 |
+| `ModuleLoader::unload_wait(name, max_wait_ms)` | 참조 해제 대기 후 언로드 |
+| `ModuleLoader::list()` | 로드된 모듈 이름 목록 |
+| `ModuleLoader::info(name)` | 모듈 상세 정보 조회 |
+| `ModuleLoader::acquire(name)` | 모듈 참조 가드(`ModuleRef`) 획득 |
+| `ModuleLoader::lookup_symbol_in(module, symbol)` | 특정 모듈에서 심볼 조회 |
+| `ModuleLoader::lookup_symbol_global(symbol)` | 커널 + 모듈 전체에서 심볼 조회 |
+| `ModuleLoader::list_module_symbols(module)` | 모듈 export 심볼 목록 조회 |
+| `ModuleLoader::export_symbol(module, symbol, addr)` | 런타임 export 심볼 추가 |
+| `ModuleLoader::load_executable(data)` | 실행 ELF 로드 후 엔트리 주소 반환 |
+
+## 심볼/재배치/PLT
+
+- 커널 심볼은 `symbol.rs`에서 관리합니다.
+- 외부 함수 호출 재배치를 위해 PLT 페이지를 생성합니다.
+- 아키텍처별 재배치 타입(`aarch64`, `riscv64`)을 처리합니다.
+
+## 상태 및 에러
+
+### ModuleState
+
+- `Loading`
+- `Live`
+- `Unloading`
+
+### ModuleError (주요)
+
+- `ElfError(...)`
+- `InvalidFormat`
+- `OutOfMemory`
+- `SymbolNotFound`
+- `UnsupportedRelocation(...)`
+- `InitFailed(...)`
+- `InUse`
+- `AlreadyLoaded`
+- `NotFound`
+- `ModuleUnloading`
+
+## 디버깅
+
+QEMU 셸에서:
 
 ```bash
-cd modules/hello
-./build.sh aarch64  # 또는 riscv64
+modtest
 ```
 
-### 빌드 스크립트
-
-```bash
-#!/bin/bash
-ARCH=${1:-aarch64}
-
-if [ "$ARCH" = "aarch64" ]; then
-    TARGET="aarch64-unknown-none"
-else
-    TARGET="riscv64gc-unknown-none-elf"
-fi
-
-cargo build --release --target $TARGET
-```
-
-## PLT (Procedure Linkage Table)
-
-외부 함수 호출을 위한 PLT 생성. 자세한 내용은 [plt.md](plt.md) 참조.
-
-## Error Handling
-
-```rust
-pub enum ModuleError {
-    InvalidElf,         // 잘못된 ELF 형식
-    UnsupportedArch,    // 지원하지 않는 아키텍처
-    SymbolNotFound,     // 심볼을 찾을 수 없음
-    RelocationFailed,   // 재배치 실패
-    OutOfMemory,        // 메모리 부족
-    InitFailed,         // 초기화 실패
-}
-```
-
-## Debugging
-
-```bash
-# QEMU 셸에서
-modtest              # 모듈 로더 테스트 실행
-```
-
-## Security Considerations
-
-- 모듈은 커널 권한으로 실행됨
-- 신뢰할 수 있는 모듈만 로드해야 함
-- 심볼 노출은 필요한 것만
+- 모듈 로드/언로드 경로를 점검할 수 있습니다.

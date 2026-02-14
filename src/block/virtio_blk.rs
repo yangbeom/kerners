@@ -62,6 +62,14 @@ pub struct VirtIOBlkReqHeader {
     pub sector: u64,
 }
 
+/// 요청 컨텍스트 (DMA가 접근하는 헤더/상태를 한 묶음으로 유지)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct VirtIOBlkReqCtx {
+    header: VirtIOBlkReqHeader,
+    status: u8,
+}
+
 /// VirtIO 블록 응답 상태
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +129,110 @@ unsafe impl Send for VirtIOBlock {}
 unsafe impl Sync for VirtIOBlock {}
 
 impl VirtIOBlock {
+    #[inline]
+    fn validate_read_chain(
+        queue: &Virtqueue,
+        head: u16,
+        header_ptr: u64,
+        data_ptr: u64,
+        data_len: u32,
+        status_ptr: u64,
+    ) -> bool {
+        if head >= queue.size() {
+            return false;
+        }
+
+        let d0 = queue.descriptor(head);
+        if d0.addr != header_ptr || d0.len != core::mem::size_of::<VirtIOBlkReqHeader>() as u32 {
+            return false;
+        }
+        if d0.flags & crate::virtio::queue::desc_flags::NEXT == 0
+            || d0.flags & crate::virtio::queue::desc_flags::WRITE != 0
+        {
+            return false;
+        }
+
+        if d0.next >= queue.size() {
+            return false;
+        }
+        let d1 = queue.descriptor(d0.next);
+        if d1.addr != data_ptr || d1.len != data_len {
+            return false;
+        }
+        if d1.flags & crate::virtio::queue::desc_flags::NEXT == 0
+            || d1.flags & crate::virtio::queue::desc_flags::WRITE == 0
+        {
+            return false;
+        }
+
+        if d1.next >= queue.size() {
+            return false;
+        }
+        let d2 = queue.descriptor(d1.next);
+        if d2.addr != status_ptr || d2.len != 1 {
+            return false;
+        }
+        if d2.flags & crate::virtio::queue::desc_flags::NEXT != 0
+            || d2.flags & crate::virtio::queue::desc_flags::WRITE == 0
+        {
+            return false;
+        }
+
+        true
+    }
+
+    #[inline]
+    fn validate_write_chain(
+        queue: &Virtqueue,
+        head: u16,
+        header_ptr: u64,
+        data_ptr: u64,
+        data_len: u32,
+        status_ptr: u64,
+    ) -> bool {
+        if head >= queue.size() {
+            return false;
+        }
+
+        let d0 = queue.descriptor(head);
+        if d0.addr != header_ptr || d0.len != core::mem::size_of::<VirtIOBlkReqHeader>() as u32 {
+            return false;
+        }
+        if d0.flags & crate::virtio::queue::desc_flags::NEXT == 0
+            || d0.flags & crate::virtio::queue::desc_flags::WRITE != 0
+        {
+            return false;
+        }
+
+        if d0.next >= queue.size() {
+            return false;
+        }
+        let d1 = queue.descriptor(d0.next);
+        if d1.addr != data_ptr || d1.len != data_len {
+            return false;
+        }
+        if d1.flags & crate::virtio::queue::desc_flags::NEXT == 0
+            || d1.flags & crate::virtio::queue::desc_flags::WRITE != 0
+        {
+            return false;
+        }
+
+        if d1.next >= queue.size() {
+            return false;
+        }
+        let d2 = queue.descriptor(d1.next);
+        if d2.addr != status_ptr || d2.len != 1 {
+            return false;
+        }
+        if d2.flags & crate::virtio::queue::desc_flags::NEXT != 0
+            || d2.flags & crate::virtio::queue::desc_flags::WRITE == 0
+        {
+            return false;
+        }
+
+        true
+    }
+
     /// 새 VirtIO 블록 디바이스 생성
     pub fn new(info: &VirtIODeviceInfo, name: &str) -> VirtIOResult<Self> {
         if info.device_type != DeviceType::Block {
@@ -209,49 +321,88 @@ impl VirtIOBlock {
             return Err(VirtIOError::IoError);
         }
 
-        // 요청 헤더
-        let header = VirtIOBlkReqHeader {
-            req_type: RequestType::In as u32,
-            reserved: 0,
-            sector: block_num,
-        };
-
-        // 상태 바이트
-        let mut status: u8 = 0xFF;
+        // DMA가 참조하는 헤더/상태를 힙에 둬서 스택 생명주기와 분리한다.
+        let mut req = Box::new(VirtIOBlkReqCtx {
+            header: VirtIOBlkReqHeader {
+                req_type: RequestType::In as u32,
+                reserved: 0,
+                sector: block_num,
+            },
+            status: 0xFF,
+        });
 
         // Virtqueue에 요청 추가
         let header_buf = unsafe {
             core::slice::from_raw_parts(
-                &header as *const _ as *const u8,
+                &req.header as *const _ as *const u8,
                 core::mem::size_of::<VirtIOBlkReqHeader>(),
             )
         };
         let status_buf = unsafe {
-            core::slice::from_raw_parts_mut(&mut status as *mut u8, 1)
+            core::slice::from_raw_parts_mut(&mut req.status as *mut u8, 1)
         };
 
-        {
+        let expected_head = {
             let mut queue = self.queue.lock();
+            if queue.available_descs() != queue.size() {
+                crate::kprintln!(
+                    "[VirtIO-blk] queue not empty before read: free={}/{}",
+                    queue.available_descs(),
+                    queue.size()
+                );
+            }
 
-            queue.add_buffer_chain(
+            let head = queue.add_buffer_chain(
                 &[header_buf],
                 &[buf, status_buf],
             )?;
+            if !Self::validate_read_chain(
+                &queue,
+                head,
+                header_buf.as_ptr() as u64,
+                buf.as_ptr() as u64,
+                buf.len() as u32,
+                status_buf.as_ptr() as u64,
+            ) {
+                crate::kprintln!("[VirtIO-blk] invalid read descriptor chain before notify");
+                queue.debug_descriptor_chain(head);
+                return Err(VirtIOError::IoError);
+            }
 
             // 메모리 배리어 - 디바이스가 descriptor를 볼 수 있도록
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+            }
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("fence ow,ow", options(nostack, preserves_flags));
+            }
 
             // 디바이스에 알림
             self.mmio.notify_queue(0);
-        }
+            head
+        };
 
         // 완료 대기 (폴링)
-        self.wait_for_completion()?;
+        self.wait_for_completion(expected_head)?;
 
         // 상태 확인
-        if status != VirtIOBlkStatus::Ok as u8 {
-            crate::kprintln!("[VirtIO-blk] Read error: status={}", status);
+        if req.status != VirtIOBlkStatus::Ok as u8 {
+            crate::kprintln!("[VirtIO-blk] Read error: status={}", req.status);
             return Err(VirtIOError::IoError);
+        }
+
+        {
+            let queue = self.queue.lock();
+            if queue.available_descs() != queue.size() {
+                crate::kprintln!(
+                    "[VirtIO-blk] queue leak/corruption after read: free={}/{}",
+                    queue.available_descs(),
+                    queue.size()
+                );
+            }
         }
 
         Ok(())
@@ -269,106 +420,168 @@ impl VirtIOBlock {
             return Err(VirtIOError::IoError);
         }
 
-        // 요청 헤더
-        let header = VirtIOBlkReqHeader {
-            req_type: RequestType::Out as u32,
-            reserved: 0,
-            sector: block_num,
-        };
-
-        // 상태 바이트
-        let mut status: u8 = 0xFF;
+        // DMA가 참조하는 헤더/상태를 힙에 둬서 스택 생명주기와 분리한다.
+        let mut req = Box::new(VirtIOBlkReqCtx {
+            header: VirtIOBlkReqHeader {
+                req_type: RequestType::Out as u32,
+                reserved: 0,
+                sector: block_num,
+            },
+            status: 0xFF,
+        });
 
         // Virtqueue에 요청 추가
         let header_buf = unsafe {
             core::slice::from_raw_parts(
-                &header as *const _ as *const u8,
+                &req.header as *const _ as *const u8,
                 core::mem::size_of::<VirtIOBlkReqHeader>(),
             )
         };
         let status_buf = unsafe {
-            core::slice::from_raw_parts_mut(&mut status as *mut u8, 1)
+            core::slice::from_raw_parts_mut(&mut req.status as *mut u8, 1)
         };
 
-        {
+        let expected_head = {
             let mut queue = self.queue.lock();
-            queue.add_buffer_chain(
+            if queue.available_descs() != queue.size() {
+                crate::kprintln!(
+                    "[VirtIO-blk] queue not empty before write: free={}/{}",
+                    queue.available_descs(),
+                    queue.size()
+                );
+            }
+            let head = queue.add_buffer_chain(
                 &[header_buf, buf],
                 &[status_buf],
             )?;
+            if !Self::validate_write_chain(
+                &queue,
+                head,
+                header_buf.as_ptr() as u64,
+                buf.as_ptr() as u64,
+                buf.len() as u32,
+                status_buf.as_ptr() as u64,
+            ) {
+                crate::kprintln!("[VirtIO-blk] invalid write descriptor chain before notify");
+                queue.debug_descriptor_chain(head);
+                return Err(VirtIOError::IoError);
+            }
+
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("dmb oshst", options(nostack, preserves_flags));
+            }
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("fence ow,ow", options(nostack, preserves_flags));
+            }
 
             // 디바이스에 알림
             self.mmio.notify_queue(0);
-        }
+            head
+        };
 
         // 완료 대기 (폴링)
-        self.wait_for_completion()?;
+        self.wait_for_completion(expected_head)?;
 
         // 상태 확인
-        if status != VirtIOBlkStatus::Ok as u8 {
-            crate::kprintln!("[VirtIO-blk] Write error: status={}", status);
+        if req.status != VirtIOBlkStatus::Ok as u8 {
+            crate::kprintln!("[VirtIO-blk] Write error: status={}", req.status);
             return Err(VirtIOError::IoError);
+        }
+
+        {
+            let queue = self.queue.lock();
+            if queue.available_descs() != queue.size() {
+                crate::kprintln!(
+                    "[VirtIO-blk] queue leak/corruption after write: free={}/{}",
+                    queue.available_descs(),
+                    queue.size()
+                );
+            }
         }
 
         Ok(())
     }
 
     /// 완료 대기 (인터럽트 + WFI 기반, 폴링 fallback)
-    fn wait_for_completion(&self) -> VirtIOResult<()> {
-        // Phase 1: 인터럽트 기반 대기 (WFI)
-        for _ in 0..1000u32 {
-            // 인터럽트 플래그 확인
-            if self.interrupt_flag.swap(false, Ordering::SeqCst) {
-                let mut queue = self.queue.lock();
-                if queue.poll_used().is_some() {
-                    return Ok(());
-                }
-            }
-
-            // Used 링 직접 확인 (인터럽트 놓친 경우 대비)
-            {
-                let mut queue = self.queue.lock();
-                if queue.poll_used().is_some() {
-                    let status = self.mmio.interrupt_status();
-                    if status != 0 {
-                        self.mmio.ack_interrupt(status);
-                    }
-                    self.interrupt_flag.store(false, Ordering::SeqCst);
-                    return Ok(());
-                }
-            }
-
-            // WFI로 저전력 대기 (다음 인터럽트까지)
-            #[cfg(target_arch = "aarch64")]
-            unsafe { core::arch::asm!("wfi"); }
-
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi"); }
-        }
-
-        // Phase 2: 폴링 fallback (인터럽트가 동작하지 않는 경우 대비)
-        let mut timeout = 100_000u32;
+    fn wait_for_completion(&self, expected_head: u16) -> VirtIOResult<()> {
+        // 디버깅용: IRQ/WFI 경로를 우회하고 순수 폴링으로만 완료를 대기한다.
+        // 원인 분리 후 인터럽트 경로를 복구할 계획이다.
+        let mut spins = 0u32;
+        let mut unexpected_used = 0u16;
         loop {
             {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("dmb oshld", options(nostack, preserves_flags));
+                }
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    core::arch::asm!("fence ir,ir", options(nostack, preserves_flags));
+                }
                 let mut queue = self.queue.lock();
-                if queue.poll_used().is_some() {
+                if let Some((id, _len)) = queue.poll_used() {
+                    if id >= queue.size() {
+                        crate::kprintln!(
+                            "[VirtIO-blk] invalid used descriptor id: {} (queue size={})",
+                            id,
+                            queue.size()
+                        );
+                        return Err(VirtIOError::IoError);
+                    }
                     let status = self.mmio.interrupt_status();
                     if status != 0 {
                         self.mmio.ack_interrupt(status);
                     }
                     self.interrupt_flag.store(false, Ordering::SeqCst);
-                    return Ok(());
+                    if id == expected_head {
+                        return Ok(());
+                    }
+
+                    unexpected_used = unexpected_used.wrapping_add(1);
+                    crate::kprintln!(
+                        "[VirtIO-blk] unexpected used descriptor id: got={}, expected={}",
+                        id,
+                        expected_head
+                    );
+                    if unexpected_used >= queue.size() {
+                        crate::kprintln!(
+                            "[VirtIO-blk] too many unexpected completions (count={})",
+                            unexpected_used
+                        );
+                        return Err(VirtIOError::IoError);
+                    }
                 }
             }
 
-            timeout -= 1;
-            if timeout == 0 {
+            spins = spins.wrapping_add(1);
+            if spins == 100_000 {
                 let queue = self.queue.lock();
-                crate::kprintln!("[VirtIO-blk] Timeout! Queue state:");
-                crate::kprintln!("  avail_idx={}, used_idx={}, last_used={}",
-                    queue.avail_idx(), queue.used_idx(), queue.last_used_idx());
+                crate::kprintln!("[VirtIO-blk] slow completion, still waiting...");
+                let avail_idx = queue.avail_idx();
+                let used_idx = queue.used_idx();
+                let last_used = queue.last_used_idx();
+                crate::kprintln!(
+                    "  avail_idx={}, used_idx={}, last_used={}",
+                    avail_idx,
+                    used_idx,
+                    last_used
+                );
+                let pending_head = queue.avail_head_at(last_used);
+                let pending_desc = queue.descriptor(pending_head);
+                crate::kprintln!(
+                    "  pending head={} desc(addr={:#x}, len={}, flags={:#x}, next={})",
+                    pending_head,
+                    pending_desc.addr,
+                    pending_desc.len,
+                    pending_desc.flags,
+                    pending_desc.next
+                );
+                queue.debug_descriptor_chain(pending_head);
                 crate::kprintln!("  ISR status: {:#x}", self.mmio.interrupt_status());
-                return Err(VirtIOError::Timeout);
+                spins = 0;
             }
 
             core::hint::spin_loop();
@@ -460,8 +673,9 @@ pub fn init() -> Option<Arc<VirtIOBlock>> {
                         info.mmio_base
                     );
                     let dev = Arc::new(dev);
-                    // 인터럽트 등록 (Arc 생성 후, flag 포인터가 안정적)
-                    dev.register_interrupt();
+                    // 디버깅: 원인 분리용으로 IRQ 등록을 잠시 비활성화하고 폴링만 사용한다.
+                    // 인터럽트 경로가 원인이 아닌지 확인 후 복구한다.
+                    // dev.register_interrupt();
                     return Some(dev);
                 }
                 Err(e) => {

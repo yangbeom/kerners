@@ -43,6 +43,9 @@ cargo build --release --target targets/aarch64-unknown-none.json --features embe
 ./run.sh aarch64 256    # 256MB RAM
 ./run.sh riscv64 1024   # 1GB RAM
 
+# Prepare BusyBox init disk and run
+KERNERS_BUSYBOX=/absolute/path/to/busybox ./run.sh aarch64
+
 # Generate DTB only (don't run QEMU)
 ./run.sh aarch64 512 --dtb-only
 ```
@@ -426,6 +429,11 @@ kerners/
 │   └── dtb/                 # Device Tree Blob parsing
 │       └── mod.rs           # DTB parser
 ├── modules/hello/           # Test kernel module
+├── modules/test_execve/     # execve error-path test module
+├── modules/test_proc/       # process syscall baseline test module
+├── modules/test_fork/       # fork/waitid/uname compatibility test module
+├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
+├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files
 ├── docs/                    # Documentation (see docs/README.md for full list)
 ├── linker_aarch64.ld        # aarch64 linker script

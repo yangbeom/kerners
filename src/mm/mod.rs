@@ -71,6 +71,7 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<KernelMemoryLayout, &'s
     // 커널 심볼 주소
     unsafe extern "C" {
         static _end: u8;
+        static _stack_start: u8;
     }
     
     // 아키텍처별 커널 시작 주소
@@ -81,20 +82,35 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<KernelMemoryLayout, &'s
     const KERNEL_START: usize = 0x8020_0000;
     
     let kernel_end = unsafe { &_end as *const u8 as usize };
+    let boot_stack_top = unsafe { &_stack_start as *const u8 as usize };
     
     // 페이지 정렬 (4KB)
     let kernel_end_aligned = (kernel_end + 0xFFF) & !0xFFF;
     
-    // 힙 크기 설정: RAM의 1/4 또는 최대 128MB
+    // 부트스트랩 스택은 [_end, _stack_start) 구간을 사용하므로 힙에서 제외한다.
+    let heap_start = (boot_stack_top + 0xFFF) & !0xFFF;
+    if heap_start <= kernel_end_aligned {
+        return Err("Invalid memory layout: heap overlaps bootstrap stack");
+    }
+
+    let reserved_boot_stack = heap_start - kernel_end_aligned;
+    kprintln!(
+        "[MM] Reserved bootstrap stack area: {:#x} - {:#x} ({} KB)",
+        kernel_end_aligned,
+        heap_start,
+        reserved_boot_stack / 1024
+    );
+
+    // 힙 크기 설정: RAM의 1/4 또는 최대 128MB (RAM 끝을 넘지 않도록 제한)
     let max_heap_size = 128 * 1024 * 1024; // 128MB
-    let heap_size = core::cmp::min(ram_size / 4, max_heap_size);
-    let heap_start = kernel_end_aligned;
+    let ram_end = ram_start + ram_size;
+    let available_for_heap = ram_end.saturating_sub(heap_start);
+    let heap_size = core::cmp::min(core::cmp::min(ram_size / 4, max_heap_size), available_for_heap);
     let heap_end = heap_start + heap_size;
     
     // 페이지 프레임 할당 영역: 힙 이후 ~ RAM 끝 (DTB 영역 제외)
     // DTB는 RAM 끝에서 2MB 전에 위치하므로 4MB 여유 확보
     let frame_alloc_start = (heap_end + 0xFFF) & !0xFFF;
-    let ram_end = ram_start + ram_size;
     let reserved_at_end = 4 * 1024 * 1024; // 4MB 예약 (DTB 등)
     let frame_alloc_end = if ram_end > reserved_at_end {
         ram_end - reserved_at_end

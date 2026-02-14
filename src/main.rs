@@ -271,9 +271,7 @@ fn aarch64_start(dtb_addr: usize) -> ! {
 
                                     #[cfg(not(feature = "test_runner"))]
                                     {
-                                        kprintln!("Welcome to kerners shell!");
-                                        kprintln!("Commands: help, meminfo, uptime, echo <text>");
-                                        simple_shell();
+                                        boot_into_init_or_shell();
                                     }
                                 }
                                 Err(e) => {
@@ -299,6 +297,115 @@ fn aarch64_start(dtb_addr: usize) -> ! {
     kprintln!("\n[boot] Initialization complete!");
 
     loop {}
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn ensure_dir(path: &str) {
+    if path == "/" {
+        return;
+    }
+
+    if fs::lookup_path(path).is_ok() {
+        return;
+    }
+
+    let (parent_path, name) = fs::path::split(path);
+    if let Ok(parent) = fs::lookup_path(parent_path) {
+        let _ = parent.create(name, fs::VNodeType::Directory, fs::FileMode::default_dir());
+    }
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn try_mount_boot_rootfs() {
+    if fs::list_mounts().iter().any(|(path, _)| path == "/mnt") {
+        return;
+    }
+
+    ensure_dir("/mnt");
+
+    let Some(device) = block::get_device("vda") else {
+        kprintln!("[init] /dev/vda not found, skipping auto-mount");
+        return;
+    };
+
+    match fs::fat32::mount_fat32(device) {
+        Ok(fat32) => match fs::mount("/mnt", fat32) {
+            Ok(()) => kprintln!("[init] mounted boot filesystem at /mnt"),
+            Err(e) => kprintln!("[init] failed to mount /mnt: {:?}", e),
+        },
+        Err(e) => kprintln!("[init] failed to parse FAT32 on /dev/vda: {:?}", e),
+    }
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn try_launch_init_process() -> bool {
+    use alloc::string::String;
+
+    ensure_dir("/bin");
+    ensure_dir("/sbin");
+    ensure_dir("/etc");
+    try_mount_boot_rootfs();
+
+    let envp = alloc::vec![
+        String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
+        String::from("HOME=/"),
+        String::from("TERM=linux"),
+    ];
+
+    // 현재 루트(RamFS) 우선 탐색 후, 자동 마운트 경로(/mnt)를 fallback으로 탐색
+    let init_candidates: [&str; 9] = [
+        "/sbin/init",
+        "/etc/init",
+        "/bin/init",
+        "/bin/sh",
+        "/mnt/init",
+        "/mnt/bin/init",
+        "/mnt/bin/sh",
+        "/mnt/sbin/init",
+        "/mnt/etc/init",
+    ];
+
+    for path in init_candidates {
+        kprintln!("[init] trying PID1 candidate '{}'", path);
+        let argv = alloc::vec![String::from(path)];
+        match proc::user::spawn_init_process(path, &argv, &envp) {
+            Ok(tid) => {
+                kprintln!("[init] launched PID1 candidate '{}' (tid={})", path, tid);
+                return true;
+            }
+            Err(proc::user::ExecError::NotFound) => {}
+            Err(err) => {
+                kprintln!("[init] failed to start '{}': {:?}", path, err);
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn boot_into_init_or_shell() -> ! {
+    if try_launch_init_process() {
+        kprintln!("[init] PID 1 started, entering scheduler loop");
+        loop {
+            proc::yield_now();
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                // SAFETY: idle loop에서 IRQ로 깨울 수 있도록 저전력 대기한다.
+                core::arch::asm!("wfi");
+            }
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                // SAFETY: idle loop에서 IRQ로 깨울 수 있도록 저전력 대기한다.
+                core::arch::asm!("wfi");
+            }
+        }
+    }
+
+    kprintln!("[init] no executable init found, falling back to kernel shell");
+    kprintln!("Welcome to kerners shell!");
+    kprintln!("Commands: help, meminfo, uptime, echo <text>");
+    simple_shell();
 }
 
 /// 파일에 텍스트 쓰기 (echo 리다이렉션용)
@@ -727,6 +834,9 @@ fn simple_shell() -> ! {
                         Ok(fat32_fs) => {
                             match fs::mount("/mnt", fat32_fs) {
                                 Ok(()) => kprintln!("FAT32 mounted at /mnt"),
+                                Err(fs::VfsError::AlreadyExists) => {
+                                    kprintln!("FAT32 already mounted at /mnt")
+                                }
                                 Err(e) => kprintln!("Mount failed: {:?}", e),
                             }
                         }
@@ -1287,9 +1397,7 @@ fn riscv64_start(dtb_addr: usize) -> ! {
 
                                     #[cfg(not(feature = "test_runner"))]
                                     {
-                                        kprintln!("Welcome to kerners shell!");
-                                        kprintln!("Commands: help, meminfo, uptime, echo <text>");
-                                        simple_shell();
+                                        boot_into_init_or_shell();
                                     }
                                 }
                                 Err(e) => {

@@ -8,6 +8,8 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 기본값
 ARCH="${1:-aarch64}"
 MEMORY="${2:-512}"
@@ -45,6 +47,13 @@ usage() {
     echo "  $0 aarch64 512 4        # Run aarch64 with 512MB, 4 CPUs"
     echo "  $0 riscv64              # Run riscv64 with 512MB, 1 Hart"
     echo "  $0 riscv64 1024 4       # Run riscv64 with 1GB, 4 Harts"
+    echo ""
+    echo "Environment variables:"
+    echo "  KERNERS_BUSYBOX=/path/to/busybox"
+    echo "      Recreate disk.img and install BusyBox as /bin/busybox,"
+    echo "      /sbin/init, /bin/init, /bin/sh for PID1 boot smoke test."
+    echo "  KERNERS_DISK_IMG=/path/to/disk.img"
+    echo "      Disk image path used by run.sh and test scripts (default: ./disk.img)."
     exit 1
 }
 
@@ -76,6 +85,7 @@ esac
 
 KERNEL_ELF="target/${TARGET}/release/kerners"
 KERNEL_BIN="target/${TARGET}/release/kerners.bin"
+DISK_IMG="${KERNERS_DISK_IMG:-$SCRIPT_DIR/disk.img}"
 
 # 커널 빌드
 build_kernel() {
@@ -139,8 +149,20 @@ build_kernel_with_modules() {
 
 # 디스크 이미지 생성 (없으면)
 create_disk_image() {
-    local disk_img="disk.img"
+    local disk_img="$DISK_IMG"
     local disk_size="32"  # MB
+
+    # BusyBox 경로가 지정되면 사용자 디스크 이미지를 항상 재생성
+    if [[ -n "${KERNERS_BUSYBOX:-}" ]]; then
+        if [[ ! -f "$KERNERS_BUSYBOX" ]]; then
+            print_error "KERNERS_BUSYBOX not found: $KERNERS_BUSYBOX"
+            exit 1
+        fi
+
+        print_info "Preparing user disk with BusyBox: $KERNERS_BUSYBOX"
+        bash "$SCRIPT_DIR/scripts/prepare_user_disk.sh" "$ARCH" "$KERNERS_BUSYBOX" "$disk_img"
+        return
+    fi
 
     if [[ ! -f "$disk_img" ]]; then
         print_info "Creating FAT32 disk image ($disk_img, ${disk_size}MB)..."
@@ -169,9 +191,9 @@ run_qemu() {
 
     # VirtIO 블록 디바이스 옵션
     VIRTIO_BLK=""
-    if [[ -f "disk.img" ]]; then
-        print_info "  Disk: disk.img (VirtIO)"
-        VIRTIO_BLK="-drive file=disk.img,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"
+    if [[ -f "$DISK_IMG" ]]; then
+        print_info "  Disk: $DISK_IMG (VirtIO)"
+        VIRTIO_BLK="-drive file=$DISK_IMG,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"
     fi
 
     echo ""
