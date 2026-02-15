@@ -198,6 +198,14 @@ pub trait VNode: Send + Sync {
     /// VNode 타입 반환
     fn node_type(&self) -> VNodeType;
 
+    /// 안정적인 파일 식별자
+    ///
+    /// 기본 구현은 객체 주소를 사용한다. 파일시스템 구현체는
+    /// 재조회 시에도 동일 식별자를 보장할 수 있으면 override 한다.
+    fn stable_id(&self) -> u64 {
+        (self as *const Self as *const ()) as usize as u64
+    }
+
     /// 파일 읽기
     ///
     /// `offset`: 읽기 시작 위치

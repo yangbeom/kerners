@@ -48,12 +48,10 @@ const PROT_WRITE: usize = 0x2;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_ANONYMOUS: usize = 0x20;
 const PAGE_SIZE: usize = 4096;
-const ENOSYS: i64 = -38;
-const EINVAL: i64 = -22;
+const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ECHILD: i64 = -10;
 const SIGCHLD: u32 = 17;
-const SIG_BLOCK: i32 = 0;
 const SIG_SETMASK: i32 = 2;
 const WNOHANG: i32 = 0x1;
 
@@ -129,19 +127,19 @@ pub extern "C" fn module_init() -> i32 {
     }
     print("PASS\n");
 
-    // 테스트 4: unsupported mmap (file-backed)
-    print("[test_proc] test: mmap unsupported mode ... ");
-    let unsupported = unsafe {
+    // 테스트 4: file-backed mmap 동작 확인
+    print("[test_proc] test: mmap file-backed mode ... ");
+    let file_backed = unsafe {
         kernel_sys_mmap(0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0)
     };
-    if unsupported != ENOSYS {
+    if file_backed != EBADF {
         print("FAIL\n");
         return -8;
     }
     print("PASS\n");
 
-    // 테스트 5: munmap 길이 불일치
-    print("[test_proc] test: munmap invalid length ... ");
+    // 테스트 5: munmap 부분 해제
+    print("[test_proc] test: munmap partial ... ");
     let mapped2 = unsafe {
         kernel_sys_mmap(
             0,
@@ -156,15 +154,26 @@ pub extern "C" fn module_init() -> i32 {
         print("FAIL (setup)\n");
         return -9;
     }
-    let bad_unmap = unsafe { kernel_sys_munmap(mapped2 as usize, PAGE_SIZE) };
-    if bad_unmap != EINVAL {
-        print("FAIL\n");
+
+    let unmap_head = unsafe { kernel_sys_munmap(mapped2 as usize, PAGE_SIZE) };
+    if unmap_head != 0 {
+        print("FAIL (head)\n");
         return -10;
     }
-    let final_unmap = unsafe { kernel_sys_munmap(mapped2 as usize, PAGE_SIZE * 2) };
+
+    unsafe {
+        let tail = (mapped2 as usize + PAGE_SIZE) as *mut u8;
+        tail.write_volatile(0xCC);
+        if tail.read_volatile() != 0xCC {
+            print("FAIL (tail-rw)\n");
+            return -11;
+        }
+    }
+
+    let final_unmap = unsafe { kernel_sys_munmap(mapped2 as usize + PAGE_SIZE, PAGE_SIZE) };
     if final_unmap != 0 {
         print("FAIL (cleanup)\n");
-        return -11;
+        return -12;
     }
     print("PASS\n");
 

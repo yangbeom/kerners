@@ -72,6 +72,8 @@ fn print_exception_context(ctx: &ExceptionContext) {
 
 /// Exception Class 코드
 const EC_SVC_AARCH64: u64 = 0b010101;  // SVC from AArch64 (syscall)
+const EC_DATA_ABORT_LOWER: u64 = 0b100100;
+const EC_DATA_ABORT_SAME: u64 = 0b100101;
 
 /// 기본 예외 핸들러
 #[unsafe(no_mangle)]
@@ -146,6 +148,15 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
         }
         // elr은 기본적으로 svc 다음 명령어를 가리킴
         return;
+    }
+
+    // 데이터 abort(page fault) 처리:
+    // - EL0(user) fault 뿐 아니라, 커널 모듈이 유저 VA를 접근하는 same-EL fault도
+    //   COW 대상이면 복구 후 복귀한다.
+    if ec == EC_DATA_ABORT_LOWER || ec == EC_DATA_ABORT_SAME {
+        if crate::syscall::handle_user_page_fault_aarch64(ctx.far as usize, ctx.esr) {
+            return;
+        }
     }
 
     // 다른 예외는 정보 출력 후 패닉

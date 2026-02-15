@@ -352,6 +352,31 @@ fn try_launch_init_process() -> bool {
         String::from("TERM=linux"),
     ];
 
+    // BusyBox 디스크가 있으면 먼저 사용자 공간 fork COW 스모크를 수행한다.
+    // shell 변수 분리(parent/child)가 깨지면 FAIL 문자열이 출력된다.
+    let busybox_smoke_path = "/mnt/bin/busybox";
+    if fs::lookup_path(busybox_smoke_path).is_ok() {
+        let busybox_smoke_argv = alloc::vec![
+            String::from(busybox_smoke_path),
+            String::from("sh"),
+            String::from("-c"),
+            String::from(
+                "x=parent; (x=child); if [ \"$x\" = \"parent\" ]; then echo COW_FORK_TEST: PASS; else echo COW_FORK_TEST: FAIL; fi; exec /mnt/bin/sh",
+            ),
+        ];
+        kprintln!("[init] trying PID1 candidate '{}' (fork COW smoke)", busybox_smoke_path);
+        match proc::user::spawn_init_process(busybox_smoke_path, &busybox_smoke_argv, &envp) {
+            Ok(tid) => {
+                kprintln!("[init] launched PID1 candidate '{}' (tid={})", busybox_smoke_path, tid);
+                return true;
+            }
+            Err(proc::user::ExecError::NotFound) => {}
+            Err(err) => {
+                kprintln!("[init] failed to start '{}': {:?}", busybox_smoke_path, err);
+            }
+        }
+    }
+
     // 현재 루트(RamFS) 우선 탐색 후, 자동 마운트 경로(/mnt)를 fallback으로 탐색
     let init_candidates: [&str; 9] = [
         "/sbin/init",

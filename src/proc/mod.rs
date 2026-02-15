@@ -50,6 +50,8 @@ pub struct Thread {
     pub kernel_stack: Vec<u8>,
     /// 유저 스택 (execve 등으로 유저 모드 진입 시 보관)
     pub user_stack: Option<Vec<u8>>,
+    /// 사용자 주소공간 루트 페이지 테이블 (aarch64)
+    pub user_root_table: usize,
     /// CPU 친화도 (None = 모든 CPU에서 실행 가능, Some(id) = 특정 CPU에 고정)
     pub cpu_affinity: Option<u32>,
 }
@@ -81,6 +83,10 @@ impl Thread {
             context,
             kernel_stack,
             user_stack: None,
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            user_root_table: crate::arch::mmu::current_root_table(),
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+            user_root_table: 0,
             cpu_affinity: None, // 모든 CPU에서 실행 가능
         }
     }
@@ -99,6 +105,10 @@ impl Thread {
             context: Context::empty(),
             kernel_stack,
             user_stack: None,
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            user_root_table: crate::arch::mmu::kernel_root_table(),
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+            user_root_table: 0,
             cpu_affinity: Some(0),
         }
     }
@@ -114,6 +124,10 @@ impl Thread {
             context: Context::empty(),
             kernel_stack: Vec::new(), // 스택은 percpu::stacks에서 관리
             user_stack: None,
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            user_root_table: crate::arch::mmu::kernel_root_table(),
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+            user_root_table: 0,
             cpu_affinity: Some(cpu_id),
         }
     }
@@ -234,6 +248,27 @@ pub fn set_current_user_stack(user_stack: Vec<u8>) -> bool {
     let mut threads = THREADS.lock();
     if let Some(thread) = threads.get_mut(idx as usize) {
         thread.user_stack = Some(user_stack);
+        true
+    } else {
+        false
+    }
+}
+
+/// 현재 스레드의 사용자 주소공간 루트 페이지 테이블 조회
+pub fn current_user_root_table() -> Option<usize> {
+    let idx = percpu::current().current_thread_idx.load(Ordering::Acquire);
+    if idx == u32::MAX {
+        return None;
+    }
+    let threads = THREADS.lock();
+    threads.get(idx as usize).map(|t| t.user_root_table)
+}
+
+/// tid 기준 사용자 주소공간 루트 페이지 테이블 설정
+pub fn set_thread_user_root_table(tid: Tid, root: usize) -> bool {
+    let mut threads = THREADS.lock();
+    if let Some(thread) = threads.iter_mut().find(|t| t.tid == tid) {
+        thread.user_root_table = root;
         true
     } else {
         false

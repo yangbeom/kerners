@@ -35,11 +35,7 @@ pub extern "C" fn kernel_heap_alloc(size: usize, align: usize) -> usize {
         Err(_) => return 0,
     };
     let ptr = unsafe { alloc::alloc::alloc(layout) };
-    if ptr.is_null() {
-        0
-    } else {
-        ptr as usize
-    }
+    if ptr.is_null() { 0 } else { ptr as usize }
 }
 
 /// 힙 메모리 해제
@@ -149,11 +145,7 @@ pub extern "C" fn kernel_mq_receive(
 /// RamDisk 생성 및 등록
 /// 반환: 0 = 성공, -1 = 실패
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_ramdisk_create(
-    name: *const u8,
-    name_len: usize,
-    size: usize,
-) -> i32 {
+pub extern "C" fn kernel_ramdisk_create(name: *const u8, name_len: usize, size: usize) -> i32 {
     let name = match str_from_raw(name, name_len) {
         Some(s) => s,
         None => return -1,
@@ -243,7 +235,11 @@ pub extern "C" fn kernel_vfs_mkdir(path: *const u8, path_len: usize) -> i32 {
         Ok(p) => p,
         Err(_) => return -1,
     };
-    match parent.create(dir_name, crate::fs::VNodeType::Directory, crate::fs::FileMode::default_dir()) {
+    match parent.create(
+        dir_name,
+        crate::fs::VNodeType::Directory,
+        crate::fs::FileMode::default_dir(),
+    ) {
         Ok(_) => 0,
         Err(_) => -1,
     }
@@ -262,7 +258,11 @@ pub extern "C" fn kernel_vfs_create_file(path: *const u8, path_len: usize) -> i3
         Ok(p) => p,
         Err(_) => return -1,
     };
-    match parent.create(file_name, crate::fs::VNodeType::File, crate::fs::FileMode::default_file()) {
+    match parent.create(
+        file_name,
+        crate::fs::VNodeType::File,
+        crate::fs::FileMode::default_file(),
+    ) {
         Ok(_) => 0,
         Err(_) => -1,
     }
@@ -368,7 +368,7 @@ pub extern "C" fn kernel_exec_prepare(path: *const u8, path_len: usize) -> i32 {
         Err(crate::proc::user::ExecError::InvalidElf)
         | Err(crate::proc::user::ExecError::UnsupportedExecutableType)
         | Err(crate::proc::user::ExecError::DynamicElfNotSupported) => -8, // ENOEXEC
-        Err(crate::proc::user::ExecError::IoError) => -5, // EIO
+        Err(crate::proc::user::ExecError::IoError) => -5,  // EIO
     }
 }
 
@@ -422,6 +422,36 @@ pub extern "C" fn kernel_sys_munmap(addr: usize, len: usize) -> i64 {
     crate::syscall::syscall_handler(crate::syscall::SYS_MUNMAP, [addr, len, 0, 0, 0, 0]) as i64
 }
 
+/// mprotect syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_mprotect(addr: usize, len: usize, prot: usize) -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_MPROTECT, [addr, len, prot, 0, 0, 0]) as i64
+}
+
+/// open syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_OPENAT,
+        [0, path as usize, flags as usize, mode as usize, 0, 0],
+    ) as i64
+}
+
+/// close syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_close(fd: i32) -> i64 {
+    crate::syscall::syscall_handler(crate::syscall::SYS_CLOSE, [fd as usize, 0, 0, 0, 0, 0]) as i64
+}
+
+/// lseek syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_LSEEK,
+        [fd as usize, offset as usize, whence as usize, 0, 0, 0],
+    ) as i64
+}
+
 /// rt_sigprocmask syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_rt_sigprocmask(
@@ -432,7 +462,14 @@ pub extern "C" fn kernel_sys_rt_sigprocmask(
 ) -> i64 {
     crate::syscall::syscall_handler(
         crate::syscall::SYS_RT_SIGPROCMASK,
-        [how as usize, set as usize, oldset as usize, sigsetsize, 0, 0],
+        [
+            how as usize,
+            set as usize,
+            oldset as usize,
+            sigsetsize,
+            0,
+            0,
+        ],
     ) as i64
 }
 
@@ -446,7 +483,14 @@ pub extern "C" fn kernel_sys_rt_sigtimedwait(
 ) -> i64 {
     crate::syscall::syscall_handler(
         crate::syscall::SYS_RT_SIGTIMEDWAIT,
-        [set as usize, info as usize, timeout as usize, sigsetsize, 0, 0],
+        [
+            set as usize,
+            info as usize,
+            timeout as usize,
+            sigsetsize,
+            0,
+            0,
+        ],
     ) as i64
 }
 
@@ -461,12 +505,7 @@ pub extern "C" fn kernel_sys_wait4(pid: isize, status: *mut i32, options: i32) -
 
 /// waitid syscall 래퍼
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_sys_waitid(
-    idtype: i32,
-    id: usize,
-    infop: *mut u8,
-    options: i32,
-) -> i64 {
+pub extern "C" fn kernel_sys_waitid(idtype: i32, id: usize, infop: *mut u8, options: i32) -> i64 {
     crate::syscall::syscall_handler(
         crate::syscall::SYS_WAITID,
         [idtype as usize, id, infop as usize, options as usize, 0, 0],
@@ -476,8 +515,7 @@ pub extern "C" fn kernel_sys_waitid(
 /// uname syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_uname(buf: *mut u8) -> i64 {
-    crate::syscall::syscall_handler(crate::syscall::SYS_UNAME, [buf as usize, 0, 0, 0, 0, 0])
-        as i64
+    crate::syscall::syscall_handler(crate::syscall::SYS_UNAME, [buf as usize, 0, 0, 0, 0, 0]) as i64
 }
 
 /// fork 래퍼 (테스트 경로)
@@ -544,9 +582,13 @@ pub extern "C" fn kernel_thread_spawn(
 /// N tick 대기 (busy-wait)
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sleep_ticks(ticks: u32) {
-    let start = crate::proc::percpu::current().tick_count.load(core::sync::atomic::Ordering::Relaxed);
+    let start = crate::proc::percpu::current()
+        .tick_count
+        .load(core::sync::atomic::Ordering::Relaxed);
     loop {
-        let now = crate::proc::percpu::current().tick_count.load(core::sync::atomic::Ordering::Relaxed);
+        let now = crate::proc::percpu::current()
+            .tick_count
+            .load(core::sync::atomic::Ordering::Relaxed);
         if now.wrapping_sub(start) >= ticks as u64 {
             break;
         }
@@ -607,14 +649,27 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_brk", kernel_sys_brk as usize);
     register_symbol("kernel_sys_mmap", kernel_sys_mmap as usize);
     register_symbol("kernel_sys_munmap", kernel_sys_munmap as usize);
-    register_symbol("kernel_sys_rt_sigprocmask", kernel_sys_rt_sigprocmask as usize);
-    register_symbol("kernel_sys_rt_sigtimedwait", kernel_sys_rt_sigtimedwait as usize);
+    register_symbol("kernel_sys_mprotect", kernel_sys_mprotect as usize);
+    register_symbol("kernel_sys_open", kernel_sys_open as usize);
+    register_symbol("kernel_sys_close", kernel_sys_close as usize);
+    register_symbol("kernel_sys_lseek", kernel_sys_lseek as usize);
+    register_symbol(
+        "kernel_sys_rt_sigprocmask",
+        kernel_sys_rt_sigprocmask as usize,
+    );
+    register_symbol(
+        "kernel_sys_rt_sigtimedwait",
+        kernel_sys_rt_sigtimedwait as usize,
+    );
     register_symbol("kernel_sys_wait4", kernel_sys_wait4 as usize);
     register_symbol("kernel_sys_waitid", kernel_sys_waitid as usize);
     register_symbol("kernel_sys_uname", kernel_sys_uname as usize);
     register_symbol("kernel_sys_fork", kernel_sys_fork as usize);
     register_symbol("kernel_sys_vfork", kernel_sys_vfork as usize);
-    register_symbol("kernel_test_enqueue_signal", kernel_test_enqueue_signal as usize);
+    register_symbol(
+        "kernel_test_enqueue_signal",
+        kernel_test_enqueue_signal as usize,
+    );
 
     // Thread
     register_symbol("kernel_thread_spawn", kernel_thread_spawn as usize);
@@ -623,5 +678,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 34);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 38);
 }

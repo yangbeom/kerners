@@ -190,7 +190,17 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
                 ctx.gpr[15] as usize,  // a5 = x15
             ];
             
-            let ret = crate::syscall::syscall_handler(syscall_num, args);
+            let ret = if cause == 8 {
+                crate::syscall::syscall_handler_riscv64_with_user_context(
+                    syscall_num,
+                    args,
+                    ctx.gpr,
+                    ctx.mstatus,
+                    ctx.mepc,
+                )
+            } else {
+                crate::syscall::syscall_handler(syscall_num, args)
+            };
 
             if let Some(exec) = crate::syscall::take_exec_transition_for_current() {
                 if crate::proc::set_current_user_stack(exec.user_stack) {
@@ -223,12 +233,18 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
         }
         13 => {
             // Load page fault
+            if crate::syscall::handle_user_page_fault_riscv64(ctx.mtval as usize, cause) {
+                return;
+            }
             kprintln!("\n[EXCEPTION] Load page fault");
             print_trap_context(ctx);
             panic!("Load page fault at {:#x}, address: {:#x}", ctx.mepc, ctx.mtval);
         }
         15 => {
             // Store page fault
+            if crate::syscall::handle_user_page_fault_riscv64(ctx.mtval as usize, cause) {
+                return;
+            }
             kprintln!("\n[EXCEPTION] Store page fault");
             print_trap_context(ctx);
             panic!("Store page fault at {:#x}, address: {:#x}", ctx.mepc, ctx.mtval);

@@ -135,7 +135,7 @@
 | 206 | `sendto` | ✅ 구현 | baseline: `EBADF`/`EAFNOSUPPORT` |
 | 214 | `brk` | ✅ 구현 | 스레드별 고정 16MB 영역 baseline |
 | 215 | `munmap` | ✅ 구현 | full unmap만 지원(부분 해제 미지원) |
-| 220 | `clone` | ✅ 구현 | baseline + aarch64 user-context + CLONE_* 리소스 그룹 추적 |
+| 220 | `clone` | ✅ 구현 | baseline + aarch64/riscv64 user-context + CLONE_* 리소스 그룹 추적 |
 | 221 | `execve` | ✅ 구현 | static ELF(`ET_EXEC`) + argv/env 경계검증 + 확장 auxv |
 | 222 | `mmap` | ✅ 구현 | anonymous(private/shared) baseline |
 | 260 | `wait4` | ✅ 구현 | zombie 회수 + Linux wait status + `WNOHANG` + 자식 대기/`ECHILD` |
@@ -197,7 +197,7 @@
 ##### 10-1A. 현재 기준점(Baseline)
 - [x] `sys_execve` (NR 221) 구현 (1차 baseline)
   - [x] 유저 ELF64 파서 (`ET_EXEC` 중심, `ET_DYN`은 추후)
-  - [x] PT_LOAD 세그먼트 로드/매핑 (aarch64 유저 VA 매핑 baseline)
+  - [x] PT_LOAD 세그먼트 로드/매핑 (aarch64/riscv64 유저 VA 매핑 baseline)
   - [x] 유저 스택 초기화 (argc, argv, envp, auxv)
   - [x] trap 복귀 시 컨텍스트 전이로 새 엔트리 점프 (aarch64/riscv64)
 - [x] BusyBox 반입 경로 준비 (`scripts/prepare_user_disk.sh`, `KERNERS_BUSYBOX`)
@@ -299,33 +299,33 @@
 
 #### 11-1. brk / sbrk 고도화
 - [x] `sys_brk` (NR 214) baseline 구현
-- [ ] `sys_brk` (NR 214) 고도화
-  - [ ] 프로세스별 program break 트래킹
-  - [ ] 힙 영역 확장/축소
-  - [ ] 페이지 단위 매핑/해제
-- [ ] 테스트: `modules/test_brk`
+- [x] `sys_brk` (NR 214) 고도화
+  - [x] 프로세스별 program break 트래킹
+  - [x] 힙 영역 확장/축소
+  - [x] 페이지 단위 매핑/해제
+- [x] 테스트: `modules/test_brk`
 
 #### 11-2. mmap / munmap 고도화
 - [x] `sys_mmap` (NR 222) baseline 구현
-- [ ] `sys_mmap` (NR 222) 고도화
-  - [ ] MAP_ANONYMOUS | MAP_PRIVATE — 익명 페이지 매핑
-  - [ ] MAP_FIXED — 지정 주소 매핑
-  - [ ] PROT_READ, PROT_WRITE, PROT_EXEC 페이지 권한
-  - [ ] 파일 backed mmap (fd + offset)
+- [x] `sys_mmap` (NR 222) 고도화
+  - [x] MAP_ANONYMOUS | MAP_PRIVATE — 익명 페이지 매핑
+  - [x] MAP_FIXED — 지정 주소 매핑
+  - [x] PROT_READ, PROT_WRITE, PROT_EXEC 페이지 권한
+  - [x] 파일 backed mmap (fd + offset, aarch64/riscv64 구현)
 - [x] `sys_munmap` (NR 215) baseline 구현
-- [ ] `sys_munmap` (NR 215) 고도화
-  - [ ] 페이지 테이블 엔트리 해제
-  - [ ] 물리 페이지 반환
-- [ ] `sys_mprotect` (NR 226)
-  - [ ] 페이지 권한 변경 (RWX)
-  - [ ] 페이지 테이블 업데이트 + TLB flush
-- [ ] 테스트: `modules/test_mmap`
+- [x] `sys_munmap` (NR 215) 고도화
+  - [x] 페이지 테이블 엔트리 해제
+  - [x] 물리 페이지 반환
+- [x] `sys_mprotect` (NR 226)
+  - [x] 페이지 권한 변경 (RWX)
+  - [x] 페이지 테이블 업데이트 + TLB flush
+- [x] 테스트: `modules/test_mmap`
 
 #### 11-3. Copy-on-Write (COW)
-- [ ] 페이지 참조 카운트
-- [ ] fork 시 부모/자식 페이지를 read-only로 공유
-- [ ] 페이지 폴트 핸들러에서 COW 처리
-  - [ ] 새 페이지 할당 → 복사 → 쓰기 권한 부여
+- [x] 페이지 참조 카운트
+- [x] fork 시 부모/자식 페이지를 read-only로 공유
+- [x] 페이지 폴트 핸들러에서 COW 처리
+  - [x] 새 페이지 할당 → 복사 → 쓰기 권한 부여
 
 ### Phase 12: 시간 및 타이머 시스템 콜 (단기)
 

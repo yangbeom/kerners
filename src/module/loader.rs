@@ -603,7 +603,7 @@ impl ModuleLoader {
                     core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
                 }
 
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 if crate::arch::mmu::map_user_page_noflush(page_addr, frame, writable, executable)
                     .is_err()
                 {
@@ -637,7 +637,7 @@ impl ModuleLoader {
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         crate::arch::mmu::flush_tlb_all();
 
         // 엔트리 포인트 반환

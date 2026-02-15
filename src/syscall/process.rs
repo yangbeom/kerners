@@ -2,13 +2,17 @@
 //!
 //! exit, yield, getpid, execve 등
 
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use super::errno;
+use crate::fs;
 use crate::kprintln;
 use crate::proc;
 use crate::sync::Mutex;
-use super::errno;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+use crate::fs::fd;
 
 const MAX_EXEC_PATH_LEN: usize = 4096;
 const MAX_EXEC_ARG_COUNT: usize = 128;
@@ -22,19 +26,68 @@ struct PendingExec {
     image: proc::user::PreparedExecImage,
 }
 
+#[derive(Clone)]
 struct BrkRegion {
-    tid: proc::Tid,
+    vm_group: u64,
     base: usize,
     current: usize,
     limit: usize,
-    phys_base: usize,
+    pages: Vec<Option<usize>>,
 }
 
+#[derive(Clone)]
+struct FileMapBacking {
+    vnode: Arc<dyn fs::VNode>,
+    stable_id: u64,
+    file_offset: usize,
+    map_len: usize,
+    shared: bool,
+}
+
+#[derive(Clone)]
+enum MmapBacking {
+    Anonymous,
+    File(FileMapBacking),
+}
+
+#[derive(Clone)]
 struct MmapRegion {
-    tid: proc::Tid,
+    vm_group: u64,
     base: usize,
-    phys_base: usize,
-    pages: usize,
+    len: usize,
+    requested_len: usize,
+    prot: usize,
+    flags: usize,
+    pages: Vec<usize>,
+    backing: MmapBacking,
+}
+
+struct VmSpace {
+    vm_group: u64,
+    root_table: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CowOrigin {
+    Fork,
+    PrivateMap,
+}
+
+#[derive(Clone, Copy)]
+struct CowMeta {
+    vm_group: u64,
+    addr: usize,
+    frame: usize,
+    execute: bool,
+    origin: CowOrigin,
+}
+
+struct FilePageCacheEntry {
+    stable_id: u64,
+    page_index: usize,
+    frame: usize,
+    vnode: Arc<dyn fs::VNode>,
+    dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +126,16 @@ struct ForkChildContext {
     sp_el0: u64,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ForkChildContext {
+    gpr: [u64; 32],
+    mstatus: u64,
+    mepc: u64,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 struct PendingForkChild {
     tid: proc::Tid,
     context: ForkChildContext,
@@ -93,25 +155,31 @@ pub struct ExecTransition {
 static PENDING_EXECS: Mutex<Vec<PendingExec>> = Mutex::new(Vec::new());
 static BRK_REGIONS: Mutex<Vec<BrkRegion>> = Mutex::new(Vec::new());
 static MMAP_REGIONS: Mutex<Vec<MmapRegion>> = Mutex::new(Vec::new());
+static VM_SPACES: Mutex<Vec<VmSpace>> = Mutex::new(Vec::new());
+static COW_PAGES: Mutex<Vec<CowMeta>> = Mutex::new(Vec::new());
+static FILE_PAGE_CACHE: Mutex<Vec<FilePageCacheEntry>> = Mutex::new(Vec::new());
 static ZOMBIE_CHILDREN: Mutex<Vec<ZombieChild>> = Mutex::new(Vec::new());
 static PROCESS_INFOS: Mutex<Vec<ProcessInfo>> = Mutex::new(Vec::new());
 static VFORK_WAITS: Mutex<Vec<VforkWait>> = Mutex::new(Vec::new());
 static NEXT_FAKE_CHILD_TID: AtomicUsize = AtomicUsize::new(1000);
 static NEXT_RESOURCE_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
-#[cfg(target_arch = "aarch64")]
+static COW_FORK_TEST_REPORTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 static PENDING_FORK_CHILDREN: Mutex<Vec<PendingForkChild>> = Mutex::new(Vec::new());
 
 const BRK_REGION_SIZE: usize = 16 * 1024 * 1024; // 16MB (static BusyBox init baseline)
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const BRK_REGION_BASE: usize = 0x2000_0000;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MMAP_REGION_BASE: usize = 0x3000_0000;
-#[cfg(target_arch = "aarch64")]
-static NEXT_MMAP_BASE: AtomicUsize = AtomicUsize::new(MMAP_REGION_BASE);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+const MMAP_REGION_END: usize =
+    crate::proc::user::USER_STACK_BASE - crate::proc::user::USER_STACK_SIZE;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
 const PROT_EXEC: usize = 0x4;
+const MAP_TYPE_MASK: usize = 0x0f;
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
@@ -139,14 +207,28 @@ const MIN_SIGSET_SIZE: usize = core::mem::size_of::<u64>();
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MIN_USER_VADDR: usize = 0x1000;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MAX_USER_VADDR_EXCLUSIVE: usize = crate::proc::user::USER_STACK_BASE;
 
 #[inline]
 const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn page_count_for_len(len: usize, page_size: usize) -> usize {
+    align_up(len, page_size) / page_size
+}
+
+#[inline]
+fn mmap_region_end(region: &MmapRegion) -> usize {
+    region.base + region.len
+}
+
+fn mmap_overlaps(region: &MmapRegion, start: usize, end: usize) -> bool {
+    region.base < end && start < mmap_region_end(region)
 }
 
 #[repr(C)]
@@ -230,10 +312,19 @@ fn monotonic_time() -> (u64, u64) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn map_user_contiguous(
+#[inline]
+fn alloc_zeroed_frame() -> Option<usize> {
+    let frame = crate::mm::page::alloc_frame()?;
+    unsafe {
+        // SAFETY: alloc_frame로 확보한 유효한 4KB 프레임을 zero-fill 한다.
+        core::ptr::write_bytes(frame as *mut u8, 0, crate::mm::page::PAGE_SIZE);
+    }
+    Some(frame)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn reprotect_user_pages_noflush(
     virt_base: usize,
-    phys_base: usize,
     pages: usize,
     write: bool,
     execute: bool,
@@ -241,16 +332,24 @@ fn map_user_contiguous(
     let page_size = crate::mm::page::PAGE_SIZE;
     for i in 0..pages {
         let va = virt_base + i * page_size;
-        let pa = phys_base + i * page_size;
-        if crate::arch::mmu::map_user_page_noflush(va, pa, write, execute).is_err() {
-            return Err(errno::ENOMEM);
+        if crate::arch::mmu::update_user_page_flags_noflush(va, write, execute).is_err() {
+            return Err(errno::EINVAL);
         }
     }
-    crate::arch::mmu::flush_tlb_all();
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[inline]
+fn flush_user_tlb() {
+    crate::arch::mmu::flush_tlb_all();
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+#[inline]
+fn flush_user_tlb() {}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 unsafe extern "C" {
     fn fork_child_enter_user(context: *const ForkChildContext) -> !;
 }
@@ -291,6 +390,58 @@ fork_child_enter_user:
     ldp x28, x29, [x30, #224]
     ldr x30, [x30, #240]
     eret
+"#
+);
+
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    r#"
+.section .text
+.global fork_child_enter_user
+.type fork_child_enter_user, @function
+fork_child_enter_user:
+    // a0 = *ForkChildContext
+    mv t6, a0
+
+    // mret 복귀 컨텍스트 복원
+    ld t0, 256(t6)   // mstatus
+    ld t1, 264(t6)   // mepc
+    csrw mstatus, t0
+    csrw mepc, t1
+
+    // 사용자 GPR 복원 (x0 제외)
+    ld x1, 8(t6)
+    ld x2, 16(t6)
+    ld x3, 24(t6)
+    ld x4, 32(t6)
+    ld x5, 40(t6)
+    ld x6, 48(t6)
+    ld x7, 56(t6)
+    ld x8, 64(t6)
+    ld x9, 72(t6)
+    ld x10, 80(t6)
+    ld x11, 88(t6)
+    ld x12, 96(t6)
+    ld x13, 104(t6)
+    ld x14, 112(t6)
+    ld x15, 120(t6)
+    ld x16, 128(t6)
+    ld x17, 136(t6)
+    ld x18, 144(t6)
+    ld x19, 152(t6)
+    ld x20, 160(t6)
+    ld x21, 168(t6)
+    ld x22, 176(t6)
+    ld x23, 184(t6)
+    ld x24, 192(t6)
+    ld x25, 200(t6)
+    ld x26, 208(t6)
+    ld x27, 216(t6)
+    ld x28, 224(t6)
+    ld x29, 232(t6)
+    ld x30, 240(t6)
+    ld x31, 248(t6)
+    mret
 "#
 );
 
@@ -369,6 +520,10 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         pending_signals: Vec::new(),
         exit_signal: 0,
     });
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        let _ = ensure_vm_space_root(default_group);
+    }
     processes.len() - 1
 }
 
@@ -379,6 +534,449 @@ fn ensure_process_info_for_tid(tid: proc::Tid) {
 
 fn current_tid_or_zero() -> proc::Tid {
     proc::current_tid().unwrap_or(0)
+}
+
+fn vm_group_for_tid(tid: proc::Tid) -> u64 {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].vm_group
+}
+
+fn current_vm_group() -> u64 {
+    vm_group_for_tid(current_tid_or_zero())
+}
+
+fn process_count_in_vm_group(vm_group: u64) -> usize {
+    let processes = PROCESS_INFOS.lock();
+    processes
+        .iter()
+        .filter(|process| process.vm_group == vm_group)
+        .count()
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn ensure_vm_space_root(vm_group: u64) -> usize {
+    let mut spaces = VM_SPACES.lock();
+    if let Some(space) = spaces.iter().find(|s| s.vm_group == vm_group) {
+        return space.root_table;
+    }
+    let root = crate::proc::current_user_root_table()
+        .unwrap_or(crate::arch::mmu::current_root_table());
+    spaces.push(VmSpace {
+        vm_group,
+        root_table: root,
+    });
+    root
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn vm_root_for_group(vm_group: u64) -> usize {
+    ensure_vm_space_root(vm_group)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn set_vm_root_for_group(vm_group: u64, root_table: usize) {
+    let mut spaces = VM_SPACES.lock();
+    if let Some(space) = spaces.iter_mut().find(|s| s.vm_group == vm_group) {
+        space.root_table = root_table;
+        return;
+    }
+    spaces.push(VmSpace {
+        vm_group,
+        root_table,
+    });
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn vm_root_for_group_if_present(vm_group: u64) -> Option<usize> {
+    let spaces = VM_SPACES.lock();
+    spaces
+        .iter()
+        .find(|space| space.vm_group == vm_group)
+        .map(|space| space.root_table)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn remove_vm_space(vm_group: u64) {
+    let mut spaces = VM_SPACES.lock();
+    if let Some(pos) = spaces.iter().position(|space| space.vm_group == vm_group) {
+        spaces.swap_remove(pos);
+    }
+}
+
+fn flush_shared_writeback_for_vm_group(vm_group: u64) {
+    let regions = MMAP_REGIONS.lock();
+    for region in regions.iter().filter(|region| region.vm_group == vm_group) {
+        let _ = flush_file_region_pages(region, 0, region.pages.len());
+    }
+}
+
+fn cleanup_vm_group_resources(vm_group: u64) {
+    flush_shared_writeback_for_vm_group(vm_group);
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    let root_table = vm_root_for_group_if_present(vm_group);
+    let page_size = crate::mm::page::PAGE_SIZE;
+
+    {
+        let mut brk_regions = BRK_REGIONS.lock();
+        let mut i = 0usize;
+        while i < brk_regions.len() {
+            if brk_regions[i].vm_group != vm_group {
+                i += 1;
+                continue;
+            }
+            let region = brk_regions.swap_remove(i);
+            for (idx, frame_opt) in region.pages.iter().enumerate() {
+                let Some(frame) = *frame_opt else {
+                    continue;
+                };
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                if let Some(root) = root_table {
+                    let va = region.base + idx * page_size;
+                    let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                }
+                remove_cow_meta(vm_group, region.base + idx * page_size);
+                unsafe {
+                    // SAFETY: vm_group에서 소유하던 frame 참조를 해제한다.
+                    crate::mm::page::free_frame(frame);
+                }
+            }
+        }
+    }
+
+    {
+        let mut mmap_regions = MMAP_REGIONS.lock();
+        let mut i = 0usize;
+        while i < mmap_regions.len() {
+            if mmap_regions[i].vm_group != vm_group {
+                i += 1;
+                continue;
+            }
+            let region = mmap_regions.swap_remove(i);
+            for (idx, frame) in region.pages.iter().copied().enumerate() {
+                let va = region.base + idx * page_size;
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                if let Some(root) = root_table {
+                    let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                }
+                remove_cow_meta(vm_group, va);
+                unsafe {
+                    // SAFETY: vm_group에서 소유하던 frame 참조를 해제한다.
+                    crate::mm::page::free_frame(frame);
+                }
+            }
+        }
+    }
+
+    remove_cow_for_vm_group(vm_group);
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if root_table.is_some() {
+            flush_user_tlb();
+        }
+        remove_vm_space(vm_group);
+    }
+}
+
+fn set_cow_meta(vm_group: u64, addr: usize, frame: usize, execute: bool, origin: CowOrigin) {
+    let mut cows = COW_PAGES.lock();
+    if let Some(item) = cows
+        .iter_mut()
+        .find(|item| item.vm_group == vm_group && item.addr == addr)
+    {
+        item.frame = frame;
+        item.execute = execute;
+        item.origin = origin;
+        return;
+    }
+    cows.push(CowMeta {
+        vm_group,
+        addr,
+        frame,
+        execute,
+        origin,
+    });
+}
+
+fn remove_cow_meta(vm_group: u64, addr: usize) {
+    let mut cows = COW_PAGES.lock();
+    if let Some(pos) = cows
+        .iter()
+        .position(|item| item.vm_group == vm_group && item.addr == addr)
+    {
+        cows.swap_remove(pos);
+    }
+}
+
+fn remove_cow_for_vm_group(vm_group: u64) {
+    let mut cows = COW_PAGES.lock();
+    cows.retain(|item| item.vm_group != vm_group);
+}
+
+fn mark_file_cache_dirty(stable_id: u64, page_index: usize) {
+    let mut cache = FILE_PAGE_CACHE.lock();
+    if let Some(item) = cache
+        .iter_mut()
+        .find(|entry| entry.stable_id == stable_id && entry.page_index == page_index)
+    {
+        item.dirty = true;
+    }
+}
+
+fn clear_file_cache_dirty(stable_id: u64, page_index: usize) {
+    let mut cache = FILE_PAGE_CACHE.lock();
+    if let Some(item) = cache
+        .iter_mut()
+        .find(|entry| entry.stable_id == stable_id && entry.page_index == page_index)
+    {
+        item.dirty = false;
+    }
+}
+
+fn get_or_create_file_cache_page(
+    vnode: &Arc<dyn fs::VNode>,
+    stable_id: u64,
+    page_index: usize,
+    file_offset: usize,
+) -> Result<usize, isize> {
+    {
+        let cache = FILE_PAGE_CACHE.lock();
+        if let Some(item) = cache
+            .iter()
+            .find(|entry| entry.stable_id == stable_id && entry.page_index == page_index)
+        {
+            let _ = crate::mm::page::retain_frame(item.frame);
+            return Ok(item.frame);
+        }
+    }
+
+    let frame = match alloc_zeroed_frame() {
+        Some(frame) => frame,
+        None => return Err(errno::ENOMEM),
+    };
+
+    let read_buf = unsafe {
+        // SAFETY: frame은 유효한 4KB 페이지 프레임이며 임시 read 버퍼로 사용한다.
+        core::slice::from_raw_parts_mut(frame as *mut u8, crate::mm::page::PAGE_SIZE)
+    };
+    if vnode.read(file_offset, read_buf).is_err() {
+        unsafe {
+            // SAFETY: 방금 할당한 frame을 실패 경로에서 반환한다.
+            crate::mm::page::free_frame(frame);
+        }
+        return Err(errno::EIO);
+    }
+
+    {
+        let mut cache = FILE_PAGE_CACHE.lock();
+        cache.push(FilePageCacheEntry {
+            stable_id,
+            page_index,
+            frame,
+            vnode: vnode.clone(),
+            dirty: false,
+        });
+    }
+
+    let _ = crate::mm::page::retain_frame(frame);
+    Ok(frame)
+}
+
+fn flush_file_region_pages(region: &MmapRegion, start_page: usize, pages: usize) -> Result<(), isize> {
+    let MmapBacking::File(backing) = &region.backing else {
+        return Ok(());
+    };
+    if !backing.shared {
+        return Ok(());
+    }
+
+    for rel in 0..pages {
+        let page = start_page + rel;
+        if page >= region.pages.len() {
+            break;
+        }
+        let page_start = page * crate::mm::page::PAGE_SIZE;
+        if page_start >= backing.map_len {
+            break;
+        }
+        let bytes = core::cmp::min(crate::mm::page::PAGE_SIZE, backing.map_len - page_start);
+        let write_off = backing.file_offset + page_start;
+        let frame = region.pages[page];
+        let buf = unsafe {
+            // SAFETY: frame은 유효한 매핑 프레임이며 writeback 시 읽기 전용으로 참조한다.
+            core::slice::from_raw_parts(frame as *const u8, bytes)
+        };
+        let page_index = backing.file_offset / crate::mm::page::PAGE_SIZE + page;
+        mark_file_cache_dirty(backing.stable_id, page_index);
+        match backing.vnode.write(write_off, buf) {
+            Ok(n) if n == bytes => {}
+            _ => return Err(errno::EIO),
+        }
+        clear_file_cache_dirty(backing.stable_id, page_index);
+    }
+
+    Ok(())
+}
+
+fn replace_vm_page_frame(vm_group: u64, va: usize, new_frame: usize) {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    {
+        let mut brk = BRK_REGIONS.lock();
+        for region in brk.iter_mut() {
+            if region.vm_group != vm_group {
+                continue;
+            }
+            if va < region.base || va >= region.limit {
+                continue;
+            }
+            let idx = (va - region.base) / page_size;
+            if idx < region.pages.len() {
+                region.pages[idx] = Some(new_frame);
+                return;
+            }
+        }
+    }
+
+    let mut mmaps = MMAP_REGIONS.lock();
+    for region in mmaps.iter_mut() {
+        if region.vm_group != vm_group {
+            continue;
+        }
+        if va < region.base || va >= mmap_region_end(region) {
+            continue;
+        }
+        let idx = (va - region.base) / page_size;
+        if idx < region.pages.len() {
+            region.pages[idx] = new_frame;
+            return;
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn setup_cow_pair(
+    parent_vm_group: u64,
+    child_vm_group: u64,
+    parent_root: usize,
+    child_root: usize,
+    va: usize,
+    frame: usize,
+    execute: bool,
+) -> Result<(), isize> {
+    if crate::arch::mmu::update_user_page_flags_for_root_noflush(parent_root, va, false, execute).is_err() {
+        return Err(errno::EINVAL);
+    }
+    if crate::arch::mmu::update_user_page_flags_for_root_noflush(child_root, va, false, execute).is_err() {
+        return Err(errno::EINVAL);
+    }
+    set_cow_meta(parent_vm_group, va, frame, execute, CowOrigin::Fork);
+    set_cow_meta(child_vm_group, va, frame, execute, CowOrigin::Fork);
+    Ok(())
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn handle_user_page_fault_write(far: usize) -> bool {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let va = far & !(page_size - 1);
+    if va < MIN_USER_VADDR || va >= MAX_USER_VADDR_EXCLUSIVE {
+        return false;
+    }
+
+    let vm_group = current_vm_group();
+    let cow = {
+        let cows = COW_PAGES.lock();
+        cows.iter()
+            .find(|item| item.vm_group == vm_group && item.addr == va)
+            .copied()
+    };
+    let Some(cow) = cow else {
+        return false;
+    };
+
+    let root_table = vm_root_for_group(vm_group);
+    let mapped_frame = match crate::arch::mmu::get_user_page_phys_for_root(root_table, va) {
+        Ok(frame) => frame,
+        Err(_) => return false,
+    };
+    let source_frame = if mapped_frame != 0 {
+        mapped_frame
+    } else {
+        cow.frame
+    };
+    let refcount = crate::mm::page::frame_refcount(source_frame);
+    if refcount == 0 {
+        return false;
+    }
+
+    if refcount > 1 {
+        let new_frame = match alloc_zeroed_frame() {
+            Some(frame) => frame,
+            None => return false,
+        };
+        unsafe {
+            // SAFETY: source/new frame은 모두 PAGE_SIZE 크기의 유효한 프레임이다.
+            core::ptr::copy_nonoverlapping(
+                source_frame as *const u8,
+                new_frame as *mut u8,
+                page_size,
+            );
+        }
+        if crate::arch::mmu::map_user_page_for_root_noflush(root_table, va, new_frame, true, cow.execute)
+            .is_err()
+        {
+            unsafe {
+                // SAFETY: map 실패 시 새 프레임만 즉시 반납한다.
+                crate::mm::page::free_frame(new_frame);
+            }
+            return false;
+        }
+        replace_vm_page_frame(vm_group, va, new_frame);
+        unsafe {
+            // SAFETY: 기존 공유 프레임에 대한 현재 매핑 참조를 해제한다.
+            crate::mm::page::free_frame(source_frame);
+        }
+    } else if crate::arch::mmu::update_user_page_flags_for_root_noflush(root_table, va, true, cow.execute)
+        .is_err()
+    {
+        return false;
+    }
+
+    if cow.origin == CowOrigin::Fork
+        && COW_FORK_TEST_REPORTED
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        kprintln!(
+            "COW_FORK_TEST: PASS (tid={}, va={:#x}, refcount_before={})",
+            current_tid_or_zero(),
+            va,
+            refcount
+        );
+    }
+
+    remove_cow_meta(vm_group, va);
+    flush_user_tlb();
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn handle_user_page_fault_aarch64(far: usize, esr: u64) -> bool {
+    const ISS_WNR_BIT: u64 = 1 << 6;
+    if (esr & ISS_WNR_BIT) == 0 {
+        return false;
+    }
+    handle_user_page_fault_write(far)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn handle_user_page_fault_riscv64(far: usize, cause: u64) -> bool {
+    const STORE_PAGE_FAULT: u64 = 15;
+    if cause != STORE_PAGE_FAULT {
+        return false;
+    }
+    handle_user_page_fault_write(far)
 }
 
 fn signal_to_mask(signum: u32) -> u64 {
@@ -552,11 +1150,20 @@ fn finalize_exit(tid: proc::Tid, status: i32) {
     let reparented_zombies = reparent_zombie_children(tid, orphan_reaper);
     let wait_status = encode_wait_status_from_exit_code(status);
 
-    let (parent_tid, exit_signal) = {
+    let (parent_tid, exit_signal, vm_group) = {
         let mut processes = PROCESS_INFOS.lock();
         let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
-        (processes[idx].parent_tid, processes[idx].exit_signal)
+        (
+            processes[idx].parent_tid,
+            processes[idx].exit_signal,
+            processes[idx].vm_group,
+        )
     };
+
+    flush_shared_writeback_for_vm_group(vm_group);
+    if process_count_in_vm_group(vm_group) == 1 {
+        cleanup_vm_group_resources(vm_group);
+    }
 
     if parent_tid != 0 {
         ZOMBIE_CHILDREN.lock().push(ZombieChild {
@@ -579,8 +1186,17 @@ fn finalize_exit(tid: proc::Tid, status: i32) {
 
 fn remove_process_info(tid: proc::Tid) {
     let mut processes = PROCESS_INFOS.lock();
-    if let Some(pos) = processes.iter().position(|p| p.tid == tid) {
-        processes.swap_remove(pos);
+    let removed_vm_group = if let Some(pos) = processes.iter().position(|p| p.tid == tid) {
+        Some(processes.swap_remove(pos).vm_group)
+    } else {
+        None
+    };
+    drop(processes);
+
+    if let Some(vm_group) = removed_vm_group {
+        if process_count_in_vm_group(vm_group) == 0 {
+            cleanup_vm_group_resources(vm_group);
+        }
     }
 }
 
@@ -649,7 +1265,7 @@ fn write_uts_field(dst: &mut [u8; 65], value: &str) {
     dst[len] = 0;
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn fork_child_entry() -> ! {
     let tid = current_tid_or_zero();
     let context = {
@@ -664,7 +1280,7 @@ fn fork_child_entry() -> ! {
     };
 
     unsafe {
-        // SAFETY: fork/clone 시 부모 trap context에서 캡처한 유효 EL0 복귀 상태를 복원한다.
+        // SAFETY: fork/clone 시 부모 trap context에서 캡처한 유효 사용자 복귀 상태를 복원한다.
         fork_child_enter_user(&context as *const ForkChildContext);
     }
 }
@@ -776,12 +1392,7 @@ pub fn sys_rt_sigaction(
 /// sys_rt_sigprocmask - 시그널 마스크 제어
 ///
 /// 현재 구현은 64비트 시그널 마스크(1~64번)를 프로세스 단위로 추적한다.
-pub fn sys_rt_sigprocmask(
-    how: i32,
-    set: *const u8,
-    oldset: *mut u8,
-    sigsetsize: usize,
-) -> isize {
+pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> isize {
     if sigsetsize < MIN_SIGSET_SIZE {
         return errno::EINVAL;
     }
@@ -1014,7 +1625,13 @@ pub fn sys_clone(
 
 /// sys_fork - clone(SIGCHLD) 래퍼
 pub fn sys_fork() -> isize {
-    sys_clone(SIGNAL_SIGCHLD as usize, 0, core::ptr::null_mut(), 0, core::ptr::null_mut())
+    sys_clone(
+        SIGNAL_SIGCHLD as usize,
+        0,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+    )
 }
 
 /// sys_vfork - clone(CLONE_VM | CLONE_VFORK | SIGCHLD) 래퍼
@@ -1026,6 +1643,199 @@ pub fn sys_vfork() -> isize {
         0,
         core::ptr::null_mut(),
     )
+}
+
+fn finalize_clone_with_vm_setup(
+    flags: usize,
+    parent_tid: proc::Tid,
+    child_tid: proc::Tid,
+    parent_tid_ptr: *mut u8,
+    child_tid_ptr: *mut u8,
+) -> isize {
+    let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
+    let (parent_vm_group, child_vm_group) = {
+        let mut processes = PROCESS_INFOS.lock();
+        let parent_idx = ensure_process_info_for_tid_locked(&mut processes, parent_tid);
+        let parent_pgid = processes[parent_idx].pgid;
+        let parent_sid = processes[parent_idx].sid;
+        let parent_mask = processes[parent_idx].signal_mask;
+        let parent_vm_group = processes[parent_idx].vm_group;
+        let parent_fs_group = processes[parent_idx].fs_group;
+        let parent_files_group = processes[parent_idx].files_group;
+        let parent_sighand_group = processes[parent_idx].sighand_group;
+        let (child_vm_group, child_fs_group, child_files_group, child_sighand_group) =
+            clone_resource_groups(
+                flags,
+                parent_vm_group,
+                parent_fs_group,
+                parent_files_group,
+                parent_sighand_group,
+            );
+
+        if let Some(pos) = processes.iter().position(|p| p.tid == child_tid) {
+            processes.swap_remove(pos);
+        }
+        processes.push(ProcessInfo {
+            tid: child_tid,
+            parent_tid,
+            pgid: parent_pgid,
+            sid: parent_sid,
+            vm_group: child_vm_group,
+            fs_group: child_fs_group,
+            files_group: child_files_group,
+            sighand_group: child_sighand_group,
+            signal_mask: parent_mask,
+            pending_signals: Vec::new(),
+            exit_signal,
+        });
+
+        (parent_vm_group, child_vm_group)
+    };
+
+    if flags & CLONE_VM != 0 {
+        let root = vm_root_for_group(parent_vm_group);
+        set_vm_root_for_group(child_vm_group, root);
+        let _ = proc::set_thread_user_root_table(child_tid, root);
+    } else {
+        let parent_root = vm_root_for_group(parent_vm_group);
+        let child_root = match crate::arch::mmu::clone_root_table(parent_root) {
+            Ok(root) => root,
+            Err(_) => return errno::ENOMEM,
+        };
+        set_vm_root_for_group(child_vm_group, child_root);
+        let _ = proc::set_thread_user_root_table(child_tid, child_root);
+
+        let page_size = crate::mm::page::PAGE_SIZE;
+        let mut needs_tlb_flush = false;
+
+        {
+            let mut brk_regions = BRK_REGIONS.lock();
+            let mut child_regions: Vec<BrkRegion> = Vec::new();
+            for region in brk_regions
+                .iter()
+                .filter(|region| region.vm_group == parent_vm_group)
+            {
+                let mut cloned = region.clone();
+                cloned.vm_group = child_vm_group;
+                for (idx, frame_opt) in region.pages.iter().enumerate() {
+                    let Some(frame) = *frame_opt else {
+                        continue;
+                    };
+                    let _ = crate::mm::page::retain_frame(frame);
+                    let va = region.base + idx * page_size;
+                    if setup_cow_pair(
+                        parent_vm_group,
+                        child_vm_group,
+                        parent_root,
+                        child_root,
+                        va,
+                        frame,
+                        false,
+                    )
+                    .is_err()
+                    {
+                        return errno::ENOMEM;
+                    }
+                    needs_tlb_flush = true;
+                }
+                child_regions.push(cloned);
+            }
+            if !child_regions.is_empty() {
+                brk_regions.extend(child_regions);
+            }
+        }
+
+        {
+            let mut mmap_regions = MMAP_REGIONS.lock();
+            let mut child_regions: Vec<MmapRegion> = Vec::new();
+            for region in mmap_regions
+                .iter()
+                .filter(|region| region.vm_group == parent_vm_group)
+            {
+                let mut cloned = region.clone();
+                cloned.vm_group = child_vm_group;
+                child_regions.push(cloned);
+
+                let private_mapping = (region.flags & MAP_TYPE_MASK) == MAP_PRIVATE;
+                let writable = (region.prot & PROT_WRITE) != 0;
+                let execute = (region.prot & PROT_EXEC) != 0;
+
+                for (idx, frame) in region.pages.iter().copied().enumerate() {
+                    let _ = crate::mm::page::retain_frame(frame);
+                    if private_mapping && writable {
+                        let va = region.base + idx * page_size;
+                        if setup_cow_pair(
+                            parent_vm_group,
+                            child_vm_group,
+                            parent_root,
+                            child_root,
+                            va,
+                            frame,
+                            execute,
+                        )
+                        .is_err()
+                        {
+                            return errno::ENOMEM;
+                        }
+                        needs_tlb_flush = true;
+                    }
+                }
+            }
+            if !child_regions.is_empty() {
+                mmap_regions.extend(child_regions);
+            }
+        }
+
+        if needs_tlb_flush {
+            flush_user_tlb();
+        }
+    }
+
+    if !parent_tid_ptr.is_null() {
+        write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
+    }
+    if !child_tid_ptr.is_null() {
+        write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
+    }
+
+    if flags & CLONE_VFORK != 0 {
+        add_vfork_wait(parent_tid, child_tid);
+        wait_vfork_release(parent_tid, child_tid);
+    }
+
+    child_tid as isize
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_clone_with_user_context_riscv(
+    flags: usize,
+    child_stack: usize,
+    parent_tid_ptr: *mut u8,
+    _tls: usize,
+    child_tid_ptr: *mut u8,
+    mut gpr: [u64; 32],
+    mstatus: u64,
+    mepc: u64,
+) -> isize {
+    if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
+        return errno::EINVAL;
+    }
+
+    let parent_tid = current_tid_or_zero();
+    ensure_process_info_for_tid(parent_tid);
+
+    let child_tid = proc::spawn("fork-child", fork_child_entry);
+    if child_stack != 0 {
+        gpr[2] = child_stack as u64; // child user sp
+    }
+    gpr[10] = 0; // child syscall return value (a0)
+
+    PENDING_FORK_CHILDREN.lock().push(PendingForkChild {
+        tid: child_tid,
+        context: ForkChildContext { gpr, mstatus, mepc },
+    });
+
+    finalize_clone_with_vm_setup(flags, parent_tid, child_tid, parent_tid_ptr, child_tid_ptr)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1067,7 +1877,7 @@ pub fn sys_clone_with_user_context(
     });
 
     let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
-    {
+    let (parent_vm_group, child_vm_group) = {
         let mut processes = PROCESS_INFOS.lock();
         let parent_idx = ensure_process_info_for_tid_locked(&mut processes, parent_tid);
         let parent_pgid = processes[parent_idx].pgid;
@@ -1085,6 +1895,7 @@ pub fn sys_clone_with_user_context(
                 parent_files_group,
                 parent_sighand_group,
             );
+
         if let Some(pos) = processes.iter().position(|p| p.tid == child_tid) {
             processes.swap_remove(pos);
         }
@@ -1101,6 +1912,107 @@ pub fn sys_clone_with_user_context(
             pending_signals: Vec::new(),
             exit_signal,
         });
+
+        (parent_vm_group, child_vm_group)
+    };
+
+    if flags & CLONE_VM != 0 {
+        let root = vm_root_for_group(parent_vm_group);
+        set_vm_root_for_group(child_vm_group, root);
+        let _ = proc::set_thread_user_root_table(child_tid, root);
+    } else {
+        let parent_root = vm_root_for_group(parent_vm_group);
+        let child_root = match crate::arch::mmu::clone_root_table(parent_root) {
+            Ok(root) => root,
+            Err(_) => return errno::ENOMEM,
+        };
+        set_vm_root_for_group(child_vm_group, child_root);
+        let _ = proc::set_thread_user_root_table(child_tid, child_root);
+
+        let page_size = crate::mm::page::PAGE_SIZE;
+        let mut needs_tlb_flush = false;
+
+        {
+            let mut brk_regions = BRK_REGIONS.lock();
+            let mut child_regions: Vec<BrkRegion> = Vec::new();
+            for region in brk_regions
+                .iter()
+                .filter(|region| region.vm_group == parent_vm_group)
+            {
+                let mut cloned = region.clone();
+                cloned.vm_group = child_vm_group;
+                for (idx, frame_opt) in region.pages.iter().enumerate() {
+                    let Some(frame) = *frame_opt else {
+                        continue;
+                    };
+                    let _ = crate::mm::page::retain_frame(frame);
+                    let va = region.base + idx * page_size;
+                    if setup_cow_pair(
+                        parent_vm_group,
+                        child_vm_group,
+                        parent_root,
+                        child_root,
+                        va,
+                        frame,
+                        false,
+                    )
+                    .is_err()
+                    {
+                        return errno::ENOMEM;
+                    }
+                    needs_tlb_flush = true;
+                }
+                child_regions.push(cloned);
+            }
+            if !child_regions.is_empty() {
+                brk_regions.extend(child_regions);
+            }
+        }
+
+        {
+            let mut mmap_regions = MMAP_REGIONS.lock();
+            let mut child_regions: Vec<MmapRegion> = Vec::new();
+            for region in mmap_regions
+                .iter()
+                .filter(|region| region.vm_group == parent_vm_group)
+            {
+                let mut cloned = region.clone();
+                cloned.vm_group = child_vm_group;
+                child_regions.push(cloned);
+
+                let private_mapping = (region.flags & MAP_TYPE_MASK) == MAP_PRIVATE;
+                let writable = (region.prot & PROT_WRITE) != 0;
+                let execute = (region.prot & PROT_EXEC) != 0;
+
+                for (idx, frame) in region.pages.iter().copied().enumerate() {
+                    let _ = crate::mm::page::retain_frame(frame);
+                    if private_mapping && writable {
+                        let va = region.base + idx * page_size;
+                        if setup_cow_pair(
+                            parent_vm_group,
+                            child_vm_group,
+                            parent_root,
+                            child_root,
+                            va,
+                            frame,
+                            execute,
+                        )
+                        .is_err()
+                        {
+                            return errno::ENOMEM;
+                        }
+                        needs_tlb_flush = true;
+                    }
+                }
+            }
+            if !child_regions.is_empty() {
+                mmap_regions.extend(child_regions);
+            }
+        }
+
+        if needs_tlb_flush {
+            flush_user_tlb();
+        }
     }
 
     if !parent_tid_ptr.is_null() {
@@ -1293,7 +2205,11 @@ pub fn sys_setpgid(pid: isize, pgid: isize) -> isize {
     let target_tid = if pid <= 0 { tid } else { pid as proc::Tid };
     let mut processes = PROCESS_INFOS.lock();
     let idx = ensure_process_info_for_tid_locked(&mut processes, target_tid);
-    let new_pgid = if pgid <= 0 { target_tid } else { pgid as proc::Tid };
+    let new_pgid = if pgid <= 0 {
+        target_tid
+    } else {
+        pgid as proc::Tid
+    };
     processes[idx].pgid = new_pgid;
     0
 }
@@ -1345,190 +2261,768 @@ pub fn sys_reboot(_magic1: usize, _magic2: usize, _cmd: usize, _arg: usize) -> i
     errno::EPERM
 }
 
-/// sys_brk - 프로그램 브레이크 조정
-///
-/// 현재 구현은 스레드별 고정 16MB 영역 내에서만 브레이크를 이동한다.
-pub fn sys_brk(addr: usize) -> isize {
-    let tid = proc::current_tid().unwrap_or(0);
-
-    let page_size = crate::mm::page::PAGE_SIZE;
-    let mut regions = BRK_REGIONS.lock();
-    let idx = if let Some(pos) = regions.iter().position(|r| r.tid == tid) {
-        pos
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn brk_base_for_vm_group(vm_group: u64) -> Option<usize> {
+    let slot = vm_group as usize;
+    let base = BRK_REGION_BASE.checked_add(slot.checked_mul(BRK_REGION_SIZE)?)?;
+    let end = base.checked_add(BRK_REGION_SIZE)?;
+    if end >= crate::proc::user::USER_STACK_BASE {
+        None
     } else {
-        let pages = BRK_REGION_SIZE / page_size;
-        let phys_base = match crate::mm::page::alloc_frames(pages) {
-            Some(v) => v,
-            None => return errno::ENOMEM,
-        };
+        Some(base)
+    }
+}
 
-        unsafe {
-            // SAFETY: page allocator에서 할당받은 유효한 메모리 영역을 0으로 초기화한다.
-            core::ptr::write_bytes(phys_base as *mut u8, 0, BRK_REGION_SIZE);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn find_mmap_base_locked(regions: &[MmapRegion], vm_group: u64, size: usize) -> Option<usize> {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let mut cursor = align_up(MMAP_REGION_BASE, page_size);
+
+    loop {
+        let end = cursor.checked_add(size)?;
+        if end > MMAP_REGION_END {
+            return None;
         }
 
-        #[cfg(target_arch = "aarch64")]
-        let base = {
-            let slot = tid as usize;
-            let virt_base = BRK_REGION_BASE + slot.saturating_mul(BRK_REGION_SIZE);
-            let virt_end = match virt_base.checked_add(BRK_REGION_SIZE) {
-                Some(end) => end,
+        let mut collided = false;
+        let mut next_cursor = cursor;
+        for region in regions.iter().filter(|r| r.vm_group == vm_group) {
+            if mmap_overlaps(region, cursor, end) {
+                collided = true;
+                let region_end = align_up(mmap_region_end(region), page_size);
+                if region_end > next_cursor {
+                    next_cursor = region_end;
+                }
+            }
+        }
+
+        if !collided {
+            return Some(cursor);
+        }
+        if next_cursor <= cursor {
+            return None;
+        }
+        cursor = align_up(next_cursor, page_size);
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn unmap_mmap_range_locked(
+    regions: &mut Vec<MmapRegion>,
+    vm_group: u64,
+    root_table: usize,
+    start: usize,
+    end: usize,
+) -> Result<bool, isize> {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let mut changed = false;
+    let mut new_regions = Vec::new();
+    let mut i = 0usize;
+
+    while i < regions.len() {
+        if regions[i].vm_group != vm_group || !mmap_overlaps(&regions[i], start, end) {
+            i += 1;
+            continue;
+        }
+
+        let region_base = regions[i].base;
+        let region_end = mmap_region_end(&regions[i]);
+        let unmap_start = core::cmp::max(region_base, start);
+        let unmap_end = core::cmp::min(region_end, end);
+        if unmap_start >= unmap_end {
+            i += 1;
+            continue;
+        }
+
+        let first_page = (unmap_start - region_base) / page_size;
+        let unmap_pages = (unmap_end - unmap_start) / page_size;
+        if unmap_pages == 0 {
+            i += 1;
+            continue;
+        }
+
+        let removed: Vec<usize> = regions[i].pages[first_page..first_page + unmap_pages].to_vec();
+        let write = (regions[i].prot & PROT_WRITE) != 0;
+        let execute = (regions[i].prot & PROT_EXEC) != 0;
+
+        if write && matches!(regions[i].backing, MmapBacking::File(_)) {
+            if flush_file_region_pages(&regions[i], first_page, unmap_pages).is_err() {
+                return Err(errno::EIO);
+            }
+        }
+
+        let mut unmapped = 0usize;
+        for page in 0..removed.len() {
+            let va = unmap_start + page * page_size;
+            remove_cow_meta(vm_group, va);
+            if crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, va).is_err() {
+                for rolled in 0..unmapped {
+                    let rollback_va = unmap_start + rolled * page_size;
+                    let rollback_pa = removed[rolled];
+                    let _ = crate::arch::mmu::map_user_page_for_root_noflush(
+                        root_table,
+                        rollback_va,
+                        rollback_pa,
+                        write,
+                        execute,
+                    );
+                }
+                flush_user_tlb();
+                return Err(errno::EINVAL);
+            }
+            unmapped += 1;
+        }
+
+        for frame in removed.iter() {
+            unsafe {
+                // SAFETY: 해당 페이지는 mmap 메타데이터가 소유하고 있으며 방금 페이지 테이블에서 해제했다.
+                crate::mm::page::free_frame(*frame);
+            }
+        }
+
+        changed = true;
+
+        if first_page == 0 && unmap_pages == regions[i].pages.len() {
+            regions.swap_remove(i);
+            continue;
+        }
+
+        if first_page == 0 {
+            let removed_bytes = unmap_pages * page_size;
+            regions[i].pages.drain(0..unmap_pages);
+            regions[i].base = unmap_end;
+            regions[i].len = regions[i].pages.len() * page_size;
+            regions[i].requested_len = regions[i].requested_len.saturating_sub(removed_bytes);
+            if let MmapBacking::File(backing) = &mut regions[i].backing {
+                backing.file_offset = backing.file_offset.saturating_add(removed_bytes);
+                backing.map_len = backing.map_len.saturating_sub(removed_bytes);
+            }
+            i += 1;
+            continue;
+        }
+
+        if first_page + unmap_pages == regions[i].pages.len() {
+            let kept_bytes = first_page * page_size;
+            regions[i].pages.truncate(first_page);
+            regions[i].len = regions[i].pages.len() * page_size;
+            regions[i].requested_len = core::cmp::min(regions[i].requested_len, kept_bytes);
+            if let MmapBacking::File(backing) = &mut regions[i].backing {
+                backing.map_len = core::cmp::min(backing.map_len, kept_bytes);
+            }
+            i += 1;
+            continue;
+        }
+
+        let original_requested_len = regions[i].requested_len;
+        let mut right_backing = regions[i].backing.clone();
+        if let MmapBacking::File(left_backing) = &mut regions[i].backing {
+            let left_kept = first_page * page_size;
+            left_backing.map_len = core::cmp::min(left_backing.map_len, left_kept);
+        }
+        if let MmapBacking::File(right_file) = &mut right_backing {
+            let right_shift = (first_page + unmap_pages) * page_size;
+            right_file.file_offset = right_file.file_offset.saturating_add(right_shift);
+            right_file.map_len = right_file.map_len.saturating_sub(right_shift);
+        }
+
+        let right_pages = regions[i].pages.split_off(first_page + unmap_pages);
+        regions[i].pages.truncate(first_page);
+        regions[i].len = regions[i].pages.len() * page_size;
+        regions[i].requested_len = core::cmp::min(regions[i].requested_len, first_page * page_size);
+        new_regions.push(MmapRegion {
+            vm_group: regions[i].vm_group,
+            base: unmap_end,
+            len: right_pages.len() * page_size,
+            requested_len: original_requested_len
+                .saturating_sub((first_page + unmap_pages) * page_size),
+            prot: regions[i].prot,
+            flags: regions[i].flags,
+            pages: right_pages,
+            backing: right_backing,
+        });
+        i += 1;
+    }
+
+    if !new_regions.is_empty() {
+        regions.extend(new_regions);
+    }
+
+    if changed {
+        flush_user_tlb();
+    }
+
+    Ok(changed)
+}
+
+/// sys_brk - 프로그램 브레이크 조정
+///
+/// 스레드별 고정 16MB 영역을 페이지 단위로 동적 확장/축소한다.
+pub fn sys_brk(addr: usize) -> isize {
+    let vm_group = current_vm_group();
+    let page_size = crate::mm::page::PAGE_SIZE;
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        let mut regions = BRK_REGIONS.lock();
+        let idx = if let Some(pos) = regions.iter().position(|r| r.vm_group == vm_group) {
+            pos
+        } else {
+            let pages = BRK_REGION_SIZE / page_size;
+            let phys_base = match crate::mm::page::alloc_frames(pages) {
+                Some(v) => v,
                 None => return errno::ENOMEM,
             };
-            if virt_end >= crate::proc::user::USER_STACK_BASE {
-                return errno::ENOMEM;
+            let mut page_vec = Vec::new();
+            page_vec.resize(pages, None);
+            for (i, slot) in page_vec.iter_mut().enumerate() {
+                *slot = Some(phys_base + i * page_size);
             }
-            if map_user_contiguous(virt_base, phys_base, pages, true, false).is_err() {
-                unsafe {
-                    crate::mm::page::free_frames(phys_base, pages);
-                }
-                return errno::ENOMEM;
-            }
-            virt_base
+            regions.push(BrkRegion {
+                vm_group,
+                base: phys_base,
+                current: phys_base,
+                limit: phys_base + BRK_REGION_SIZE,
+                pages: page_vec,
+            });
+            regions.len() - 1
         };
 
-        #[cfg(not(target_arch = "aarch64"))]
-        let base = phys_base;
-
-        regions.push(BrkRegion {
-            tid,
-            base,
-            current: base,
-            limit: base + BRK_REGION_SIZE,
-            phys_base,
-        });
-        regions.len() - 1
-    };
-
-    let region = &mut regions[idx];
-    if addr == 0 {
+        let region = &mut regions[idx];
+        if addr == 0 {
+            return region.current as isize;
+        }
+        if addr < region.base || addr > region.limit {
+            return region.current as isize;
+        }
+        region.current = align_up(addr, 16);
         return region.current as isize;
     }
 
-    if addr < region.base || addr > region.limit {
-        // Linux brk와 유사하게 실패 시 현재 break를 반환한다.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        let root_table = vm_root_for_group(vm_group);
+        let mut regions = BRK_REGIONS.lock();
+        let idx = if let Some(pos) = regions.iter().position(|r| r.vm_group == vm_group) {
+            pos
+        } else {
+            let Some(base) = brk_base_for_vm_group(vm_group) else {
+                return errno::ENOMEM;
+            };
+            let pages = BRK_REGION_SIZE / page_size;
+            let mut page_vec = Vec::new();
+            page_vec.resize(pages, None);
+            regions.push(BrkRegion {
+                vm_group,
+                base,
+                current: base,
+                limit: base + BRK_REGION_SIZE,
+                pages: page_vec,
+            });
+            regions.len() - 1
+        };
+
+        let region = &mut regions[idx];
+        if addr == 0 {
+            return region.current as isize;
+        }
+
+        if addr < region.base || addr > region.limit {
+            // Linux brk와 유사하게 실패 시 현재 break를 반환한다.
+            return region.current as isize;
+        }
+
+        let requested = align_up(addr, 16);
+        let old_pages = page_count_for_len(region.current.saturating_sub(region.base), page_size);
+        let new_pages = page_count_for_len(requested.saturating_sub(region.base), page_size);
+
+        if new_pages > old_pages {
+            let mut staged: Vec<(usize, usize)> = Vec::new();
+            for page_idx in old_pages..new_pages {
+                let frame = match alloc_zeroed_frame() {
+                    Some(v) => v,
+                    None => {
+                        for (rollback_idx, rollback_frame) in staged.drain(..).rev() {
+                            let va = region.base + rollback_idx * page_size;
+                            let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(
+                                root_table,
+                                va,
+                            );
+                            region.pages[rollback_idx] = None;
+                            unsafe {
+                                // SAFETY: 실패 경로에서 이번 호출 중 확보한 프레임만 반환한다.
+                                crate::mm::page::free_frame(rollback_frame);
+                            }
+                        }
+                        flush_user_tlb();
+                        return region.current as isize;
+                    }
+                };
+
+                let va = region.base + page_idx * page_size;
+                if crate::arch::mmu::map_user_page_for_root_noflush(
+                    root_table, va, frame, true, false,
+                )
+                .is_err()
+                {
+                    unsafe {
+                        // SAFETY: map 실패한 방금 할당 프레임을 즉시 반환한다.
+                        crate::mm::page::free_frame(frame);
+                    }
+                    for (rollback_idx, rollback_frame) in staged.drain(..).rev() {
+                        let rollback_va = region.base + rollback_idx * page_size;
+                        let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(
+                            root_table,
+                            rollback_va,
+                        );
+                        region.pages[rollback_idx] = None;
+                        unsafe {
+                            // SAFETY: 실패 경로에서 이번 호출 중 확보한 프레임만 반환한다.
+                            crate::mm::page::free_frame(rollback_frame);
+                        }
+                    }
+                    flush_user_tlb();
+                    return region.current as isize;
+                }
+
+                region.pages[page_idx] = Some(frame);
+                staged.push((page_idx, frame));
+            }
+            if !staged.is_empty() {
+                flush_user_tlb();
+            }
+        } else if new_pages < old_pages {
+            let mut removed: Vec<(usize, usize)> = Vec::new();
+            for page_idx in new_pages..old_pages {
+                let Some(frame) = region.pages[page_idx].take() else {
+                    continue;
+                };
+                let va = region.base + page_idx * page_size;
+                if crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, va).is_err() {
+                    region.pages[page_idx] = Some(frame);
+                    for (rollback_idx, rollback_frame) in removed.drain(..).rev() {
+                        let rollback_va = region.base + rollback_idx * page_size;
+                        let _ = crate::arch::mmu::map_user_page_for_root_noflush(
+                            root_table,
+                            rollback_va,
+                            rollback_frame,
+                            true,
+                            false,
+                        );
+                        region.pages[rollback_idx] = Some(rollback_frame);
+                    }
+                    flush_user_tlb();
+                    return region.current as isize;
+                }
+                removed.push((page_idx, frame));
+            }
+
+            if !removed.is_empty() {
+                flush_user_tlb();
+                for (_idx, frame) in removed {
+                    unsafe {
+                        // SAFETY: 페이지 테이블 엔트리를 제거한 프레임만 allocator로 반환한다.
+                        crate::mm::page::free_frame(frame);
+                    }
+                }
+            }
+        }
+
+        region.current = requested;
         return region.current as isize;
     }
-
-    region.current = align_up(addr, 16);
-    region.current as isize
 }
 
 /// sys_mmap - 익명(private/shared) 매핑
 ///
-/// 10-1B 최소 범위: MAP_ANONYMOUS 기반 메모리 매핑만 지원.
+/// MAP_ANONYMOUS 기반 매핑 + MAP_FIXED를 지원한다.
 pub fn sys_mmap(
-    _addr: usize,
+    addr: usize,
     len: usize,
     prot: usize,
     flags: usize,
     fd: isize,
-    _offset: usize,
+    offset: usize,
 ) -> isize {
     if len == 0 {
         return errno::EINVAL;
     }
-
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return errno::EINVAL;
     }
-
-    if flags & MAP_FIXED != 0 {
-        return errno::ENOSYS;
-    }
-
-    if flags & (MAP_PRIVATE | MAP_SHARED) == 0 {
+    let map_type = flags & MAP_TYPE_MASK;
+    if map_type != MAP_PRIVATE && map_type != MAP_SHARED {
         return errno::EINVAL;
     }
-
-    if flags & MAP_ANONYMOUS == 0 {
-        return errno::ENOSYS;
-    }
-
-    // anonymous mmap에서는 fd가 -1이어야 한다.
-    if fd != -1 {
-        return errno::EINVAL;
-    }
-
-    let tid = proc::current_tid().unwrap_or(0);
-
+    let anonymous = (flags & MAP_ANONYMOUS) != 0;
     let page_size = crate::mm::page::PAGE_SIZE;
     let size = align_up(len, page_size);
-    let pages = size / page_size;
-    let phys_base = match crate::mm::page::alloc_frames(pages) {
-        Some(v) => v,
-        None => return errno::ENOMEM,
-    };
+    let pages = page_count_for_len(size, page_size);
+    let vm_group = current_vm_group();
 
-    unsafe {
-        // SAFETY: page allocator에서 할당받은 유효한 메모리 영역을 0으로 초기화한다.
-        core::ptr::write_bytes(phys_base as *mut u8, 0, size);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    let base = {
-        let virt_base = NEXT_MMAP_BASE.fetch_add(size, Ordering::SeqCst);
-        let virt_end = match virt_base.checked_add(size) {
-            Some(end) => end,
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        if !anonymous {
+            return errno::ENOSYS;
+        }
+        if fd != -1 || offset != 0 {
+            return errno::EINVAL;
+        }
+        let phys = match crate::mm::page::alloc_frames(pages) {
+            Some(v) => v,
             None => return errno::ENOMEM,
         };
-        if virt_end >= crate::proc::user::USER_STACK_BASE {
-            unsafe {
-                crate::mm::page::free_frames(phys_base, pages);
-            }
-            return errno::ENOMEM;
+        let mut page_vec = Vec::new();
+        page_vec.reserve(pages);
+        for i in 0..pages {
+            page_vec.push(phys + i * page_size);
         }
+        MMAP_REGIONS.lock().push(MmapRegion {
+            vm_group,
+            base: phys,
+            len: size,
+            requested_len: len,
+            prot,
+            flags,
+            pages: page_vec,
+            backing: MmapBacking::Anonymous,
+        });
+        return phys as isize;
+    }
 
-        let write = (prot & PROT_WRITE) != 0;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        let root_table = vm_root_for_group(vm_group);
+        let file_backing = if anonymous {
+            if fd != -1 || offset != 0 {
+                return errno::EINVAL;
+            }
+            None
+        } else {
+            if fd < 0 {
+                return errno::EBADF;
+            }
+            if offset & (page_size - 1) != 0 {
+                return errno::EINVAL;
+            }
+
+            let table = match fd::kernel_fd_table() {
+                Ok(table) => table,
+                Err(_) => return errno::EBADF,
+            };
+            let file = match table.get(fd as i32) {
+                Ok(file) => file,
+                Err(_) => return errno::EBADF,
+            };
+            let stat = match file.vnode.stat() {
+                Ok(stat) => stat,
+                Err(_) => return errno::EIO,
+            };
+            let file_size = stat.size as usize;
+            let Some(end) = offset.checked_add(len) else {
+                return errno::EINVAL;
+            };
+            if end > file_size {
+                return errno::EINVAL;
+            }
+
+            Some(FileMapBacking {
+                vnode: file.vnode.clone(),
+                stable_id: file.vnode.stable_id(),
+                file_offset: offset,
+                map_len: len,
+                shared: map_type == MAP_SHARED,
+            })
+        };
+
+        let mut regions = MMAP_REGIONS.lock();
+        let base = if flags & MAP_FIXED != 0 {
+            if addr == 0 || addr & (page_size - 1) != 0 {
+                return errno::EINVAL;
+            }
+            let end = match addr.checked_add(size) {
+                Some(v) => v,
+                None => return errno::ENOMEM,
+            };
+            if addr < MIN_USER_VADDR || end > MMAP_REGION_END {
+                return errno::ENOMEM;
+            }
+            if unmap_mmap_range_locked(&mut regions, vm_group, root_table, addr, end).is_err() {
+                return errno::EINVAL;
+            }
+            addr
+        } else {
+            match find_mmap_base_locked(&regions, vm_group, size) {
+                Some(v) => v,
+                None => return errno::ENOMEM,
+            }
+        };
+
+        let write_requested = (prot & PROT_WRITE) != 0;
         let execute = (prot & PROT_EXEC) != 0;
-        if map_user_contiguous(virt_base, phys_base, pages, write, execute).is_err() {
-            unsafe {
-                crate::mm::page::free_frames(phys_base, pages);
+        let mut mapped_pages = Vec::new();
+        mapped_pages.reserve(pages);
+
+        for i in 0..pages {
+            let va = base + i * page_size;
+            let frame = match &file_backing {
+                Some(backing) => {
+                    let page_index = backing.file_offset / page_size + i;
+                    let page_file_offset = backing.file_offset + i * page_size;
+                    match get_or_create_file_cache_page(
+                        &backing.vnode,
+                        backing.stable_id,
+                        page_index,
+                        page_file_offset,
+                    ) {
+                        Ok(frame) => frame,
+                        Err(e) => {
+                            for (rollback_idx, rollback_frame) in mapped_pages.iter().enumerate() {
+                                let rollback_va = base + rollback_idx * page_size;
+                                remove_cow_meta(vm_group, rollback_va);
+                                let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(
+                                    root_table,
+                                    rollback_va,
+                                );
+                                unsafe {
+                                    // SAFETY: 실패 경로에서 현재 mmap 호출이 획득한 참조를 되돌린다.
+                                    crate::mm::page::free_frame(*rollback_frame);
+                                }
+                            }
+                            flush_user_tlb();
+                            return e;
+                        }
+                    }
+                }
+                None => match alloc_zeroed_frame() {
+                    Some(v) => v,
+                    None => {
+                        for (rollback_idx, rollback_frame) in mapped_pages.iter().enumerate() {
+                            let rollback_va = base + rollback_idx * page_size;
+                            remove_cow_meta(vm_group, rollback_va);
+                            let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(
+                                root_table,
+                                rollback_va,
+                            );
+                            unsafe {
+                                // SAFETY: 실패 경로에서 현재 mmap 호출이 확보한 프레임만 반납한다.
+                                crate::mm::page::free_frame(*rollback_frame);
+                            }
+                        }
+                        flush_user_tlb();
+                        return errno::ENOMEM;
+                    }
+                },
+            };
+
+            let map_write = match &file_backing {
+                Some(backing) if !backing.shared => false,
+                _ => write_requested,
+            };
+
+            if crate::arch::mmu::map_user_page_for_root_noflush(
+                root_table,
+                va,
+                frame,
+                map_write,
+                execute,
+            )
+            .is_err()
+            {
+                unsafe {
+                    // SAFETY: map 실패한 방금 할당 프레임을 즉시 반납한다.
+                    crate::mm::page::free_frame(frame);
+                }
+                for (rollback_idx, rollback_frame) in mapped_pages.iter().enumerate() {
+                    let rollback_va = base + rollback_idx * page_size;
+                    remove_cow_meta(vm_group, rollback_va);
+                    let _ =
+                        crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, rollback_va);
+                    unsafe {
+                        // SAFETY: 실패 경로에서 현재 mmap 호출이 확보한 프레임만 반납한다.
+                        crate::mm::page::free_frame(*rollback_frame);
+                    }
+                }
+                flush_user_tlb();
+                return errno::ENOMEM;
             }
-            return errno::ENOMEM;
+
+            if let Some(backing) = &file_backing {
+                if !backing.shared && write_requested {
+                    set_cow_meta(vm_group, va, frame, execute, CowOrigin::PrivateMap);
+                }
+            }
+            mapped_pages.push(frame);
         }
-        virt_base
-    };
+        flush_user_tlb();
 
-    #[cfg(not(target_arch = "aarch64"))]
-    let base = phys_base;
-
-    MMAP_REGIONS
-        .lock()
-        .push(MmapRegion { tid, base, phys_base, pages });
-    base as isize
+        let backing = match file_backing {
+            Some(backing) => MmapBacking::File(backing),
+            None => MmapBacking::Anonymous,
+        };
+        regions.push(MmapRegion {
+            vm_group,
+            base,
+            len: size,
+            requested_len: len,
+            prot,
+            flags,
+            pages: mapped_pages,
+            backing,
+        });
+        base as isize
+    }
 }
 
 /// sys_munmap - 매핑 해제
 ///
-/// 현재는 full unmap(전체 길이 해제)만 지원한다.
+/// 부분/전체 unmap을 지원한다.
 pub fn sys_munmap(addr: usize, len: usize) -> isize {
     if addr == 0 || len == 0 {
         return errno::EINVAL;
     }
 
-    let tid = proc::current_tid().unwrap_or(0);
-
     let page_size = crate::mm::page::PAGE_SIZE;
-    let pages = align_up(len, page_size) / page_size;
-
-    let mut regions = MMAP_REGIONS.lock();
-    let pos = match regions.iter().position(|m| m.tid == tid && m.base == addr) {
-        Some(p) => p,
+    if addr & (page_size - 1) != 0 {
+        return errno::EINVAL;
+    }
+    let size = align_up(len, page_size);
+    let end = match addr.checked_add(size) {
+        Some(v) => v,
         None => return errno::EINVAL,
     };
 
-    if regions[pos].pages != pages {
+    let vm_group = current_vm_group();
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        let mut regions = MMAP_REGIONS.lock();
+        let mut i = 0usize;
+        while i < regions.len() {
+            if regions[i].vm_group != vm_group || !mmap_overlaps(&regions[i], addr, end) {
+                i += 1;
+                continue;
+            }
+
+            for frame in regions[i].pages.iter() {
+                unsafe {
+                    // SAFETY: mmap 메타데이터가 소유 중인 프레임만 반환한다.
+                    crate::mm::page::free_frame(*frame);
+                }
+            }
+            regions.swap_remove(i);
+        }
+        return 0;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if addr < MIN_USER_VADDR || end > MAX_USER_VADDR_EXCLUSIVE {
+            return errno::EINVAL;
+        }
+        let root_table = vm_root_for_group(vm_group);
+        let mut regions = MMAP_REGIONS.lock();
+        match unmap_mmap_range_locked(&mut regions, vm_group, root_table, addr, end) {
+            Ok(_) => 0,
+            Err(e) => e,
+        }
+    }
+}
+
+/// sys_mprotect - 매핑된 페이지 권한 변경
+pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    if len == 0 {
+        return errno::EINVAL;
+    }
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return errno::EINVAL;
+    }
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
         return errno::EINVAL;
     }
 
-    let region = regions.swap_remove(pos);
-    unsafe {
-        // SAFETY: mmap 등록 시 alloc_frames로 확보한 페이지 범위를 동일 크기로 해제한다.
-        crate::mm::page::free_frames(region.phys_base, region.pages);
+    let page_size = crate::mm::page::PAGE_SIZE;
+    if addr == 0 || addr & (page_size - 1) != 0 {
+        return errno::EINVAL;
     }
 
-    0
+    let size = align_up(len, page_size);
+    let end = match addr.checked_add(size) {
+        Some(v) => v,
+        None => return errno::EINVAL,
+    };
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        let _ = (addr, end);
+        return errno::ENOSYS;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if addr < MIN_USER_VADDR || end > MAX_USER_VADDR_EXCLUSIVE {
+            return errno::EINVAL;
+        }
+
+        let vm_group = current_vm_group();
+        let root_table = vm_root_for_group(vm_group);
+        let mut regions = MMAP_REGIONS.lock();
+        let write = (prot & PROT_WRITE) != 0;
+        let execute = (prot & PROT_EXEC) != 0;
+
+        let mut cursor = addr;
+        while cursor < end {
+            let found_idx = regions
+                .iter()
+                .position(|r| {
+                    r.vm_group == vm_group && r.base <= cursor && cursor < mmap_region_end(r)
+                });
+            let Some(idx) = found_idx else {
+                return errno::ENOMEM;
+            };
+
+            let region_end = core::cmp::min(end, mmap_region_end(&regions[idx]));
+            let pages = (region_end - cursor) / page_size;
+            if pages == 0 {
+                return errno::EINVAL;
+            }
+
+            let force_cow_ro = matches!(
+                regions[idx].backing,
+                MmapBacking::File(FileMapBacking { shared: false, .. })
+            ) && write;
+            let map_write = if force_cow_ro { false } else { write };
+
+            let start_page = (cursor - regions[idx].base) / page_size;
+            for page in 0..pages {
+                let va = cursor + page * page_size;
+                if crate::arch::mmu::update_user_page_flags_for_root_noflush(
+                    root_table, va, map_write, execute,
+                )
+                .is_err()
+                {
+                    return errno::EINVAL;
+                }
+
+                if force_cow_ro {
+                    let page_idx = start_page + page;
+                    if let Some(&frame) = regions[idx].pages.get(page_idx) {
+                        set_cow_meta(vm_group, va, frame, execute, CowOrigin::PrivateMap);
+                    }
+                } else {
+                    remove_cow_meta(vm_group, va);
+                }
+            }
+
+            if cursor == regions[idx].base && region_end == mmap_region_end(&regions[idx]) {
+                regions[idx].prot = prot;
+            }
+
+            cursor = region_end;
+        }
+
+        flush_user_tlb();
+        0
+    }
 }
 
 /// sys_execve - 현재 태스크를 새 유저 ELF 이미지로 교체
@@ -1543,23 +3037,17 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         Err(e) => return e,
     };
 
-    let (argv_list, argv_bytes) = match read_user_string_array(
-        argv,
-        MAX_EXEC_ARG_COUNT,
-        MAX_EXEC_STR_LEN,
-    ) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (argv_list, argv_bytes) =
+        match read_user_string_array(argv, MAX_EXEC_ARG_COUNT, MAX_EXEC_STR_LEN) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
-    let (envp_list, envp_bytes) = match read_user_string_array(
-        envp,
-        MAX_EXEC_ENV_COUNT,
-        MAX_EXEC_STR_LEN,
-    ) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+    let (envp_list, envp_bytes) =
+        match read_user_string_array(envp, MAX_EXEC_ENV_COUNT, MAX_EXEC_STR_LEN) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let arg_env_total = match argv_bytes.checked_add(envp_bytes) {
         Some(v) => v,
@@ -1594,6 +3082,8 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         path_str,
         argv_list.len()
     );
+
+    flush_shared_writeback_for_vm_group(current_vm_group());
 
     // vfork 부모는 자식이 execve/exit 시점에 해제된다.
     complete_vfork_wait(tid);
@@ -1740,12 +3230,12 @@ fn user_pointer_in_range(ptr: usize, len: usize) -> bool {
         return false;
     };
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
         ptr >= MIN_USER_VADDR && end <= MAX_USER_VADDR_EXCLUSIVE
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     {
         ptr >= 0x1000 && end > ptr
     }

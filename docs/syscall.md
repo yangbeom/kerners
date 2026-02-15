@@ -54,11 +54,12 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_nanosleep` | 101 | `nanosleep(req, rem)` | baseline: yield 기반 최소 동작 |
 | `sys_socket` | 198 | `socket(domain, type, proto)` | baseline: `EAFNOSUPPORT` |
 | `sys_sendto` | 206 | `sendto(fd, buf, len, ...)` | baseline: `EBADF`/`EAFNOSUPPORT` |
-| `sys_brk` | 214 | `brk(addr) -> new_brk` | 스레드별 program break 조정 (고정 16MB 영역 baseline) |
-| `sys_clone` | 220 | `clone(flags, ...)` | baseline fake child + aarch64 user-context + CLONE_* 리소스 그룹 추적 |
+| `sys_brk` | 214 | `brk(addr) -> new_brk` | vm_group별 16MB 힙 윈도우 + 페이지 단위 확장/축소 및 매핑/해제 |
+| `sys_clone` | 220 | `clone(flags, ...)` | aarch64/riscv64 user-context fork/clone + vm_group/CLONE_* 리소스 그룹 + non-`CLONE_VM` COW 설정 |
 | `sys_execve` | 221 | `execve(path, argv, envp)` | static ELF 실행 준비 + 인자/환경 경계 검증 |
-| `sys_mmap` | 222 | `mmap(addr, len, prot, flags, fd, off) -> addr` | anonymous mmap baseline |
-| `sys_munmap` | 215 | `munmap(addr, len)` | full unmap baseline |
+| `sys_mmap` | 222 | `mmap(addr, len, prot, flags, fd, off) -> addr` | anonymous + file-backed 지원(aarch64/riscv64), `MAP_FIXED`, `MAP_SHARED`, `MAP_PRIVATE`(fault COW), `PROT_{R,W,X}` |
+| `sys_munmap` | 215 | `munmap(addr, len)` | 부분/전체 unmap + 페이지 테이블 엔트리 해제 + 물리 프레임 반환 |
+| `sys_mprotect` | 226 | `mprotect(addr, len, prot)` | 매핑된 페이지 권한(R/W/X) 변경 + TLB flush |
 | `sys_wait4` | 260 | `wait4(pid, status, options, rusage)` | zombie 회수 + Linux wait status(`exit<<8`) + `WNOHANG` |
 
 ### 파일 I/O
@@ -143,10 +144,23 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   4. trap 복귀 시점에 `PC/SP`를 새 이미지로 전환
 - 현재 제약:
   - `argv/envp`는 개수/길이 + 총량(현재 32KiB) 상한을 검사하며, 초과 시 `E2BIG`
-  - aarch64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)
+  - aarch64/riscv64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)
   - 유저 포인터 fault 복구(페이지 폴트 복귀)는 아직 미구현
   - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHNUM/AT_PAGESZ`)를 스택에 제공
   - 동적 ELF(`PT_INTERP`, `ET_DYN`)는 아직 미지원
+
+## `mmap`/`fork` COW 동작 (aarch64/riscv64)
+
+- file-backed `mmap`:
+  - `MAP_SHARED`: 파일 page cache 프레임을 공유 매핑합니다(다른 fd/open 경로 포함).
+  - `MAP_PRIVATE`: 초기 RO 매핑 + write fault 시 COW 분리.
+  - 검증: `fd < 0`은 `EBADF`, `offset` 비정렬/`offset+len > file_size`는 `EINVAL`.
+- shared writeback:
+  - `munmap`, `exit`, `execve` 시점에 dirty 페이지를 파일에 flush합니다.
+  - `msync`는 아직 범위 밖입니다.
+- fork COW:
+  - non-`CLONE_VM` fork는 부모 root table 복제 후 writable private 페이지를 양쪽 RO로 강등하고 COW 메타를 등록합니다.
+  - page fault에서 copy-or-promote 후 쓰기 권한을 복구합니다.
 
 ## `exit` / `wait` 최소 모델
 
@@ -169,7 +183,7 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   - run별 로그 `logs/busybox-init-*.log`
   - summary 로그 `logs/busybox-init-*.summary.log`
 - 실패 원인 분류:
-  - `ENOSYS`, `EFAULT`, `EXEC_FAIL`, `NO_INIT_FALLBACK`, `QEMU_LOCK`, `PANIC`, `TIMEOUT`
+  - `ENOSYS`, `EFAULT`, `EXEC_FAIL`, `NO_INIT_FALLBACK`, `QEMU_LOCK`, `PANIC`, `TIMEOUT`, `COW_FORK_MISSING`
 
 ## 폴백 동작
 

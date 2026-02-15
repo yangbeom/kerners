@@ -753,6 +753,18 @@ impl Fat32File {
 }
 
 impl VNode for Fat32File {
+    fn stable_id(&self) -> u64 {
+        let (dev_data, dev_vtable): (usize, usize) = unsafe {
+            // SAFETY: Arc<dyn BlockDevice> fat pointer를 포인터 크기 튜플로 비트복사한다.
+            core::mem::transmute_copy(&self.device)
+        };
+        let mut id = dev_data as u64;
+        id ^= (dev_vtable as u64).rotate_left(13);
+        id ^= (self.parent_cluster as u64).rotate_left(29);
+        id ^= (self.entry_offset as u64).rotate_left(7);
+        id
+    }
+
     fn node_type(&self) -> VNodeType {
         VNodeType::File
     }

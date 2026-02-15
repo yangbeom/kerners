@@ -388,14 +388,14 @@ fn build_user_stack(
     let mut user_stack = Vec::new();
     user_stack.resize(USER_STACK_SIZE, 0);
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let stack_base = USER_STACK_BASE - USER_STACK_SIZE;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let mut sp = USER_STACK_BASE;
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     let stack_base = user_stack.as_ptr() as usize;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     let mut sp = stack_base + USER_STACK_SIZE;
 
     let mut argv_owned = if argv.is_empty() {
@@ -466,7 +466,7 @@ fn build_user_stack(
     let argv_ptr = table_start + usize_bytes;
     let envp_ptr = argv_ptr + (argc + 1) * usize_bytes;
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     map_user_stack_pages(stack_base, &user_stack)?;
 
     Ok((user_stack, table_start, argc, argv_ptr, envp_ptr))
@@ -530,7 +530,7 @@ fn find_phdr_vaddr(elf: &crate::module::Elf64<'_>) -> Option<usize> {
     None
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn map_user_stack_pages(stack_base: usize, stack_bytes: &[u8]) -> Result<(), ExecError> {
     let page_size = crate::mm::page::PAGE_SIZE;
     let mut frames: Vec<usize> = Vec::new();
@@ -565,7 +565,7 @@ fn map_user_stack_pages(stack_base: usize, stack_bytes: &[u8]) -> Result<(), Exe
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn cleanup_stack_frames(frames: &mut Vec<usize>) {
     for frame in frames.drain(..) {
         unsafe {

@@ -114,10 +114,22 @@ for i in $(seq 1 "$RUNS"); do
     RUN_STATUS="FAIL"
     REASONS=()
 
+    COW_FORK_MARKER="N/A"
+    COW_FORK_OK=1
+    if [[ "$ARCH" == "aarch64" || "$ARCH" == "riscv64" ]]; then
+        if grep -q "COW_FORK_TEST: PASS" "$RUN_LOG"; then
+            COW_FORK_MARKER="PASS"
+        else
+            COW_FORK_MARKER="MISSING"
+            COW_FORK_OK=0
+        fi
+    fi
+
     if grep -q "launched PID1 candidate" "$RUN_LOG" && \
        ! grep -q "no executable init found, falling back to kernel shell" "$RUN_LOG" && \
        ! grep -q "Process 1 exiting with status" "$RUN_LOG" && \
-       ! grep -q "Kernel panic" "$RUN_LOG"; then
+       ! grep -q "Kernel panic" "$RUN_LOG" && \
+       [[ "$COW_FORK_OK" -eq 1 ]]; then
         RUN_STATUS="PASS"
     fi
 
@@ -140,6 +152,9 @@ for i in $(seq 1 "$RUNS"); do
     if grep -q "Kernel panic" "$RUN_LOG"; then
         REASONS+=("PANIC")
     fi
+    if [[ ("$ARCH" == "aarch64" || "$ARCH" == "riscv64") && "$COW_FORK_MARKER" == "MISSING" ]]; then
+        REASONS+=("COW_FORK_MISSING")
+    fi
     if [[ "$RUN_EXIT" -eq 124 ]]; then
         REASONS+=("TIMEOUT")
     fi
@@ -159,7 +174,7 @@ for i in $(seq 1 "$RUNS"); do
         REASON_STR=""
     fi
     {
-        echo "run=$i status=$RUN_STATUS exit=$RUN_EXIT reasons=$REASON_STR"
+        echo "run=$i status=$RUN_STATUS exit=$RUN_EXIT cow_fork=$COW_FORK_MARKER reasons=$REASON_STR"
         echo "log=$RUN_LOG"
         echo ""
     } >>"$SUMMARY_LOG"

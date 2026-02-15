@@ -23,6 +23,7 @@ pub struct Thread {
     pub context: Context,      // CPU 컨텍스트
     pub kernel_stack: Vec<u8>, // 커널 스택
     pub user_stack: Option<Vec<u8>>, // execve 후 유저 스택 보관
+    pub user_root_table: usize, // aarch64/riscv64: 스레드별 유저 루트 페이지 테이블
 }
 ```
 
@@ -143,6 +144,9 @@ pub fn schedule() {
 }
 ```
 
+- aarch64/riscv64에서는 컨텍스트 스위치 직전에 `Thread.user_root_table`로 루트 페이지 테이블을 전환합니다.
+- 현재 정책은 ASID 없이 전역 TLB flush를 사용합니다.
+
 ### 타이머 인터럽트
 
 타이머 인터럽트에서 `schedule()` 호출하여 선점형 스케줄링 구현.
@@ -184,13 +188,13 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 - 유저 스택 메모리는 현재 스레드(`Thread.user_stack`)에 바인딩해 수명을 보장합니다.
 - 유저 초기 스택의 auxv에는 최소 호환 키를 포함합니다:
   - `AT_ENTRY`, `AT_PHDR`, `AT_PHNUM`, `AT_PAGESZ`
-- aarch64 경로에서는 `path/argv/envp` 유저 포인터 범위를 선검증합니다.
+- aarch64/riscv64 경로에서는 `path/argv/envp` 유저 포인터 범위를 선검증합니다.
 - 실행 파일은 static ELF(`ET_EXEC`) 기준이며, `PT_INTERP`를 포함한 동적 ELF는 지원하지 않습니다.
 - ELF `PT_LOAD` 세그먼트의 가상주소가 현재 identity-mapped RAM 범위를 벗어나면 exec 준비가 실패합니다.
 
 ### fork/vfork/wait 최소 동작
 
-- aarch64 유저 syscall 경로에서는 부모 trap context를 복사해 자식이 `sys_clone/fork/vfork`에서 0을 반환하도록 복귀합니다.
+- aarch64/riscv64 유저 syscall 경로에서는 부모 trap context를 복사해 자식이 `sys_clone/fork/vfork`에서 0을 반환하도록 복귀합니다.
 - `sys_clone`는 `CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_SIGHAND` 플래그를 리소스 그룹 메타데이터로 추적합니다.
 - `sys_exit`는 부모의 zombie 리스트에 종료 상태를 등록하고 `SIGCHLD`를 큐잉합니다.
 - `sys_wait4`는 zombie를 회수하고 Linux wait status(`exit_code << 8`)를 기록합니다.
@@ -222,6 +226,5 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 
 ## 현재 제약
 
-- 프로세스별 독립 주소 공간(페이지 테이블 분리)은 아직 미구현입니다.
-- COW 기반 `fork` 메모리 공유/분리는 아직 미구현입니다.
+- aarch64/riscv64는 vm_group 기반 주소공간 분리 + file-backed `mmap` + fork COW를 지원합니다.
 - signal handler delivery(`rt_sigaction` 실제 핸들러 진입)는 아직 미구현입니다.

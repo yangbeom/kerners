@@ -19,7 +19,7 @@ pub fn schedule() {
         return; // 아직 초기화되지 않음
     }
 
-    let (old_ctx, new_ctx) = {
+    let (old_ctx, new_ctx, next_root) = {
         let mut threads = THREADS.lock();
 
         if current_idx >= threads.len() {
@@ -95,15 +95,25 @@ pub fn schedule() {
             .map(|t| &mut t.context as *mut Context);
         let new_ctx = threads.get(next_idx)
             .map(|t| &t.context as *const Context);
+        let next_root = threads.get(next_idx).map(|t| t.user_root_table);
 
         // Per-CPU 현재 스레드 인덱스 업데이트
         pc.current_thread_idx.store(next_idx as u32, Ordering::Release);
 
-        match (old_ctx, new_ctx) {
-            (Some(old), Some(new)) => (old, new),
+        match (old_ctx, new_ctx, next_root) {
+            (Some(old), Some(new), Some(root)) => (old, new, root),
             _ => return,
         }
     };
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if crate::arch::mmu::switch_root_table(next_root).is_err() {
+            return;
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    let _ = next_root;
 
     // 락을 해제한 후 컨텍스트 스위칭
     unsafe {

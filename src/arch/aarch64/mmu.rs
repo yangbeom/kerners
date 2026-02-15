@@ -14,6 +14,8 @@ pub const KERNEL_VIRT_BASE: usize = 0xFFFF_0000_0000_0000;
 
 /// 활성 커널 루트 페이지 테이블 주소
 static ROOT_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
+/// 현재 CPU에서 활성화된 루트 페이지 테이블 주소
+static ACTIVE_ROOT_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
 /// 런타임 매핑 수정 시 동기화용 락
 static MMU_MAP_LOCK: Mutex<()> = Mutex::new(());
 
@@ -164,6 +166,10 @@ impl PageTable {
 
     pub fn set_entry(&mut self, index: usize, entry: PageTableEntry) {
         self.entries[index] = entry;
+    }
+
+    pub fn entry_mut(&mut self, index: usize) -> &mut PageTableEntry {
+        &mut self.entries[index]
     }
 }
 
@@ -382,6 +388,7 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<(), &'static str> {
     // 1. Identity mapping 페이지 테이블 생성
     let pt_mgr = create_identity_mapping(ram_start, ram_size)?;
     ROOT_TABLE_ADDR.store(pt_mgr.root_table_addr(), Ordering::Release);
+    ACTIVE_ROOT_TABLE_ADDR.store(pt_mgr.root_table_addr(), Ordering::Release);
 
     // 2. MMU 활성화
     unsafe {
@@ -418,6 +425,7 @@ pub fn flush_tlb_all() {
 }
 
 fn map_user_page_inner(
+    root: usize,
     virt_addr: usize,
     phys_addr: usize,
     write: bool,
@@ -427,7 +435,6 @@ fn map_user_page_inner(
         return Err("Address must be 4KB aligned");
     }
 
-    let root = ROOT_TABLE_ADDR.load(Ordering::Acquire);
     if root == 0 {
         return Err("MMU root table not initialized");
     }
@@ -441,6 +448,175 @@ fn map_user_page_inner(
     )
 }
 
+fn resolve_user_l3_entry_mut(
+    root: usize,
+    virt_addr: usize,
+) -> Result<(*mut PageTableEntry, PageTableEntry), &'static str> {
+    if virt_addr & 0xFFF != 0 {
+        return Err("Address must be 4KB aligned");
+    }
+
+    if root == 0 {
+        return Err("MMU root table not initialized");
+    }
+
+    let l0_idx = (virt_addr >> 39) & 0x1FF;
+    let l1_idx = (virt_addr >> 30) & 0x1FF;
+    let l2_idx = (virt_addr >> 21) & 0x1FF;
+    let l3_idx = (virt_addr >> 12) & 0x1FF;
+
+    let l0_table = unsafe {
+        // SAFETY: ROOT_TABLE_ADDR는 init 이후 유효한 L0 테이블을 가리킨다.
+        &mut *(root as *mut PageTable)
+    };
+    let l0e = l0_table.entry(l0_idx);
+    if !l0e.is_valid() {
+        return Err("L0 entry is invalid");
+    }
+
+    let l1_table = unsafe {
+        // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+        &mut *(l0e.addr() as *mut PageTable)
+    };
+    let l1e = l1_table.entry(l1_idx);
+    if !l1e.is_valid() {
+        return Err("L1 entry is invalid");
+    }
+
+    let l2_table = unsafe {
+        // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+        &mut *(l1e.addr() as *mut PageTable)
+    };
+    let l2e = l2_table.entry(l2_idx);
+    if !l2e.is_valid() {
+        return Err("L2 entry is invalid");
+    }
+
+    let l3_table = unsafe {
+        // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+        &mut *(l2e.addr() as *mut PageTable)
+    };
+    let entry_ref = l3_table.entry_mut(l3_idx) as *mut PageTableEntry;
+    let current = unsafe {
+        // SAFETY: entry_ref는 위에서 얻은 l3_table 내부 엔트리를 가리킨다.
+        *entry_ref
+    };
+    if !current.is_valid() {
+        return Err("L3 entry is invalid");
+    }
+
+    Ok((entry_ref, current))
+}
+
+/// 부트 시 생성된 커널 기본 루트 페이지 테이블
+pub fn kernel_root_table() -> usize {
+    ROOT_TABLE_ADDR.load(Ordering::Acquire)
+}
+
+/// 현재 활성 루트 페이지 테이블
+pub fn current_root_table() -> usize {
+    ACTIVE_ROOT_TABLE_ADDR.load(Ordering::Acquire)
+}
+
+/// 루트 페이지 테이블 전환
+pub fn switch_root_table(root: usize) -> Result<(), &'static str> {
+    if root == 0 || root & 0xFFF != 0 {
+        return Err("Invalid root table address");
+    }
+    unsafe {
+        // SAFETY: 호출자는 유효한 L0 페이지 테이블 물리 주소를 전달한다.
+        asm!(
+            "msr TTBR0_EL1, {pt}",
+            "isb",
+            pt = in(reg) root as u64,
+            options(nostack)
+        );
+    }
+    ACTIVE_ROOT_TABLE_ADDR.store(root, Ordering::Release);
+    flush_tlb_all();
+    Ok(())
+}
+
+fn clone_page_table_level(src_addr: usize, level: usize) -> Result<usize, &'static str> {
+    let new_table = alloc_page_table().ok_or("Failed to allocate page table")?;
+    let new_addr = new_table as *mut PageTable as usize;
+    let src = unsafe {
+        // SAFETY: src_addr는 호출자가 제공한 유효한 페이지 테이블 주소여야 한다.
+        &*(src_addr as *const PageTable)
+    };
+
+    for i in 0..512 {
+        let entry = src.entry(i);
+        if !entry.is_valid() {
+            continue;
+        }
+
+        let is_table = level < 3 && (entry.0 & PageTableEntry::TABLE) != 0;
+        if is_table {
+            let child = clone_page_table_level(entry.addr(), level + 1)?;
+            new_table.set_entry(i, PageTableEntry::new_table(child));
+        } else {
+            new_table.set_entry(i, entry);
+        }
+    }
+
+    Ok(new_addr)
+}
+
+/// 루트 페이지 테이블 깊은 복제
+pub fn clone_root_table(src_root: usize) -> Result<usize, &'static str> {
+    if src_root == 0 || src_root & 0xFFF != 0 {
+        return Err("Invalid source root table");
+    }
+    clone_page_table_level(src_root, 0)
+}
+
+/// root 지정 유저 페이지 물리 주소 조회
+pub fn get_user_page_phys_for_root(root: usize, virt_addr: usize) -> Result<usize, &'static str> {
+    let (_entry_ptr, current) = resolve_user_l3_entry_mut(root, virt_addr)?;
+    Ok(current.addr())
+}
+
+/// root 지정 유저 페이지 매핑 (flush 없음)
+pub fn map_user_page_for_root_noflush(
+    root: usize,
+    virt_addr: usize,
+    phys_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    map_user_page_inner(root, virt_addr, phys_addr, write, execute)
+}
+
+/// root 지정 유저 페이지 매핑 해제 (flush 없음)
+pub fn unmap_user_page_for_root_noflush(
+    root: usize,
+    virt_addr: usize,
+) -> Result<usize, &'static str> {
+    let (entry_ptr, current) = resolve_user_l3_entry_mut(root, virt_addr)?;
+    unsafe {
+        // SAFETY: resolve_user_l3_entry_mut에서 유효한 엔트리 포인터를 보장한다.
+        *entry_ptr = PageTableEntry::empty();
+    }
+    Ok(current.addr())
+}
+
+/// root 지정 유저 페이지 권한 변경 (flush 없음)
+pub fn update_user_page_flags_for_root_noflush(
+    root: usize,
+    virt_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    let (entry_ptr, current) = resolve_user_l3_entry_mut(root, virt_addr)?;
+    let phys = current.addr();
+    unsafe {
+        // SAFETY: resolve_user_l3_entry_mut에서 유효한 엔트리 포인터를 보장한다.
+        *entry_ptr = PageTableEntry::new_page(phys, PageFlags::user_from_segment(write, execute));
+    }
+    Ok(())
+}
+
 /// 유저 페이지 1개 매핑 (flush 없음)
 ///
 /// 주로 다수 페이지를 연속 매핑할 때 사용한다.
@@ -451,7 +627,57 @@ pub fn map_user_page_noflush(
     execute: bool,
 ) -> Result<(), &'static str> {
     let _guard = MMU_MAP_LOCK.lock();
-    map_user_page_inner(virt_addr, phys_addr, write, execute)
+    let root = current_root_table();
+    map_user_page_inner(root, virt_addr, phys_addr, write, execute)
+}
+
+/// 유저 페이지 1개 매핑 해제 (flush 없음)
+///
+/// 성공 시 기존 매핑의 물리 주소를 반환한다.
+pub fn unmap_user_page_noflush(virt_addr: usize) -> Result<usize, &'static str> {
+    let _guard = MMU_MAP_LOCK.lock();
+    let root = current_root_table();
+    let (entry_ptr, current) = resolve_user_l3_entry_mut(root, virt_addr)?;
+    unsafe {
+        // SAFETY: resolve_user_l3_entry_mut에서 유효한 L3 엔트리 포인터를 보장한다.
+        *entry_ptr = PageTableEntry::empty();
+    }
+    Ok(current.addr())
+}
+
+/// 유저 페이지 1개 매핑 해제 + TLB flush
+pub fn unmap_user_page(virt_addr: usize) -> Result<usize, &'static str> {
+    let phys = unmap_user_page_noflush(virt_addr)?;
+    flush_tlb_all();
+    Ok(phys)
+}
+
+/// 유저 페이지 1개 권한 업데이트 (flush 없음)
+pub fn update_user_page_flags_noflush(
+    virt_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    let _guard = MMU_MAP_LOCK.lock();
+    let root = current_root_table();
+    let (entry_ptr, current) = resolve_user_l3_entry_mut(root, virt_addr)?;
+    let phys = current.addr();
+    unsafe {
+        // SAFETY: resolve_user_l3_entry_mut에서 유효한 L3 엔트리 포인터를 보장한다.
+        *entry_ptr = PageTableEntry::new_page(phys, PageFlags::user_from_segment(write, execute));
+    }
+    Ok(())
+}
+
+/// 유저 페이지 1개 권한 업데이트 + TLB flush
+pub fn update_user_page_flags(
+    virt_addr: usize,
+    write: bool,
+    execute: bool,
+) -> Result<(), &'static str> {
+    update_user_page_flags_noflush(virt_addr, write, execute)?;
+    flush_tlb_all();
+    Ok(())
 }
 
 /// 유저 페이지 1개 매핑 + TLB flush
@@ -462,7 +688,8 @@ pub fn map_user_page(
     execute: bool,
 ) -> Result<(), &'static str> {
     let _guard = MMU_MAP_LOCK.lock();
-    map_user_page_inner(virt_addr, phys_addr, write, execute)?;
+    let root = current_root_table();
+    map_user_page_inner(root, virt_addr, phys_addr, write, execute)?;
     flush_tlb_all();
     Ok(())
 }

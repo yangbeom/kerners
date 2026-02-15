@@ -432,6 +432,8 @@ kerners/
 ├── modules/test_execve/     # execve error-path test module
 ├── modules/test_proc/       # process syscall baseline test module
 ├── modules/test_fork/       # fork/waitid/uname compatibility test module
+├── modules/test_brk/        # brk grow/shrink regression test module
+├── modules/test_mmap/       # mmap/munmap/mprotect regression test module
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files

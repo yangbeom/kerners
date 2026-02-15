@@ -159,6 +159,9 @@ pub const SYS_UNLINKAT: usize = 35;
 /// mmap(addr, len, prot, flags, fd, offset) -> void*
 pub const SYS_MMAP: usize = 222;
 
+/// mprotect(addr, len, prot) -> int
+pub const SYS_MPROTECT: usize = 226;
+
 // ============================================================================
 // 시스템 콜 디스패처
 // ============================================================================
@@ -270,13 +273,11 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[3] as *mut u8,
         ),
         SYS_BRK => process::sys_brk(args[0]),
-        SYS_EXECVE => {
-            process::sys_execve(
-                args[0] as *const u8,
-                args[1] as *const *const u8,
-                args[2] as *const *const u8,
-            )
-        }
+        SYS_EXECVE => process::sys_execve(
+            args[0] as *const u8,
+            args[1] as *const *const u8,
+            args[2] as *const *const u8,
+        ),
         SYS_MMAP => process::sys_mmap(
             args[0],
             args[1],
@@ -286,6 +287,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[5],
         ),
         SYS_MUNMAP => process::sys_munmap(args[0], args[1]),
+        SYS_MPROTECT => process::sys_mprotect(args[0], args[1], args[2]),
         SYS_MKDIRAT => {
             // mkdirat(dirfd, path, mode) - dirfd 무시
             fs::sys_mkdir(args[1] as *const u8, args[2] as u32)
@@ -295,7 +297,11 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             fs::sys_unlink(args[1] as *const u8)
         }
         _ => {
-            kprintln!("[syscall] Unknown syscall: {} (args: {:?})", syscall_num, args);
+            kprintln!(
+                "[syscall] Unknown syscall: {} (args: {:?})",
+                syscall_num,
+                args
+            );
             errno::ENOSYS
         }
     }
@@ -326,6 +332,29 @@ pub fn syscall_handler_aarch64_with_user_context(
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn syscall_handler_riscv64_with_user_context(
+    syscall_num: usize,
+    args: [usize; 6],
+    gpr: [u64; 32],
+    mstatus: u64,
+    mepc: u64,
+) -> isize {
+    match syscall_num {
+        SYS_CLONE => process::sys_clone_with_user_context_riscv(
+            args[0],
+            args[1],
+            args[2] as *mut u8,
+            args[3],
+            args[4] as *mut u8,
+            gpr,
+            mstatus,
+            mepc,
+        ),
+        _ => syscall_handler(syscall_num, args),
+    }
+}
+
 /// 현재 스레드의 pending exec 전이 정보를 가져온다.
 pub fn take_exec_transition_for_current() -> Option<process::ExecTransition> {
     process::take_exec_transition_for_current()
@@ -344,6 +373,16 @@ pub fn vfork_for_test() -> isize {
 /// 테스트 모듈용: 현재 태스크 pending signal 큐에 시그널 삽입
 pub fn enqueue_signal_for_test(signum: u32) -> isize {
     process::test_enqueue_signal_for_current(signum)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn handle_user_page_fault_aarch64(far: usize, esr: u64) -> bool {
+    process::handle_user_page_fault_aarch64(far, esr)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn handle_user_page_fault_riscv64(far: usize, cause: u64) -> bool {
+    process::handle_user_page_fault_riscv64(far, cause)
 }
 
 /// 에러 코드 (Linux 호환)

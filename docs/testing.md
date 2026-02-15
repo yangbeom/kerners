@@ -26,6 +26,8 @@ make test
   │     → target/modules/{arch}/test_log.ko
   │     → target/modules/{arch}/test_proc.ko
   │     → target/modules/{arch}/test_fork.ko
+  │     → target/modules/{arch}/test_brk.ko
+  │     → target/modules/{arch}/test_mmap.ko
   │
   ├─ 2) FAT32 디스크 이미지 생성 + .ko 파일 복사
   │     → disk.img (mcopy로 .ko를 FAT32에 넣음, `KERNERS_DISK_IMG`로 경로 override 가능)
@@ -66,7 +68,7 @@ $ make test ARCH=aarch64
 
 === KERNERS TEST SUITE START ===
 
-[test] Found 9 test module(s)
+[test] Found 11 test module(s)
 
 [test] Loading /mnt/TEST_IPC.KO ...     (FAT32 8.3 대문자)
 [test_ipc] mq create .................. PASS
@@ -106,8 +108,16 @@ $ make test ARCH=aarch64
 [test_proc] brk grow/shrink ........... PASS
 [test_proc] mmap/munmap ............... PASS
 
+[test] Loading /mnt/test_brk.ko ...
+[test_brk] grow pages ................. PASS
+[test_brk] shrink + keep current ...... PASS
+
+[test] Loading /mnt/test_mmap.ko ...
+[test_mmap] anonymous map/mprotect .... PASS
+[test_mmap] MAP_FIXED replace ......... PASS
+
 === KERNERS TEST SUITE END ===
-RESULT: 9 passed, 0 failed
+RESULT: 11 passed, 0 failed
 TEST_STATUS: PASS
 
 → qemu_exit(0)
@@ -171,12 +181,19 @@ make test-all
 - `modules/test_proc`
   - `getpid/gettid/getppid`
   - `brk` 증가/감소
-  - `mmap/munmap` (anonymous/private baseline)
+  - `mmap/munmap` (anonymous/private + partial unmap)
   - `rt_sigprocmask/rt_sigtimedwait` (pending signal queue)
   - `fork/vfork/wait4` 최소 경로
 - `modules/test_fork`
   - `fork/vfork` + `wait4/waitid` 호환 경로
   - `uname` 반환값 검증
+- `modules/test_brk`
+  - `brk` 페이지 단위 확장/축소
+  - 잘못된 범위 요청 시 현재 break 유지
+- `modules/test_mmap`
+  - `mmap` + `munmap` 부분 해제
+  - `mprotect` 권한 변경 호출
+  - `MAP_FIXED` 덮어쓰기 매핑
 
 ### modules/test_mm — 메모리 관리
 
@@ -244,7 +261,7 @@ make test-all
 | getpid/gettid/getppid | PID/TID/PPID 기본 조회 검증 |
 | brk grow/shrink | `brk(0)` 조회 및 증가/감소 경로 검증 |
 | mmap/munmap | anonymous/private 매핑 + 읽기/쓰기 + 해제 검증 |
-| unsupported mode | file-backed mmap 미지원 시 `ENOSYS(-38)` 검증 |
+| file-backed mode | invalid fd에 `EBADF(-9)` 검증 |
 | signal queue | `rt_sigprocmask` + `rt_sigtimedwait`로 pending signal 소비 검증 |
 | fork/wait4 | `fork` 후 `wait4`로 자식 회수 및 상태 검증 |
 | vfork/wait4 | `vfork` 후 `wait4`로 자식 회수 검증 |
@@ -258,6 +275,26 @@ make test-all
 | waitid(WNOWAIT) + wait4 | `waitid(..., WNOWAIT)` 이후 `wait4` 회수 가능 여부 검증 |
 | vfork/waitid consume | `waitid`가 자식을 회수하고 재대기 시 `ECHILD` 반환 확인 |
 | uname basics | `sys_uname`의 `sysname=Kerners`, machine 필드 기본값 검증 |
+
+### modules/test_brk — brk 고도화
+
+| 테스트 | 설명 |
+|--------|------|
+| grow pages | `brk` 확장 시 신규 페이지 접근 가능 여부 검증 |
+| shrink + keep current | 축소 후 첫 페이지 접근 + invalid range 요청 시 현재 break 유지 확인 |
+| shrink to baseline | 초기 break로 되돌리는 경로 검증 |
+
+### modules/test_mmap — mmap/munmap/mprotect
+
+| 테스트 | 설명 |
+|--------|------|
+| anonymous map + mprotect + partial munmap | 익명 매핑/권한 변경/앞쪽 부분 해제/꼬리 접근 검증 |
+| MAP_FIXED replace | 같은 주소에 `MAP_FIXED`로 재매핑해 기존 매핑 교체 확인 |
+| file-backed `MAP_SHARED` | 동일 파일 페이지를 다른 fd로 매핑해 변경 공유 확인 |
+| file-backed `MAP_PRIVATE` + COW | write fault 후 private 변경이 shared/file에 전파되지 않음 확인 |
+| shared writeback | `munmap` 후 재매핑/재읽기에서 flush 결과 반영 확인 |
+| invalid args | `fd`, `offset` 정렬, `offset+len > file_size`(`EINVAL`) 검증 |
+| riscv file-backed arg check | invalid fd에서 `EBADF` 반환 확인 |
 
 ## 커널 심볼 익스포트
 
@@ -317,6 +354,21 @@ make test-all
 | `kernel_vfs_read` | `(path: *const u8, path_len: usize, offset: usize, buf: *mut u8, buf_len: usize) -> i32` |
 | `kernel_vfs_unlink` | `(path: *const u8, path_len: usize) -> i32` |
 | `kernel_exec_prepare` | `(path: *const u8, path_len: usize) -> i32` |
+
+### Process Syscalls
+
+| 심볼 | 시그니처 |
+|------|---------|
+| `kernel_sys_getpid` | `() -> i64` |
+| `kernel_sys_getppid` | `() -> i64` |
+| `kernel_sys_gettid` | `() -> i64` |
+| `kernel_sys_brk` | `(addr: usize) -> i64` |
+| `kernel_sys_mmap` | `(addr, len, prot, flags, fd, offset) -> i64` |
+| `kernel_sys_munmap` | `(addr: usize, len: usize) -> i64` |
+| `kernel_sys_mprotect` | `(addr: usize, len: usize, prot: usize) -> i64` |
+| `kernel_sys_open` | `(path: *const u8, flags: u32, mode: u32) -> i64` |
+| `kernel_sys_close` | `(fd: i32) -> i64` |
+| `kernel_sys_lseek` | `(fd: i32, offset: i64, whence: i32) -> i64` |
 
 ### Thread
 
@@ -399,6 +451,7 @@ fn panic(_info: &PanicInfo) -> ! {
 | `scripts/build_test_modules.sh [ARCH]` | `modules/test_*/`를 순회하여 `.ko` 빌드 |
 | `scripts/prepare_test_disk.sh [ARCH]` | FAT32 `disk.img` 생성 + `.ko` 복사 (`KERNERS_DISK_IMG` 지원) |
 | `scripts/prepare_user_disk.sh [ARCH] [BUSYBOX_PATH] [DISK_IMG]` | BusyBox 기반 `disk.img` 생성 (`/sbin/init`, `/bin/init` 포함) |
+| `scripts/run_busybox_smoke.sh [ARCH] [BUSYBOX_PATH] [RUNS] [TIMEOUT]` | BusyBox init 스모크 + `COW_FORK_TEST` 로그 판정 |
 | `scripts/run_tests.sh [ARCH] [TIMEOUT]` | 전체 오케스트레이션 (빌드 → 디스크 → 커널 → QEMU → 결과 파싱) |
 
 ## 관련 소스
@@ -406,6 +459,6 @@ fn panic(_info: &PanicInfo) -> ! {
 | 파일 | 설명 |
 |------|------|
 | `src/test_runner.rs` | QEMU 내 테스트 러너 (FAT32 마운트 → 모듈 로드 → 실행 → 결과 집계) |
-| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (34개 심볼) |
+| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (38개 심볼) |
 | `src/module/symbol.rs` | 커널 심볼 테이블 + 컴파일러 intrinsic (memset/memcpy/memmove) |
 | `Cargo.toml` | `test_runner` feature 정의 |

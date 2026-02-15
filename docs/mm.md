@@ -173,6 +173,15 @@ mm::page::alloc_frame() -> Option<usize>
 /// 연속 n개 페이지 할당
 mm::page::alloc_frames(count: usize) -> Option<usize>
 
+/// 프레임 참조 카운트 증가
+mm::page::retain_frame(addr: usize) -> bool
+
+/// 프레임 참조 카운트 조회
+mm::page::frame_refcount(addr: usize) -> usize
+
+/// 프레임 참조 카운트 감소 (0이면 실제 free)
+mm::page::release_frame(addr: usize) -> bool
+
 /// 단일 페이지 해제
 unsafe { mm::page::free_frame(addr); }
 
@@ -183,6 +192,13 @@ unsafe { mm::page::free_frames(addr, count); }
 mm::page::stats() -> FrameAllocatorStats
 mm::page::dump_stats()  // 콘솔 출력
 ```
+
+### 프레임 참조 카운트와 COW
+
+- `alloc_frame/alloc_frames`는 새 프레임의 refcount를 `1`로 시작합니다.
+- `retain_frame`은 공유 매핑(파일 page cache, fork COW 등) 시 호출됩니다.
+- `free_frame/free_frames`는 직접 allocator free를 수행하지 않고 `release_frame` 의미로 동작합니다.
+  - refcount가 0이 되는 시점에만 물리 프레임이 실제 반환됩니다.
 
 ### 사용 예시
 

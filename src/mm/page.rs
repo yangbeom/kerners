@@ -5,6 +5,7 @@
 
 use crate::kprintln;
 use crate::sync::Mutex;
+use alloc::vec::Vec;
 
 /// 페이지 크기: 4KB
 pub const PAGE_SIZE: usize = 4096;
@@ -24,6 +25,12 @@ pub struct FrameAllocator {
     next_search: usize,
     /// 할당된 페이지 수
     allocated_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameRefCount {
+    addr: usize,
+    count: usize,
 }
 
 unsafe impl Send for FrameAllocator {}
@@ -265,6 +272,8 @@ impl FrameAllocatorStats {
 
 /// 전역 프레임 할당자
 static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::new());
+/// 프레임별 참조 카운트 (프레임 공유/COW용)
+static FRAME_REFS: Mutex<Vec<FrameRefCount>> = Mutex::new(Vec::new());
 
 /// 프레임 할당자 초기화
 pub fn init(base: usize, size: usize) -> Result<(), &'static str> {
@@ -280,12 +289,85 @@ pub fn init(base: usize, size: usize) -> Result<(), &'static str> {
 
 /// 단일 페이지 할당
 pub fn alloc_frame() -> Option<usize> {
-    FRAME_ALLOCATOR.lock().alloc()
+    let addr = FRAME_ALLOCATOR.lock().alloc()?;
+    let mut refs = FRAME_REFS.lock();
+    refs.push(FrameRefCount { addr, count: 1 });
+    Some(addr)
 }
 
 /// 연속 페이지 할당
 pub fn alloc_frames(count: usize) -> Option<usize> {
-    FRAME_ALLOCATOR.lock().alloc_pages(count)
+    let addr = FRAME_ALLOCATOR.lock().alloc_pages(count)?;
+    let mut refs = FRAME_REFS.lock();
+    for i in 0..count {
+        refs.push(FrameRefCount {
+            addr: addr + i * PAGE_SIZE,
+            count: 1,
+        });
+    }
+    Some(addr)
+}
+
+/// 프레임 참조 카운트 증가
+///
+/// 이미 알려진 프레임이면 +1, 없으면 새 엔트리(count=1)를 생성한다.
+pub fn retain_frame(addr: usize) -> bool {
+    if addr % PAGE_SIZE != 0 {
+        return false;
+    }
+    let mut refs = FRAME_REFS.lock();
+    if let Some(item) = refs.iter_mut().find(|item| item.addr == addr) {
+        item.count = item.count.saturating_add(1);
+        return true;
+    }
+    refs.push(FrameRefCount { addr, count: 1 });
+    true
+}
+
+/// 프레임 참조 카운트 조회
+pub fn frame_refcount(addr: usize) -> usize {
+    if addr % PAGE_SIZE != 0 {
+        return 0;
+    }
+    let refs = FRAME_REFS.lock();
+    refs.iter()
+        .find(|item| item.addr == addr)
+        .map(|item| item.count)
+        .unwrap_or(0)
+}
+
+/// 프레임 참조 카운트 감소
+///
+/// 참조 카운트가 0이 되면 실제 프레임을 allocator에 반환한다.
+pub fn release_frame(addr: usize) -> bool {
+    if addr % PAGE_SIZE != 0 {
+        return false;
+    }
+
+    let mut should_free = false;
+    {
+        let mut refs = FRAME_REFS.lock();
+        if let Some(pos) = refs.iter().position(|item| item.addr == addr) {
+            if refs[pos].count <= 1 {
+                refs.swap_remove(pos);
+                should_free = true;
+            } else {
+                refs[pos].count -= 1;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    if should_free {
+        unsafe {
+            // SAFETY: 참조 카운트가 0이 된 프레임만 실제 allocator로 반환한다.
+            FRAME_ALLOCATOR.lock().free(addr);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 /// 단일 페이지 해제
@@ -293,9 +375,7 @@ pub fn alloc_frames(count: usize) -> Option<usize> {
 /// # Safety
 /// 유효한 주소여야 함
 pub unsafe fn free_frame(addr: usize) {
-    unsafe {
-        FRAME_ALLOCATOR.lock().free(addr);
-    }
+    let _ = release_frame(addr);
 }
 
 /// 연속 페이지 해제
@@ -303,8 +383,8 @@ pub unsafe fn free_frame(addr: usize) {
 /// # Safety
 /// 유효한 주소여야 함
 pub unsafe fn free_frames(addr: usize, count: usize) {
-    unsafe {
-        FRAME_ALLOCATOR.lock().free_pages(addr, count);
+    for i in 0..count {
+        let _ = release_frame(addr + i * PAGE_SIZE);
     }
 }
 

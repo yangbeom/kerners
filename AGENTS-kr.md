@@ -92,6 +92,8 @@ kerners/
 ├── modules/test_execve/     # execve 에러 경로 테스트 모듈
 ├── modules/test_proc/       # process syscall baseline 테스트 모듈
 ├── modules/test_fork/       # fork/waitid/uname 호환성 테스트 모듈
+├── modules/test_brk/        # brk 확장/축소 회귀 테스트 모듈
+├── modules/test_mmap/       # mmap/munmap/mprotect 회귀 테스트 모듈
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
