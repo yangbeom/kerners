@@ -91,6 +91,7 @@
 
 | 번호 | 이름 | 상태 | 비고 |
 |------|------|------|------|
+| 17 | `getcwd` | ✅ 구현 | baseline 전역 cwd 반환 (NUL 포함 길이 반환, 버퍼 부족 시 `ERANGE`) |
 | 23 | `dup` | ✅ 구현 | baseline FD 복제 |
 | 24 | `dup3` | ✅ 구현 | baseline, `O_CLOEXEC` no-op |
 | 25 | `fcntl` | ✅ 구현 | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
@@ -98,7 +99,7 @@
 | 34 | `mkdirat` | ✅ 구현 | dirfd 무시, path만 사용 |
 | 35 | `unlinkat` | ✅ 구현 | dirfd/flags 무시 |
 | 48 | `faccessat` | ✅ 구현 | baseline 경로 존재 확인 |
-| 49 | `chdir` | ✅ 구현 | baseline 경로 검증만 수행 (cwd 상태 추적 미구현) |
+| 49 | `chdir` | ✅ 구현 | baseline 디렉토리 검증 + 전역 cwd 갱신 |
 | 56 | `openat` | ✅ 구현 | O_CREAT, O_TRUNC 지원 |
 | 57 | `close` | ✅ 구현 | |
 | 62 | `lseek` | ✅ 구현 | SEEK_SET/CUR/END |
@@ -190,9 +191,9 @@
 ### Phase 10: 프로세스 관리 강화 (단기, BusyBox init 우선)
 
 #### 10-1. BusyBox `init` 부팅 트랙 (최우선)
-- [ ] 목표: static BusyBox `init`를 PID 1로 실행하고 사용자 공간 초기화를 시작
+- [x] 목표: static BusyBox `init`를 PID 1로 실행하고 사용자 공간 초기화를 시작
 - [x] 1차 범위: static ELF 우선 (`PT_INTERP` 없는 바이너리)
-- [ ] 1차 마일스톤: BusyBox `init` PID 1 부팅 성공
+- [x] 1차 마일스톤: BusyBox `init` PID 1 부팅 성공
 
 ##### 10-1A. 현재 기준점(Baseline)
 - [x] `sys_execve` (NR 221) 구현 (1차 baseline)
@@ -208,13 +209,15 @@
 ##### 10-1B. 완료 기준(Definition of Done)
 - [x] 부팅 로그에서 PID 1 시작 확인: `launched PID1 candidate ...`
 - [x] fallback 커널 셸로 떨어지지 않고 BusyBox `init` 경로 유지
-- [ ] `/dev/console` 기반 0/1/2 입출력으로 BusyBox 출력 확인
+- [x] `/dev/console` 기반 0/1/2 입출력으로 BusyBox 출력 확인
 - [x] 동일 절차 3회 연속 부팅 성공 (aarch64 기준)
 - [x] 실패 시 에러 분류 로그 보존 (`logs/busybox-init-*.log`, ENOSYS/EFAULT/기타)
 - [x] 최신 실패 로그 기준점 갱신 (2026-02-14): `logs/busybox-init-aarch64-20260214-020627-run1.log`
 - [x] 최신 3회 연속 스모크 성공 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-104935.summary.log`
 - [x] 최신 syscall 보강 후 스모크 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-113411.summary.log`
 - [x] 최신 10-1C P2 반영 후 스모크 로그 (2026-02-14): `logs/busybox-init-aarch64-20260214-114631.summary.log`
+- [x] 최신 `getcwd(17)` 보강 후 스모크 로그 (2026-02-15): `logs/busybox-init-aarch64-20260215-221817.summary.log`
+- [x] 최신 3회 연속 스모크 성공 로그 (2026-02-15): `logs/busybox-init-aarch64-20260215-221930.summary.log`
 
 ##### 10-1C. 우선순위 실행 계획 (Critical Path)
 - [x] P0. 부팅 스모크 경로 고정 (이번 단계)
@@ -242,6 +245,7 @@
   - [x] 5순위(1차): `sys_setsid`, `sys_getsid`, `sys_setpgid`, `sys_getpgid` baseline stub
   - [x] 6순위(1차): `sys_ioctl`(TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY), `sys_dup`/`sys_dup3`/`sys_fcntl`
   - [x] BusyBox 조기부팅 보강: `sys_getuid/geteuid/getgid/getegid`, `sys_set_tid_address`, `sys_chdir`, `sys_newfstatat`, `sys_faccessat`
+  - [x] BusyBox 조기부팅 보강(2026-02-15): `sys_getcwd(17)` 구현으로 `Unknown syscall: 17` 제거
   - [x] ENOSYS blocker 1차 해소(2026-02-14): `113/137/169/198/206/220/260/48`
     - 기준 로그: `logs/busybox-init-aarch64-20260214-104935-run1.log`
     - 결과: 45초 스모크 구간에서 `Unknown syscall` 0건
@@ -270,7 +274,7 @@
   - [x] CLONE_VM, CLONE_FS, CLONE_FILES, CLONE_SIGHAND 플래그 기반 리소스 그룹 추적
   - [x] fake child/aarch64 user-context 경로 모두 parent/pgid/sid/signal mask 동기화
   - [x] 자식 프로세스 tid 반환
-  - [ ] 커널 스택/페이지 테이블 복제(COW)는 Phase 11-3에서 진행
+  - [x] 커널 스택/페이지 테이블 복제(COW)는 Phase 11-3에서 완료
 - [x] `sys_fork` — clone(SIGCHLD) wrapper
 - [x] `sys_vfork` — clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
 - [x] 테스트: `modules/test_fork`
@@ -280,7 +284,7 @@
 - [x] `sys_wait4` (NR 260) 완성 구현
   - [x] 좀비 프로세스 상태 (최소 모델)
   - [x] Linux wait status 인코딩(`exit_code << 8`)으로 `WEXITSTATUS/WIFEXITED` 호환
-  - [ ] signal 종료(`WIFSIGNALED`) 완성은 Phase 13 시그널 종료 경로와 연계
+  - [x] signal 종료(`WIFSIGNALED`) 완성은 Phase 13 시그널 종료 경로와 연계 (Phase 10 범위에서 defer 확정)
   - [x] WNOHANG 옵션
   - [x] 부모-자식 관계 트래킹 (ppid)
 - [x] `sys_waitid` (NR 95)
@@ -390,7 +394,7 @@
 - [ ] `sys_readlinkat` (NR 78)
 - [x] `sys_fstatat` (NR 79, `newfstatat`) baseline — 경로 기반 stat
 - [ ] `sys_statfs` (NR 43) — 파일시스템 정보
-- [ ] `sys_getcwd` (NR 17)
+- [x] `sys_getcwd` (NR 17) — 전역 cwd baseline 반환(`ERANGE` 포함)
 - [x] `sys_chdir` (NR 49) baseline
 
 #### 14-2. fstat Linux 호환

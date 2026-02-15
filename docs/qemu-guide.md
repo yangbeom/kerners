@@ -62,7 +62,9 @@ make busybox-smoke ARCH=aarch64 BUSYBOX=/absolute/path/to/busybox
 ```
 
 스모크 스크립트는 run별 로그와 summary 로그를 생성하고, 실패 시 원인을 1차 분류합니다.
-(`ENOSYS`, `EFAULT`, `EXEC_FAIL`, `NO_INIT_FALLBACK`)
+(`ENOSYS`, `EFAULT`, `EXEC_FAIL`, `NO_INIT_FALLBACK`, `PANIC`, `TIMEOUT` 등)
+
+`BUSYBOX_SMOKE_REQUIRE_COW=1`을 지정하면 `COW_FORK_TEST: PASS` 마커를 필수로 검사합니다.
 
 ## 수동 실행 방법
 

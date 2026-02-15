@@ -33,6 +33,9 @@ pub const SYS_CHDIR: usize = 49;
 /// faccessat(dirfd, path, mode, flags) -> int
 pub const SYS_FACCESSAT: usize = 48;
 
+/// getcwd(buf, size) -> ssize_t
+pub const SYS_GETCWD: usize = 17;
+
 /// close(fd) -> int
 pub const SYS_CLOSE: usize = 57;
 
@@ -187,6 +190,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[2] as u32,
             args[3] as u32,
         ),
+        SYS_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
         SYS_CHDIR => fs::sys_chdir(args[0] as *const u8),
         SYS_OPENAT => {
             // openat(dirfd, path, flags, mode) - dirfd 무시하고 path만 사용
@@ -406,6 +410,7 @@ pub mod errno {
     pub const EISDIR: isize = -21;
     pub const EINVAL: isize = -22;
     pub const ENOTTY: isize = -25;
+    pub const ERANGE: isize = -34;
     pub const EAFNOSUPPORT: isize = -97;
     pub const ENOSYS: isize = -38;
 }

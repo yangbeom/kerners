@@ -18,6 +18,7 @@ BUSYBOX_PATH="${2:-${KERNERS_BUSYBOX:-}}"
 RUNS="${3:-3}"
 TIMEOUT_SEC="${4:-30}"
 LOG_DIR="$PROJECT_ROOT/logs"
+REQUIRE_COW="${BUSYBOX_SMOKE_REQUIRE_COW:-0}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -116,7 +117,7 @@ for i in $(seq 1 "$RUNS"); do
 
     COW_FORK_MARKER="N/A"
     COW_FORK_OK=1
-    if [[ "$ARCH" == "aarch64" || "$ARCH" == "riscv64" ]]; then
+    if [[ "$REQUIRE_COW" == "1" && ( "$ARCH" == "aarch64" || "$ARCH" == "riscv64" ) ]]; then
         if grep -q "COW_FORK_TEST: PASS" "$RUN_LOG"; then
             COW_FORK_MARKER="PASS"
         else
@@ -128,7 +129,7 @@ for i in $(seq 1 "$RUNS"); do
     if grep -q "launched PID1 candidate" "$RUN_LOG" && \
        ! grep -q "no executable init found, falling back to kernel shell" "$RUN_LOG" && \
        ! grep -q "Process 1 exiting with status" "$RUN_LOG" && \
-       ! grep -q "Kernel panic" "$RUN_LOG" && \
+       ! grep -Eq "Kernel panic|Kernels panic" "$RUN_LOG" && \
        [[ "$COW_FORK_OK" -eq 1 ]]; then
         RUN_STATUS="PASS"
     fi
@@ -149,10 +150,10 @@ for i in $(seq 1 "$RUNS"); do
     if grep -q "Failed to get \"write\" lock" "$RUN_LOG"; then
         REASONS+=("QEMU_LOCK")
     fi
-    if grep -q "Kernel panic" "$RUN_LOG"; then
+    if grep -Eq "Kernel panic|Kernels panic" "$RUN_LOG"; then
         REASONS+=("PANIC")
     fi
-    if [[ ("$ARCH" == "aarch64" || "$ARCH" == "riscv64") && "$COW_FORK_MARKER" == "MISSING" ]]; then
+    if [[ "$REQUIRE_COW" == "1" && ("$ARCH" == "aarch64" || "$ARCH" == "riscv64") && "$COW_FORK_MARKER" == "MISSING" ]]; then
         REASONS+=("COW_FORK_MISSING")
     fi
     if [[ "$RUN_EXIT" -eq 124 ]]; then

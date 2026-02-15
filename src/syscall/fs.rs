@@ -7,6 +7,7 @@ use alloc::string::String;
 use crate::console;
 use crate::fs::{self, VfsError, VNodeType, FileMode};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
+use crate::sync::Mutex;
 use super::errno;
 
 /// VFS 에러를 errno로 변환
@@ -27,6 +28,7 @@ fn vfs_error_to_errno(e: VfsError) -> isize {
 }
 
 const MAX_PATH_LEN: usize = 4096;
+static CURRENT_CWD: Mutex<Option<String>> = Mutex::new(None);
 
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
@@ -120,10 +122,23 @@ fn normalize_user_path(path: &str) -> Result<String, isize> {
     let abs = if path.starts_with('/') {
         String::from(path)
     } else {
-        format!("/{}", path)
+        let cwd = current_cwd();
+        if cwd == "/" {
+            format!("/{}", path)
+        } else {
+            format!("{}/{}", cwd, path)
+        }
     };
 
     fs::path::normalize(&abs).map_err(vfs_error_to_errno)
+}
+
+fn current_cwd() -> String {
+    let cwd = CURRENT_CWD.lock();
+    match cwd.as_ref() {
+        Some(path) if !path.is_empty() => path.clone(),
+        _ => String::from("/"),
+    }
 }
 
 fn linux_mode_bits(node_type: VNodeType) -> u32 {
@@ -380,8 +395,7 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> isize {
 
 /// sys_chdir - 현재 작업 디렉토리 변경
 ///
-/// 현재 커널은 per-process cwd를 보관하지 않으므로,
-/// 경로 유효성(디렉토리 존재)만 검사한 뒤 성공 처리한다.
+/// 현재 구현은 per-process cwd 대신 커널 전역 cwd baseline을 갱신한다.
 pub fn sys_chdir(path: *const u8) -> isize {
     let path_owned = match read_c_path(path) {
         Ok(p) => p,
@@ -393,10 +407,40 @@ pub fn sys_chdir(path: *const u8) -> isize {
     };
 
     match fs::lookup_path(&path_norm) {
-        Ok(v) if v.node_type() == VNodeType::Directory => 0,
+        Ok(v) if v.node_type() == VNodeType::Directory => {
+            *CURRENT_CWD.lock() = Some(path_norm);
+            0
+        }
         Ok(_) => errno::ENOTDIR,
         Err(e) => vfs_error_to_errno(e),
     }
+}
+
+/// sys_getcwd - 현재 작업 디렉토리 조회
+///
+/// 현재 구현은 프로세스별 cwd 대신 커널 전역 cwd baseline을 반환한다.
+/// 성공 시 NUL 종료 문자열 길이(terminator 포함)를 반환한다.
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
+    if buf.is_null() {
+        return errno::EFAULT;
+    }
+    if size == 0 {
+        return errno::EINVAL;
+    }
+
+    let cwd = current_cwd();
+    let bytes = cwd.as_bytes();
+    let required = bytes.len() + 1; // trailing NUL
+    if required > size {
+        return errno::ERANGE;
+    }
+
+    unsafe {
+        // SAFETY: 호출자가 제공한 buf는 최소 required 바이트 이상이며 겹치지 않는다.
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+    }
+    required as isize
 }
 
 /// sys_faccessat - 파일 접근 권한 확인

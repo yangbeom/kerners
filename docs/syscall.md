@@ -71,9 +71,10 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_fcntl` | 25 | `fcntl(fd, cmd, arg)` | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
 | `sys_ioctl` | 29 | `ioctl(fd, req, arg)` | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
 | `sys_faccessat` | 48 | `faccessat(dirfd, path, mode, flags)` | baseline 경로 존재 확인 |
+| `sys_getcwd` | 17 | `getcwd(buf, size) -> len` | baseline 전역 cwd 반환 (NUL 포함 길이, 버퍼 부족 시 `ERANGE`) |
 | `sys_openat` | 56 | `openat(dirfd, path, flags, mode) -> fd` | 파일 열기 |
 | `sys_close` | 57 | `close(fd)` | 파일 닫기 |
-| `sys_chdir` | 49 | `chdir(path)` | baseline 경로 검증 (cwd 상태 추적 미구현) |
+| `sys_chdir` | 49 | `chdir(path)` | baseline 디렉토리 검증 + 전역 cwd 갱신 |
 | `sys_lseek` | 62 | `lseek(fd, offset, whence) -> off` | 오프셋 이동 |
 | `sys_read` | 63 | `read(fd, buf, count) -> n` | 파일 읽기 |
 | `sys_write` | 64 | `write(fd, buf, count) -> n` | 파일 쓰기 |
@@ -84,7 +85,8 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 
 **참고**:
 - `openat`, `mkdirat`, `unlinkat`의 `dirfd` 인자는 현재 무시됩니다.
-- 경로는 baseline에서 `/` 기준으로 정규화됩니다.
+- 상대 경로는 baseline 전역 cwd 기준으로 정규화됩니다.
+- `getcwd`는 NUL 종료 문자열 길이를 반환하며, 버퍼 부족 시 `ERANGE`를 반환합니다.
 
 ## 파일 구조
 
@@ -128,6 +130,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
 | `EISDIR` | -21 | 디렉토리임 |
 | `EINVAL` | -22 | 잘못된 인자 |
 | `ENOTTY` | -25 | TTY가 아닌 디바이스 |
+| `ERANGE` | -34 | 버퍼 크기 부족 |
 | `EAFNOSUPPORT` | -97 | 지원하지 않는 주소 체계 |
 | `ENOSYS` | -38 | 미구현 syscall |
 

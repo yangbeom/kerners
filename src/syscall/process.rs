@@ -138,6 +138,7 @@ struct ForkChildContext {
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 struct PendingForkChild {
     tid: proc::Tid,
+    ready: bool,
     context: ForkChildContext,
 }
 
@@ -189,6 +190,8 @@ const CLONE_FS: usize = 0x00000200;
 const CLONE_FILES: usize = 0x00000400;
 const CLONE_SIGHAND: usize = 0x00000800;
 const CLONE_VFORK: usize = 0x00004000;
+const CLONE_PARENT_SETTID: usize = 0x00100000;
+const CLONE_CHILD_SETTID: usize = 0x01000000;
 const CLONE_CSIGNAL_MASK: usize = 0x000000ff;
 const WNOHANG: i32 = 0x1;
 const WEXITED: i32 = 0x4;
@@ -884,12 +887,27 @@ fn handle_user_page_fault_write(far: usize) -> bool {
         return false;
     }
 
-    let vm_group = current_vm_group();
-    let cow = {
+    let current_vm_group = current_vm_group();
+    let active_root = crate::proc::current_user_root_table()
+        .unwrap_or(crate::arch::mmu::current_root_table());
+    let (vm_group, cow) = {
         let cows = COW_PAGES.lock();
-        cows.iter()
-            .find(|item| item.vm_group == vm_group && item.addr == va)
+        if let Some(item) = cows
+            .iter()
+            .find(|item| item.vm_group == current_vm_group && item.addr == va)
             .copied()
+        {
+            (item.vm_group, Some(item))
+        } else {
+            let mut fallback: Option<CowMeta> = None;
+            for item in cows.iter().filter(|item| item.addr == va) {
+                if vm_root_for_group_if_present(item.vm_group) == Some(active_root) {
+                    fallback = Some(*item);
+                    break;
+                }
+            }
+            (fallback.map(|item| item.vm_group).unwrap_or(current_vm_group), fallback)
+        }
     };
     let Some(cow) = cow else {
         return false;
@@ -1268,20 +1286,29 @@ fn write_uts_field(dst: &mut [u8; 65], value: &str) {
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn fork_child_entry() -> ! {
     let tid = current_tid_or_zero();
-    let context = {
-        let mut pending = PENDING_FORK_CHILDREN.lock();
-        let pos = pending.iter().position(|c| c.tid == tid);
-        pos.map(|idx| pending.swap_remove(idx).context)
-    };
-
-    let Some(context) = context else {
-        kprintln!("[syscall] fork child tid={} has no pending context", tid);
-        proc::exit();
+    let context = loop {
+        let context = {
+            let mut pending = PENDING_FORK_CHILDREN.lock();
+            let pos = pending.iter().position(|c| c.tid == tid && c.ready);
+            pos.map(|idx| pending.swap_remove(idx).context)
+        };
+        if let Some(context) = context {
+            break context;
+        }
+        proc::yield_now();
     };
 
     unsafe {
         // SAFETY: fork/clone 시 부모 trap context에서 캡처한 유효 사용자 복귀 상태를 복원한다.
         fork_child_enter_user(&context as *const ForkChildContext);
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn mark_pending_fork_child_ready(child_tid: proc::Tid) {
+    let mut pending = PENDING_FORK_CHILDREN.lock();
+    if let Some(child) = pending.iter_mut().find(|child| child.tid == child_tid) {
+        child.ready = true;
     }
 }
 
@@ -1613,10 +1640,10 @@ pub fn sys_clone(
         enqueue_signal(parent_tid, exit_signal);
     }
 
-    if !parent_tid_ptr.is_null() {
+    if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
         write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
     }
-    if !child_tid_ptr.is_null() {
+    if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
         write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
     }
 
@@ -1791,12 +1818,14 @@ fn finalize_clone_with_vm_setup(
         }
     }
 
-    if !parent_tid_ptr.is_null() {
+    if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
         write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
     }
-    if !child_tid_ptr.is_null() {
+    if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
         write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
     }
+
+    mark_pending_fork_child_ready(child_tid);
 
     if flags & CLONE_VFORK != 0 {
         add_vfork_wait(parent_tid, child_tid);
@@ -1832,6 +1861,7 @@ pub fn sys_clone_with_user_context_riscv(
 
     PENDING_FORK_CHILDREN.lock().push(PendingForkChild {
         tid: child_tid,
+        ready: false,
         context: ForkChildContext { gpr, mstatus, mepc },
     });
 
@@ -1868,6 +1898,7 @@ pub fn sys_clone_with_user_context(
 
     PENDING_FORK_CHILDREN.lock().push(PendingForkChild {
         tid: child_tid,
+        ready: false,
         context: ForkChildContext {
             gpr,
             elr,
@@ -2015,12 +2046,14 @@ pub fn sys_clone_with_user_context(
         }
     }
 
-    if !parent_tid_ptr.is_null() {
+    if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
         write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
     }
-    if !child_tid_ptr.is_null() {
+    if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
         write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
     }
+
+    mark_pending_fork_child_ready(child_tid);
 
     if flags & CLONE_VFORK != 0 {
         add_vfork_wait(parent_tid, child_tid);
