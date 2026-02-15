@@ -1,5 +1,6 @@
 pub mod mmu;
 pub mod plic;
+pub mod rtc;
 pub mod timer;
 pub mod trap;
 pub mod uart;

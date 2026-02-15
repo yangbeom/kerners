@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Mutex;
+use crate::sync::IrqSpinlock;
 
 use crate::kprintln;
 use context::Context;
@@ -34,6 +34,21 @@ pub enum ThreadState {
     Blocked,
     /// 종료됨
     Terminated,
+}
+
+/// sleep 해제 사유
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepWakeReason {
+    Timer,
+    Signal,
+}
+
+/// sleep 대기 항목
+#[derive(Debug, Clone, Copy)]
+pub struct SleepEntry {
+    pub tid: Tid,
+    pub deadline_ns: u64,
+    pub wake_reason: SleepWakeReason,
 }
 
 /// 스레드 제어 블록 (TCB)
@@ -134,7 +149,10 @@ impl Thread {
 }
 
 /// 전역 스레드 리스트 (모든 CPU가 공유)
-pub(crate) static THREADS: Mutex<Vec<Box<Thread>>> = Mutex::new(Vec::new());
+pub(crate) static THREADS: IrqSpinlock<Vec<Box<Thread>>> = IrqSpinlock::new(Vec::new());
+static SLEEP_QUEUE: IrqSpinlock<Vec<SleepEntry>> = IrqSpinlock::new(Vec::new());
+static SLEEP_WAKE_REASONS: IrqSpinlock<Vec<(Tid, SleepWakeReason)>> =
+    IrqSpinlock::new(Vec::new());
 
 /// 프로세스 서브시스템 초기화
 pub fn init() {
@@ -334,5 +352,114 @@ pub fn exit() -> ! {
         unsafe {
             core::arch::asm!("wfi");
         }
+    }
+}
+
+fn record_sleep_wake_reason(tid: Tid, reason: SleepWakeReason) {
+    let mut reasons = SLEEP_WAKE_REASONS.lock();
+    if let Some(item) = reasons.iter_mut().find(|item| item.0 == tid) {
+        item.1 = reason;
+    } else {
+        reasons.push((tid, reason));
+    }
+}
+
+fn take_sleep_wake_reason(tid: Tid) -> Option<SleepWakeReason> {
+    let mut reasons = SLEEP_WAKE_REASONS.lock();
+    let pos = reasons.iter().position(|item| item.0 == tid)?;
+    Some(reasons.swap_remove(pos).1)
+}
+
+/// 현재 스레드를 deadline까지 sleep 상태로 전환한다.
+pub fn sleep_current_until(deadline_ns: u64) -> SleepWakeReason {
+    let tid = match current_tid() {
+        Some(tid) => tid,
+        None => return SleepWakeReason::Timer,
+    };
+
+    {
+        let mut threads = THREADS.lock();
+        if let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) {
+            if thread.state != ThreadState::Terminated {
+                thread.state = ThreadState::Blocked;
+            }
+        } else {
+            return SleepWakeReason::Timer;
+        }
+    }
+
+    {
+        let mut queue = SLEEP_QUEUE.lock();
+        if let Some(entry) = queue.iter_mut().find(|entry| entry.tid == tid) {
+            entry.deadline_ns = deadline_ns;
+            entry.wake_reason = SleepWakeReason::Timer;
+        } else {
+            queue.push(SleepEntry {
+                tid,
+                deadline_ns,
+                wake_reason: SleepWakeReason::Timer,
+            });
+        }
+    }
+
+    scheduler::schedule();
+    take_sleep_wake_reason(tid).unwrap_or(SleepWakeReason::Timer)
+}
+
+/// 타이머 만료된 sleep 스레드를 깨운다.
+pub fn wake_sleepers_by_timer(now_ns: u64) -> usize {
+    let mut ready_tids: Vec<Tid> = Vec::new();
+    {
+        let mut queue = SLEEP_QUEUE.lock();
+        let mut i = 0usize;
+        while i < queue.len() {
+            if queue[i].deadline_ns <= now_ns {
+                let entry = queue.swap_remove(i);
+                ready_tids.push(entry.tid);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if ready_tids.is_empty() {
+        return 0;
+    }
+
+    {
+        let mut threads = THREADS.lock();
+        for tid in ready_tids.iter().copied() {
+            if let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) {
+                if thread.state == ThreadState::Blocked {
+                    thread.state = ThreadState::Ready;
+                }
+            }
+            record_sleep_wake_reason(tid, SleepWakeReason::Timer);
+        }
+    }
+
+    ready_tids.len()
+}
+
+/// 지정 스레드를 시그널 사유로 깨운다.
+pub fn wake_thread_for_signal(tid: Tid) -> bool {
+    {
+        let mut queue = SLEEP_QUEUE.lock();
+        if let Some(pos) = queue.iter().position(|entry| entry.tid == tid) {
+            queue.swap_remove(pos);
+        } else {
+            return false;
+        }
+    }
+
+    let mut threads = THREADS.lock();
+    if let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) {
+        if thread.state == ThreadState::Blocked {
+            thread.state = ThreadState::Ready;
+        }
+        record_sleep_wake_reason(tid, SleepWakeReason::Signal);
+        true
+    } else {
+        false
     }
 }

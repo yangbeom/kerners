@@ -27,6 +27,7 @@ kerners/
 │   │   │   ├── exception.rs # 예외 처리
 │   │   │   ├── gic.rs       # GIC (인터럽트 컨트롤러)
 │   │   │   ├── mmu.rs       # 메모리 관리 유닛
+│   │   │   ├── rtc.rs       # PL031 RTC 드라이버
 │   │   │   ├── timer.rs     # 타이머
 │   │   │   └── uart.rs      # UART 드라이버
 │   │   └── riscv64/         # RISC-V 64 구현
@@ -34,8 +35,11 @@ kerners/
 │   │       ├── trap.rs      # 트랩 처리
 │   │       ├── plic.rs      # PLIC (인터럽트 컨트롤러)
 │   │       ├── mmu.rs       # 메모리 관리 유닛
+│   │       ├── rtc.rs       # Goldfish RTC 드라이버
 │   │       ├── timer.rs     # 타이머
 │   │       └── uart.rs      # UART 드라이버
+│   ├── time/                # 시간 코어 (monotonic/realtime/해상도)
+│   │   └── mod.rs           # RTC 오프셋 + clock helper
 │   ├── mm/                  # 메모리 관리
 │   │   ├── mod.rs           # 메모리 서브시스템
 │   │   ├── heap.rs          # 힙 할당자 (linked_list_allocator)
@@ -94,6 +98,7 @@ kerners/
 ├── modules/test_fork/       # fork/waitid/uname 호환성 테스트 모듈
 ├── modules/test_brk/        # brk 확장/축소 회귀 테스트 모듈
 ├── modules/test_mmap/       # mmap/munmap/mprotect 회귀 테스트 모듈
+├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일

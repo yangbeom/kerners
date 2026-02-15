@@ -14,7 +14,7 @@ mod semaphore;
 mod seqlock;
 mod rcu;
 
-pub use spinlock::{Spinlock, SpinlockGuard};
+pub use spinlock::{IrqSpinlock, IrqSpinlockGuard, Spinlock, SpinlockGuard};
 pub use mutex::{Mutex, MutexGuard};
 pub use rwlock::{RwLock, ReadGuard, WriteGuard};
 pub use semaphore::Semaphore;

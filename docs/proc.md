@@ -149,7 +149,17 @@ pub fn schedule() {
 
 ### 타이머 인터럽트
 
-타이머 인터럽트에서 `schedule()` 호출하여 선점형 스케줄링 구현.
+타이머 인터럽트 경로에서 sleep queue wakeup을 처리합니다.
+
+- aarch64: wakeup 이벤트가 발생한 틱에서만 `schedule()` 호출 (강제 선점 비활성)
+- riscv64: wakeup 처리 후 기존 틱 기반 선점 스케줄링 유지
+
+### sleep queue
+
+- `SleepEntry { tid, deadline_ns, wake_reason }`로 대기 항목을 관리합니다.
+- `sleep_current_until(deadline_ns)`는 현재 스레드를 `Blocked`로 전환하고 스케줄링합니다.
+- `wake_sleepers_by_timer(now_ns)`는 deadline이 지난 스레드를 `Ready`로 전환합니다.
+- `wake_thread_for_signal(tid)`는 signal 사유로 대기 중 스레드를 깨우고 wake reason을 `Signal`로 기록합니다.
 
 ## User Mode
 
@@ -227,4 +237,5 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 ## 현재 제약
 
 - aarch64/riscv64는 vm_group 기반 주소공간 분리 + file-backed `mmap` + fork COW를 지원합니다.
-- signal handler delivery(`rt_sigaction` 실제 핸들러 진입)는 아직 미구현입니다.
+- signal core는 구현되어 syscall/interrupt 복귀 직전에 pending unmasked signal 1건을 전달합니다.
+- `rt_sigtimedwait`의 완전한 timeout/blocking 모델, `SA_RESTART` 자동 재시작, job-control(`SIGSTOP/SIGCONT`)은 아직 미구현입니다.

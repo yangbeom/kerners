@@ -452,6 +452,63 @@ pub extern "C" fn kernel_sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     ) as i64
 }
 
+/// clock_gettime syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_clock_gettime(clock_id: i32, tp: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_CLOCK_GETTIME,
+        [clock_id as usize, tp as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// clock_getres syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_clock_getres(clock_id: i32, tp: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_CLOCK_GETRES,
+        [clock_id as usize, tp as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// gettimeofday syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_GETTIMEOFDAY,
+        [tv as usize, tz as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// nanosleep syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_nanosleep(req: *const u8, rem: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_NANOSLEEP,
+        [req as usize, rem as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// rt_sigaction syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_rt_sigaction(
+    signum: i32,
+    act: *const u8,
+    oldact: *mut u8,
+    sigsetsize: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_RT_SIGACTION,
+        [
+            signum as usize,
+            act as usize,
+            oldact as usize,
+            sigsetsize,
+            0,
+            0,
+        ],
+    ) as i64
+}
+
 /// rt_sigprocmask syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_rt_sigprocmask(
@@ -470,6 +527,33 @@ pub extern "C" fn kernel_sys_rt_sigprocmask(
             0,
             0,
         ],
+    ) as i64
+}
+
+/// kill syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_kill(pid: isize, sig: i32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_KILL,
+        [pid as usize, sig as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// tkill syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_tkill(tid: isize, sig: i32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_TKILL,
+        [tid as usize, sig as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// tgkill syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_tgkill(tgid: isize, tid: isize, sig: i32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_TGKILL,
+        [tgid as usize, tid as usize, sig as usize, 0, 0, 0],
     ) as i64
 }
 
@@ -653,6 +737,11 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_open", kernel_sys_open as usize);
     register_symbol("kernel_sys_close", kernel_sys_close as usize);
     register_symbol("kernel_sys_lseek", kernel_sys_lseek as usize);
+    register_symbol("kernel_sys_clock_gettime", kernel_sys_clock_gettime as usize);
+    register_symbol("kernel_sys_clock_getres", kernel_sys_clock_getres as usize);
+    register_symbol("kernel_sys_gettimeofday", kernel_sys_gettimeofday as usize);
+    register_symbol("kernel_sys_nanosleep", kernel_sys_nanosleep as usize);
+    register_symbol("kernel_sys_rt_sigaction", kernel_sys_rt_sigaction as usize);
     register_symbol(
         "kernel_sys_rt_sigprocmask",
         kernel_sys_rt_sigprocmask as usize,
@@ -661,6 +750,9 @@ pub fn register_test_symbols() {
         "kernel_sys_rt_sigtimedwait",
         kernel_sys_rt_sigtimedwait as usize,
     );
+    register_symbol("kernel_sys_kill", kernel_sys_kill as usize);
+    register_symbol("kernel_sys_tkill", kernel_sys_tkill as usize);
+    register_symbol("kernel_sys_tgkill", kernel_sys_tgkill as usize);
     register_symbol("kernel_sys_wait4", kernel_sys_wait4 as usize);
     register_symbol("kernel_sys_waitid", kernel_sys_waitid as usize);
     register_symbol("kernel_sys_uname", kernel_sys_uname as usize);
@@ -678,5 +770,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 38);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 49);
 }

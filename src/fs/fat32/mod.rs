@@ -18,7 +18,7 @@ pub mod fat;
 
 #[inline]
 fn is_probably_kernel_ptr(addr: usize) -> bool {
-    addr >= 0x4000_0000 && addr < 0x8000_0000
+    crate::mm::is_kernel_mapped_addr(addr)
 }
 
 static FAT32_READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);

@@ -22,6 +22,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// 페이지 크기 (4KB)
 const PAGE_SIZE: usize = 4096;
+const MMIO_DEFAULT_SIZE: usize = PAGE_SIZE;
+const GOLDFISH_RTC_COMPAT: &str = "google,goldfish-rtc";
+const GOLDFISH_RTC_FALLBACK_BASE: usize = 0x0010_1000;
+const VIRTIO_MMIO_COMPAT: &str = "virtio,mmio";
 
 /// Higher-half 커널 베이스 주소
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_FFFF_8000_0000;
@@ -312,23 +316,105 @@ fn create_mapping(ram_start: usize, ram_size: usize) -> Result<PageTableManager,
     }
 
     // 3. MMIO 영역 매핑
-    // UART: 0x1000_0000
-    kprintln!("[MMU] Mapping UART MMIO...");
-    pt_mgr.map_page(0x1000_0000, 0x1000_0000, PageFlags::kernel_rw())?;
+    let uart_base = crate::drivers::config::uart_base();
+    let uart_size = crate::drivers::config::uart_size();
+    kprintln!(
+        "[MMU] Mapping UART MMIO: base={:#x}, size={:#x}",
+        uart_base, uart_size
+    );
+    map_mmio_region(&mut pt_mgr, uart_base, uart_size)?;
 
-    // CLINT: 0x0200_0000
-    kprintln!("[MMU] Mapping CLINT MMIO...");
-    pt_mgr.map_page(0x0200_0000, 0x0200_0000, PageFlags::kernel_rw())?;
+    let (rtc_base, rtc_size) = rtc_region_from_dtb_or_fallback();
+    kprintln!(
+        "[MMU] Mapping RTC MMIO: base={:#x}, size={:#x}",
+        rtc_base, rtc_size
+    );
+    map_mmio_region(&mut pt_mgr, rtc_base, rtc_size)?;
 
-    // PLIC: 0x0C00_0000 - 0x0C20_0000 (여러 페이지)
-    kprintln!("[MMU] Mapping PLIC MMIO...");
-    for offset in (0..0x20_0000).step_by(PAGE_SIZE) {
-        pt_mgr.map_page(0x0C00_0000 + offset, 0x0C00_0000 + offset, PageFlags::kernel_rw())?;
+    let clint_base = crate::drivers::config::clint_base();
+    let clint_size = crate::drivers::config::clint_size();
+    kprintln!(
+        "[MMU] Mapping CLINT MMIO: base={:#x}, size={:#x}",
+        clint_base, clint_size
+    );
+    map_mmio_region(&mut pt_mgr, clint_base, clint_size)?;
+
+    let plic_base = crate::drivers::config::plic_base();
+    let plic_size = crate::drivers::config::plic_size();
+    kprintln!(
+        "[MMU] Mapping PLIC MMIO: base={:#x}, size={:#x}",
+        plic_base, plic_size
+    );
+    map_mmio_region(&mut pt_mgr, plic_base, plic_size)?;
+
+    if let Some(dt) = crate::dtb::get() {
+        for info in dt.find_compatible(VIRTIO_MMIO_COMPAT) {
+            if info.reg_base == 0 {
+                continue;
+            }
+            let base = info.reg_base as usize;
+            let size = if info.reg_size != 0 {
+                info.reg_size as usize
+            } else {
+                MMIO_DEFAULT_SIZE
+            };
+            kprintln!(
+                "[MMU] Mapping VirtIO MMIO (DTB): base={:#x}, size={:#x}",
+                base, size
+            );
+            map_mmio_region(&mut pt_mgr, base, size)?;
+        }
     }
 
     kprintln!("[MMU] Mapping created, root PPN: {:#x}", pt_mgr.root_ppn());
 
     Ok(pt_mgr)
+}
+
+#[inline]
+fn align_down_page(addr: usize) -> usize {
+    addr & !(PAGE_SIZE - 1)
+}
+
+#[inline]
+fn align_up_page(addr: usize) -> usize {
+    (addr.saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1)
+}
+
+fn map_mmio_region(
+    pt_mgr: &mut PageTableManager,
+    base: usize,
+    size: usize,
+) -> Result<(), &'static str> {
+    if base == 0 {
+        return Ok(());
+    }
+    let size = if size == 0 { MMIO_DEFAULT_SIZE } else { size };
+    let start = align_down_page(base);
+    let end = align_up_page(base.saturating_add(size));
+    if end <= start {
+        return Ok(());
+    }
+    for addr in (start..end).step_by(PAGE_SIZE) {
+        pt_mgr.map_page(addr, addr, PageFlags::kernel_rw())?;
+    }
+    Ok(())
+}
+
+fn rtc_region_from_dtb_or_fallback() -> (usize, usize) {
+    if let Some(dt) = crate::dtb::get() {
+        if let Some(info) = dt.find_compatible(GOLDFISH_RTC_COMPAT).into_iter().next() {
+            if info.reg_base != 0 {
+                let size = if info.reg_size != 0 {
+                    info.reg_size as usize
+                } else {
+                    MMIO_DEFAULT_SIZE
+                };
+                return (info.reg_base as usize, size);
+            }
+        }
+    }
+    (GOLDFISH_RTC_FALLBACK_BASE, MMIO_DEFAULT_SIZE)
 }
 
 /// MMU 활성화

@@ -32,6 +32,7 @@ struct BrkRegion {
     base: usize,
     current: usize,
     limit: usize,
+    direct_phys: bool,
     pages: Vec<Option<usize>>,
 }
 
@@ -58,6 +59,7 @@ struct MmapRegion {
     requested_len: usize,
     prot: usize,
     flags: usize,
+    direct_phys: bool,
     pages: Vec<usize>,
     backing: MmapBacking,
 }
@@ -111,6 +113,12 @@ struct ProcessInfo {
     exit_signal: u32,
 }
 
+#[derive(Clone, Copy)]
+struct SignalActionGroup {
+    sighand_group: u64,
+    actions: [LinuxSigAction; MAX_SIGNAL_COUNT],
+}
+
 struct VforkWait {
     parent_tid: proc::Tid,
     child_tid: proc::Tid,
@@ -142,6 +150,27 @@ struct PendingForkChild {
     context: ForkChildContext,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct PendingSigReturnAarch64 {
+    tid: proc::Tid,
+    gpr: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    sp_el0: u64,
+    signal_mask: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy)]
+struct PendingSigReturnRiscv {
+    tid: proc::Tid,
+    gpr: [u64; 32],
+    mstatus: u64,
+    mepc: u64,
+    signal_mask: u64,
+}
+
 /// execve 성공 후 trap 복귀 시 적용할 컨텍스트 전이 정보
 pub struct ExecTransition {
     pub entry: usize,
@@ -161,12 +190,17 @@ static COW_PAGES: Mutex<Vec<CowMeta>> = Mutex::new(Vec::new());
 static FILE_PAGE_CACHE: Mutex<Vec<FilePageCacheEntry>> = Mutex::new(Vec::new());
 static ZOMBIE_CHILDREN: Mutex<Vec<ZombieChild>> = Mutex::new(Vec::new());
 static PROCESS_INFOS: Mutex<Vec<ProcessInfo>> = Mutex::new(Vec::new());
+static SIGNAL_ACTION_GROUPS: Mutex<Vec<SignalActionGroup>> = Mutex::new(Vec::new());
 static VFORK_WAITS: Mutex<Vec<VforkWait>> = Mutex::new(Vec::new());
 static NEXT_FAKE_CHILD_TID: AtomicUsize = AtomicUsize::new(1000);
-static NEXT_RESOURCE_GROUP_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_RESOURCE_GROUP_ID: AtomicUsize = AtomicUsize::new(2);
 static COW_FORK_TEST_REPORTED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 static PENDING_FORK_CHILDREN: Mutex<Vec<PendingForkChild>> = Mutex::new(Vec::new());
+#[cfg(target_arch = "aarch64")]
+static PENDING_SIGRETURN_AARCH64: Mutex<Vec<PendingSigReturnAarch64>> = Mutex::new(Vec::new());
+#[cfg(target_arch = "riscv64")]
+static PENDING_SIGRETURN_RISCV64: Mutex<Vec<PendingSigReturnRiscv>> = Mutex::new(Vec::new());
 
 const BRK_REGION_SIZE: usize = 16 * 1024 * 1024; // 16MB (static BusyBox init baseline)
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -199,13 +233,23 @@ const WNOWAIT: i32 = 0x0100_0000;
 const WAITID_IDTYPE_ALL: i32 = 0;
 const WAITID_IDTYPE_PID: i32 = 1;
 const WAITID_IDTYPE_PGID: i32 = 2;
+const SIGNAL_SIGKILL: u32 = 9;
+const SIGNAL_SIGSEGV: u32 = 11;
 const SIGNAL_SIGCHLD: u32 = 17;
+const SIGNAL_SIGSTOP: u32 = 19;
 const SIGINFO_CLD_EXITED: i32 = 1;
 const SIGINFO_CLD_KILLED: i32 = 2;
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
 const MIN_SIGSET_SIZE: usize = core::mem::size_of::<u64>();
+const MAX_SIGNAL_COUNT: usize = 64;
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+const SA_SIGINFO: u64 = 0x0000_0004;
+const SA_NODEFER: u64 = 0x4000_0000;
+const SA_RESTART: u64 = 0x1000_0000;
+const SIGFRAME_MAGIC: u64 = 0x5349_4746_5241_4d45;
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -223,6 +267,18 @@ const fn align_up(value: usize, align: usize) -> usize {
 #[inline]
 fn page_count_for_len(len: usize, page_size: usize) -> usize {
     align_up(len, page_size) / page_size
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn use_riscv_kernel_direct_vm() -> bool {
+    !super::in_user_syscall_context()
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline]
+fn use_riscv_kernel_direct_vm() -> bool {
+    false
 }
 
 #[inline]
@@ -253,6 +309,26 @@ struct LinuxTimeval {
 struct LinuxTimezone {
     tz_minuteswest: i32,
     tz_dsttime: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSigAction {
+    sa_handler: u64,
+    sa_flags: u64,
+    sa_restorer: u64,
+    sa_mask: u64,
+}
+
+impl LinuxSigAction {
+    const fn empty() -> Self {
+        Self {
+            sa_handler: SIG_DFL,
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -288,31 +364,43 @@ struct LinuxUtsName {
     domainname: [u8; 65],
 }
 
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelSigFrameAarch64 {
+    magic: u64,
+    signum: u64,
+    old_mask: u64,
+    _pad: u64,
+    gpr: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    sp_el0: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelSigFrameRiscv64 {
+    magic: u64,
+    signum: u64,
+    old_mask: u64,
+    _pad: u64,
+    gpr: [u64; 32],
+    mstatus: u64,
+    mepc: u64,
+}
+
 #[inline]
 fn monotonic_time() -> (u64, u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let counter = crate::arch::timer::get_counter();
-        let freq = crate::arch::timer::get_frequency();
-        if freq == 0 {
-            return (0, 0);
-        }
-        let sec = counter / freq;
-        let nsec = (counter % freq) * 1_000_000_000 / freq;
-        (sec, nsec)
-    }
+    let ns = crate::time::monotonic_now_ns();
+    (ns / 1_000_000_000, ns % 1_000_000_000)
+}
 
-    #[cfg(target_arch = "riscv64")]
-    {
-        let counter = crate::arch::timer::get_time();
-        let freq = crate::boards::timer_freq();
-        if freq == 0 {
-            return (0, 0);
-        }
-        let sec = counter / freq;
-        let nsec = (counter % freq) * 1_000_000_000 / freq;
-        (sec, nsec)
-    }
+#[inline]
+fn realtime_time() -> (u64, u64) {
+    let ns = crate::time::realtime_now_ns();
+    (ns / 1_000_000_000, ns % 1_000_000_000)
 }
 
 #[inline]
@@ -504,11 +592,7 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         return pos;
     }
 
-    let default_group = if tid == 0 {
-        next_resource_group_id()
-    } else {
-        tid
-    };
+    let default_group = if tid == 0 { 0 } else { tid };
 
     processes.push(ProcessInfo {
         tid,
@@ -555,6 +639,81 @@ fn process_count_in_vm_group(vm_group: u64) -> usize {
         .iter()
         .filter(|process| process.vm_group == vm_group)
         .count()
+}
+
+fn process_count_in_sighand_group(sighand_group: u64) -> usize {
+    let processes = PROCESS_INFOS.lock();
+    processes
+        .iter()
+        .filter(|process| process.sighand_group == sighand_group)
+        .count()
+}
+
+fn sighand_group_for_tid(tid: proc::Tid) -> u64 {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].sighand_group
+}
+
+fn ensure_signal_action_group_locked(
+    groups: &mut Vec<SignalActionGroup>,
+    sighand_group: u64,
+) -> usize {
+    if let Some(pos) = groups
+        .iter()
+        .position(|group| group.sighand_group == sighand_group)
+    {
+        return pos;
+    }
+    groups.push(SignalActionGroup {
+        sighand_group,
+        actions: [LinuxSigAction::empty(); MAX_SIGNAL_COUNT],
+    });
+    groups.len() - 1
+}
+
+fn signal_action_for_group(sighand_group: u64, signum: u32) -> LinuxSigAction {
+    if signum == 0 || signum > MAX_SIGNAL_COUNT as u32 {
+        return LinuxSigAction::empty();
+    }
+
+    let mut groups = SIGNAL_ACTION_GROUPS.lock();
+    let idx = ensure_signal_action_group_locked(&mut groups, sighand_group);
+    groups[idx].actions[(signum - 1) as usize]
+}
+
+fn set_signal_action_for_group(sighand_group: u64, signum: u32, action: LinuxSigAction) {
+    if signum == 0 || signum > MAX_SIGNAL_COUNT as u32 {
+        return;
+    }
+
+    let mut groups = SIGNAL_ACTION_GROUPS.lock();
+    let idx = ensure_signal_action_group_locked(&mut groups, sighand_group);
+    groups[idx].actions[(signum - 1) as usize] = action;
+}
+
+fn clone_signal_actions_if_needed(parent_group: u64, child_group: u64) {
+    if parent_group == child_group {
+        return;
+    }
+
+    let mut groups = SIGNAL_ACTION_GROUPS.lock();
+    let parent_idx = ensure_signal_action_group_locked(&mut groups, parent_group);
+    let child_idx = ensure_signal_action_group_locked(&mut groups, child_group);
+    groups[child_idx].actions = groups[parent_idx].actions;
+}
+
+fn remove_signal_actions_if_unused(sighand_group: u64) {
+    if process_count_in_sighand_group(sighand_group) != 0 {
+        return;
+    }
+    let mut groups = SIGNAL_ACTION_GROUPS.lock();
+    if let Some(pos) = groups
+        .iter()
+        .position(|group| group.sighand_group == sighand_group)
+    {
+        groups.swap_remove(pos);
+    }
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -635,9 +794,11 @@ fn cleanup_vm_group_resources(vm_group: u64) {
                     continue;
                 };
                 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-                if let Some(root) = root_table {
-                    let va = region.base + idx * page_size;
-                    let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                if !region.direct_phys {
+                    if let Some(root) = root_table {
+                        let va = region.base + idx * page_size;
+                        let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                    }
                 }
                 remove_cow_meta(vm_group, region.base + idx * page_size);
                 unsafe {
@@ -660,8 +821,10 @@ fn cleanup_vm_group_resources(vm_group: u64) {
             for (idx, frame) in region.pages.iter().copied().enumerate() {
                 let va = region.base + idx * page_size;
                 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-                if let Some(root) = root_table {
-                    let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                if !region.direct_phys {
+                    if let Some(root) = root_table {
+                        let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, va);
+                    }
                 }
                 remove_cow_meta(vm_group, va);
                 unsafe {
@@ -1008,13 +1171,32 @@ fn signal_mask_contains(mask: u64, signum: u32) -> bool {
     (mask & signal_to_mask(signum)) != 0
 }
 
+fn signal_is_unmaskable(signum: u32) -> bool {
+    signum == SIGNAL_SIGKILL || signum == SIGNAL_SIGSTOP
+}
+
+fn signal_is_blocked(mask: u64, signum: u32) -> bool {
+    if signal_is_unmaskable(signum) {
+        false
+    } else {
+        signal_mask_contains(mask, signum)
+    }
+}
+
 fn enqueue_signal(tid: proc::Tid, signum: u32) {
     if signal_to_mask(signum) == 0 {
         return;
     }
     let mut processes = PROCESS_INFOS.lock();
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let mask = processes[idx].signal_mask;
     processes[idx].pending_signals.push(signum);
+    let wake_for_signal = !signal_is_blocked(mask, signum);
+    drop(processes);
+
+    if wake_for_signal {
+        let _ = proc::wake_thread_for_signal(tid);
+    }
 }
 
 fn take_pending_signal(tid: proc::Tid, accepted_mask: u64) -> Option<u32> {
@@ -1029,6 +1211,302 @@ fn take_pending_signal(tid: proc::Tid, accepted_mask: u64) -> Option<u32> {
         .iter()
         .position(|&sig| signal_mask_contains(accepted_mask, sig))?;
     Some(processes[idx].pending_signals.remove(pos))
+}
+
+fn has_unmasked_pending_signal(tid: proc::Tid) -> bool {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let mask = processes[idx].signal_mask;
+    processes[idx]
+        .pending_signals
+        .iter()
+        .copied()
+        .any(|signum| !signal_is_blocked(mask, signum))
+}
+
+fn pop_pending_unmasked_signal(tid: proc::Tid) -> Option<u32> {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let mask = processes[idx].signal_mask;
+    let pos = processes[idx]
+        .pending_signals
+        .iter()
+        .position(|&signum| !signal_is_blocked(mask, signum))?;
+    Some(processes[idx].pending_signals.remove(pos))
+}
+
+fn set_signal_mask_for_tid(tid: proc::Tid, mask: u64) {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let unmaskable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
+    processes[idx].signal_mask = mask & !unmaskable;
+}
+
+fn prepare_pending_signal_delivery(tid: proc::Tid) -> Option<(u32, LinuxSigAction, u64)> {
+    loop {
+        let signum = pop_pending_unmasked_signal(tid)?;
+        let sighand_group = sighand_group_for_tid(tid);
+        let action = signal_action_for_group(sighand_group, signum);
+
+        if action.sa_handler == SIG_IGN {
+            continue;
+        }
+        if action.sa_handler == SIG_DFL && signum == SIGNAL_SIGCHLD {
+            continue;
+        }
+
+        let old_mask = {
+            let mut processes = PROCESS_INFOS.lock();
+            let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+            let old = processes[idx].signal_mask;
+            let mut next_mask = old | action.sa_mask;
+            if (action.sa_flags & SA_NODEFER) == 0 {
+                next_mask |= signal_to_mask(signum);
+            }
+            let unmaskable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
+            processes[idx].signal_mask = next_mask & !unmaskable;
+            old
+        };
+
+        if action.sa_handler == SIG_DFL {
+            finalize_exit_by_signal(tid, signum);
+            kprintln!(
+                "[signal] tid={} default action terminate by signal {}",
+                tid,
+                signum
+            );
+            proc::exit();
+        }
+
+        return Some((signum, action, old_mask));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn deliver_pending_signal_aarch64(ctx: &mut crate::arch::exception::ExceptionContext) -> bool {
+    let tid = current_tid_or_zero();
+    let Some((signum, action, old_mask)) = prepare_pending_signal_delivery(tid) else {
+        return false;
+    };
+
+    if action.sa_restorer == 0 {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
+    }
+
+    let mut sp_el0: usize;
+    unsafe {
+        // SAFETY: EL1 예외 컨텍스트에서 현재 EL0 스택 포인터를 읽는다.
+        core::arch::asm!(
+            "mrs {sp}, sp_el0",
+            sp = out(reg) sp_el0,
+            options(nostack, nomem)
+        );
+    }
+
+    let frame_size = core::mem::size_of::<KernelSigFrameAarch64>();
+    let frame_sp = sp_el0.saturating_sub(frame_size) & !0xF;
+    if validate_user_pointer(frame_sp, frame_size).is_err() {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
+    }
+
+    let frame = KernelSigFrameAarch64 {
+        magic: SIGFRAME_MAGIC,
+        signum: signum as u64,
+        old_mask,
+        _pad: 0,
+        gpr: ctx.gpr,
+        elr: ctx.elr,
+        spsr: ctx.spsr,
+        sp_el0: sp_el0 as u64,
+    };
+    unsafe {
+        // SAFETY: 사용자 스택 영역 유효성을 검증한 뒤 sigframe을 기록한다.
+        core::ptr::write_unaligned(frame_sp as *mut KernelSigFrameAarch64, frame);
+        core::arch::asm!(
+            "msr sp_el0, {sp}",
+            sp = in(reg) frame_sp,
+            options(nostack, nomem)
+        );
+    }
+
+    ctx.gpr[0] = signum as u64;
+    ctx.gpr[1] = 0;
+    ctx.gpr[2] = 0;
+    ctx.gpr[30] = action.sa_restorer;
+    ctx.elr = action.sa_handler;
+    true
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn deliver_pending_signal_riscv64(ctx: &mut crate::arch::trap::TrapContext) -> bool {
+    let tid = current_tid_or_zero();
+    let Some((signum, action, old_mask)) = prepare_pending_signal_delivery(tid) else {
+        return false;
+    };
+
+    if action.sa_restorer == 0 {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
+    }
+
+    let user_sp = ctx.gpr[2] as usize;
+    let frame_size = core::mem::size_of::<KernelSigFrameRiscv64>();
+    let frame_sp = user_sp.saturating_sub(frame_size) & !0xF;
+    if validate_user_pointer(frame_sp, frame_size).is_err() {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
+    }
+
+    let frame = KernelSigFrameRiscv64 {
+        magic: SIGFRAME_MAGIC,
+        signum: signum as u64,
+        old_mask,
+        _pad: 0,
+        gpr: ctx.gpr,
+        mstatus: ctx.mstatus,
+        mepc: ctx.mepc,
+    };
+    unsafe {
+        // SAFETY: 사용자 스택 영역 유효성을 검증한 뒤 sigframe을 기록한다.
+        core::ptr::write_unaligned(frame_sp as *mut KernelSigFrameRiscv64, frame);
+    }
+
+    ctx.gpr[10] = signum as u64; // a0
+    ctx.gpr[11] = 0;
+    ctx.gpr[12] = 0;
+    ctx.gpr[1] = action.sa_restorer; // ra
+    ctx.gpr[2] = frame_sp as u64; // sp
+    ctx.mepc = action.sa_handler;
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn sys_rt_sigreturn_aarch64(
+    _gpr: [u64; 31],
+    _elr: u64,
+    _spsr: u64,
+    sp_el0: usize,
+) -> isize {
+    let frame_size = core::mem::size_of::<KernelSigFrameAarch64>();
+    if validate_user_pointer(sp_el0, frame_size).is_err() {
+        return errno::EFAULT;
+    }
+
+    let frame = unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigframe을 읽는다.
+        core::ptr::read_unaligned(sp_el0 as *const KernelSigFrameAarch64)
+    };
+    if frame.magic != SIGFRAME_MAGIC {
+        return errno::EFAULT;
+    }
+
+    let tid = current_tid_or_zero();
+    set_signal_mask_for_tid(tid, frame.old_mask);
+
+    let mut pending = PENDING_SIGRETURN_AARCH64.lock();
+    if let Some(pos) = pending.iter().position(|item| item.tid == tid) {
+        pending.swap_remove(pos);
+    }
+    pending.push(PendingSigReturnAarch64 {
+        tid,
+        gpr: frame.gpr,
+        elr: frame.elr,
+        spsr: frame.spsr,
+        sp_el0: frame.sp_el0,
+        signal_mask: frame.old_mask,
+    });
+    0
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_rt_sigreturn_riscv(
+    gpr: [u64; 32],
+    _mstatus: u64,
+    _mepc: u64,
+) -> isize {
+    let sp = gpr[2] as usize;
+    let frame_size = core::mem::size_of::<KernelSigFrameRiscv64>();
+    if validate_user_pointer(sp, frame_size).is_err() {
+        return errno::EFAULT;
+    }
+
+    let frame = unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigframe을 읽는다.
+        core::ptr::read_unaligned(sp as *const KernelSigFrameRiscv64)
+    };
+    if frame.magic != SIGFRAME_MAGIC {
+        return errno::EFAULT;
+    }
+
+    let tid = current_tid_or_zero();
+    set_signal_mask_for_tid(tid, frame.old_mask);
+
+    let mut pending = PENDING_SIGRETURN_RISCV64.lock();
+    if let Some(pos) = pending.iter().position(|item| item.tid == tid) {
+        pending.swap_remove(pos);
+    }
+    pending.push(PendingSigReturnRiscv {
+        tid,
+        gpr: frame.gpr,
+        mstatus: frame.mstatus,
+        mepc: frame.mepc,
+        signal_mask: frame.old_mask,
+    });
+    0
+}
+
+pub fn sys_rt_sigreturn() -> isize {
+    errno::ENOSYS
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn apply_pending_sigreturn_aarch64(
+    ctx: &mut crate::arch::exception::ExceptionContext,
+) -> bool {
+    let tid = current_tid_or_zero();
+    let mut pending = PENDING_SIGRETURN_AARCH64.lock();
+    let pos = match pending.iter().position(|item| item.tid == tid) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry = pending.swap_remove(pos);
+    drop(pending);
+
+    set_signal_mask_for_tid(tid, entry.signal_mask);
+    ctx.gpr = entry.gpr;
+    ctx.elr = entry.elr;
+    ctx.spsr = entry.spsr;
+    unsafe {
+        // SAFETY: 저장해둔 사용자 스택 포인터를 EL0 복귀 전에 복원한다.
+        core::arch::asm!(
+            "msr sp_el0, {sp}",
+            sp = in(reg) entry.sp_el0 as usize,
+            options(nostack, nomem)
+        );
+    }
+    true
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn apply_pending_sigreturn_riscv64(
+    ctx: &mut crate::arch::trap::TrapContext,
+) -> bool {
+    let tid = current_tid_or_zero();
+    let mut pending = PENDING_SIGRETURN_RISCV64.lock();
+    let pos = match pending.iter().position(|item| item.tid == tid) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry = pending.swap_remove(pos);
+    drop(pending);
+
+    set_signal_mask_for_tid(tid, entry.signal_mask);
+    ctx.gpr = entry.gpr;
+    ctx.mstatus = entry.mstatus;
+    ctx.mepc = entry.mepc;
+    true
 }
 
 fn complete_vfork_wait(child_tid: proc::Tid) {
@@ -1163,10 +1641,9 @@ fn reparent_zombie_children(old_parent_tid: proc::Tid, new_parent_tid: proc::Tid
     moved
 }
 
-fn finalize_exit(tid: proc::Tid, status: i32) {
+fn finalize_exit_with_wait_status(tid: proc::Tid, wait_status: i32) {
     let orphan_reaper = reparent_orphans(tid);
     let reparented_zombies = reparent_zombie_children(tid, orphan_reaper);
-    let wait_status = encode_wait_status_from_exit_code(status);
 
     let (parent_tid, exit_signal, vm_group) = {
         let mut processes = PROCESS_INFOS.lock();
@@ -1202,19 +1679,30 @@ fn finalize_exit(tid: proc::Tid, status: i32) {
     complete_vfork_wait(tid);
 }
 
+fn finalize_exit(tid: proc::Tid, status: i32) {
+    finalize_exit_with_wait_status(tid, encode_wait_status_from_exit_code(status));
+}
+
+fn finalize_exit_by_signal(tid: proc::Tid, signum: u32) {
+    let wait_status = (signum as i32) & 0x7f;
+    finalize_exit_with_wait_status(tid, wait_status);
+}
+
 fn remove_process_info(tid: proc::Tid) {
     let mut processes = PROCESS_INFOS.lock();
-    let removed_vm_group = if let Some(pos) = processes.iter().position(|p| p.tid == tid) {
-        Some(processes.swap_remove(pos).vm_group)
+    let removed = if let Some(pos) = processes.iter().position(|p| p.tid == tid) {
+        let info = processes.swap_remove(pos);
+        Some((info.vm_group, info.sighand_group))
     } else {
         None
     };
     drop(processes);
 
-    if let Some(vm_group) = removed_vm_group {
+    if let Some((vm_group, sighand_group)) = removed {
         if process_count_in_vm_group(vm_group) == 0 {
             cleanup_vm_group_resources(vm_group);
         }
+        remove_signal_actions_if_unused(sighand_group);
     }
 }
 
@@ -1406,13 +1894,53 @@ pub fn sys_set_tid_address(_tidptr: *mut i32) -> isize {
 
 /// sys_rt_sigaction - 시그널 액션 설정
 ///
-/// 10-1C baseline: signal delivery 미구현, 호출 성공으로 처리한다.
+/// sighand_group 단위로 시그널 핸들러를 등록/조회한다.
 pub fn sys_rt_sigaction(
-    _signum: i32,
-    _act: *const u8,
-    _oldact: *mut u8,
-    _sigsetsize: usize,
+    signum: i32,
+    act: *const u8,
+    oldact: *mut u8,
+    sigsetsize: usize,
 ) -> isize {
+    if sigsetsize < MIN_SIGSET_SIZE {
+        return errno::EINVAL;
+    }
+    if signum <= 0 || signum > MAX_SIGNAL_COUNT as i32 {
+        return errno::EINVAL;
+    }
+    if !oldact.is_null() && validate_user_pointer(oldact as usize, core::mem::size_of::<LinuxSigAction>()).is_err() {
+        return errno::EFAULT;
+    }
+    if !act.is_null() && validate_user_pointer(act as usize, core::mem::size_of::<LinuxSigAction>()).is_err() {
+        return errno::EFAULT;
+    }
+
+    let tid = current_tid_or_zero();
+    let sighand_group = sighand_group_for_tid(tid);
+    let sig = signum as u32;
+    let current = signal_action_for_group(sighand_group, sig);
+
+    if !oldact.is_null() {
+        unsafe {
+            // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigaction 구조체를 기록한다.
+            core::ptr::write_unaligned(oldact as *mut LinuxSigAction, current);
+        }
+    }
+
+    if act.is_null() {
+        return 0;
+    }
+
+    if sig == SIGNAL_SIGKILL || sig == SIGNAL_SIGSTOP {
+        return errno::EINVAL;
+    }
+
+    let mut next = unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigaction 구조체를 읽는다.
+        core::ptr::read_unaligned(act as *const LinuxSigAction)
+    };
+    // 현재 단계에서는 핵심 플래그만 유지한다.
+    next.sa_flags &= SA_SIGINFO | SA_NODEFER | SA_RESTART;
+    set_signal_action_for_group(sighand_group, sig, next);
     0
 }
 
@@ -1422,6 +1950,12 @@ pub fn sys_rt_sigaction(
 pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> isize {
     if sigsetsize < MIN_SIGSET_SIZE {
         return errno::EINVAL;
+    }
+    if !oldset.is_null() && validate_user_pointer(oldset as usize, MIN_SIGSET_SIZE).is_err() {
+        return errno::EFAULT;
+    }
+    if !set.is_null() && validate_user_pointer(set as usize, MIN_SIGSET_SIZE).is_err() {
+        return errno::EFAULT;
     }
 
     let tid = current_tid_or_zero();
@@ -1438,10 +1972,11 @@ pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize:
     }
 
     let set_bits = read_user_u64(set);
+    let unmaskable_bits = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
     match how {
-        SIG_BLOCK => processes[idx].signal_mask |= set_bits,
-        SIG_UNBLOCK => processes[idx].signal_mask &= !set_bits,
-        SIG_SETMASK => processes[idx].signal_mask = set_bits,
+        SIG_BLOCK => processes[idx].signal_mask |= set_bits & !unmaskable_bits,
+        SIG_UNBLOCK => processes[idx].signal_mask &= !(set_bits & !unmaskable_bits),
+        SIG_SETMASK => processes[idx].signal_mask = set_bits & !unmaskable_bits,
         _ => return errno::EINVAL,
     }
 
@@ -1450,10 +1985,83 @@ pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize:
 
 /// sys_nanosleep - 지정 시간 대기
 ///
-/// 고해상도 슬립은 아직 미구현이며, 최소 동작으로 yield를 수행한다.
-pub fn sys_nanosleep(_req: *const u8, _rem: *mut u8) -> isize {
-    proc::yield_now();
-    0
+/// timespec 기반 슬립 + EINTR/rem 지원.
+pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
+    if req.is_null() {
+        return errno::EFAULT;
+    }
+    if validate_user_pointer(req as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+        return errno::EFAULT;
+    }
+    if !rem.is_null() && validate_user_pointer(rem as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+        return errno::EFAULT;
+    }
+
+    let req_ts = unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 읽는다.
+        core::ptr::read_unaligned(req as *const LinuxTimespec)
+    };
+    if req_ts.tv_sec < 0 || req_ts.tv_nsec < 0 || req_ts.tv_nsec >= 1_000_000_000 {
+        return errno::EINVAL;
+    }
+
+    let req_ns = (req_ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(req_ts.tv_nsec as u64);
+    if req_ns == 0 {
+        if !rem.is_null() {
+            let zero = LinuxTimespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe {
+                // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
+                core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
+            }
+        }
+        return 0;
+    }
+
+    let tid = current_tid_or_zero();
+    if has_unmasked_pending_signal(tid) {
+        if !rem.is_null() {
+            unsafe {
+                // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
+                core::ptr::write_unaligned(rem as *mut LinuxTimespec, req_ts);
+            }
+        }
+        return errno::EINTR;
+    }
+
+    let start_ns = crate::time::monotonic_now_ns();
+    let deadline_ns = start_ns.saturating_add(req_ns);
+    loop {
+        let now = crate::time::monotonic_now_ns();
+        if now >= deadline_ns {
+            if !rem.is_null() {
+                let zero = LinuxTimespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe {
+                    // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
+                    core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
+                }
+            }
+            return 0;
+        }
+
+        let wake_reason = proc::sleep_current_until(deadline_ns);
+        if wake_reason == proc::SleepWakeReason::Signal && has_unmasked_pending_signal(tid) {
+            if !rem.is_null() {
+                let now2 = crate::time::monotonic_now_ns();
+                let remaining = deadline_ns.saturating_sub(now2);
+                let rem_ts = LinuxTimespec {
+                    tv_sec: (remaining / 1_000_000_000) as i64,
+                    tv_nsec: (remaining % 1_000_000_000) as i64,
+                };
+                unsafe {
+                    // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
+                    core::ptr::write_unaligned(rem as *mut LinuxTimespec, rem_ts);
+                }
+            }
+            return errno::EINTR;
+        }
+    }
 }
 
 /// sys_clock_gettime - 시계 값 조회
@@ -1463,12 +2071,19 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut u8) -> isize {
     if tp.is_null() {
         return errno::EFAULT;
     }
+    if validate_user_pointer(tp as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+        return errno::EFAULT;
+    }
 
     if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
         return errno::EINVAL;
     }
 
-    let (sec, nsec) = monotonic_time();
+    let (sec, nsec) = if clock_id == CLOCK_REALTIME {
+        realtime_time()
+    } else {
+        monotonic_time()
+    };
     let ts = LinuxTimespec {
         tv_sec: sec as i64,
         tv_nsec: nsec as i64,
@@ -1481,13 +2096,40 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut u8) -> isize {
     0
 }
 
+/// sys_clock_getres - 시계 해상도 조회
+pub fn sys_clock_getres(clock_id: i32, tp: *mut u8) -> isize {
+    if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
+        return errno::EINVAL;
+    }
+    if tp.is_null() {
+        return 0;
+    }
+    if validate_user_pointer(tp as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+        return errno::EFAULT;
+    }
+
+    let res_ns = crate::time::clock_res_ns();
+    let ts = LinuxTimespec {
+        tv_sec: (res_ns / 1_000_000_000) as i64,
+        tv_nsec: (res_ns % 1_000_000_000) as i64,
+    };
+    unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
+        core::ptr::write_unaligned(tp as *mut LinuxTimespec, ts);
+    }
+    0
+}
+
 /// sys_gettimeofday - wallclock 시간 조회
 ///
-/// 현재 커널은 RTC가 없으므로 monotonic 시간을 timeval로 변환해 반환한다.
+/// realtime 시간을 timeval로 변환해 반환한다.
 pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
-    let (sec, nsec) = monotonic_time();
+    let (sec, nsec) = realtime_time();
 
     if !tv.is_null() {
+        if validate_user_pointer(tv as usize, core::mem::size_of::<LinuxTimeval>()).is_err() {
+            return errno::EFAULT;
+        }
         let tv_out = LinuxTimeval {
             tv_sec: sec as i64,
             tv_usec: (nsec / 1_000) as i64,
@@ -1499,6 +2141,9 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
     }
 
     if !tz.is_null() {
+        if validate_user_pointer(tz as usize, core::mem::size_of::<LinuxTimezone>()).is_err() {
+            return errno::EFAULT;
+        }
         let tz_out = LinuxTimezone {
             tz_minuteswest: 0,
             tz_dsttime: 0,
@@ -1510,6 +2155,84 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
     }
 
     0
+}
+
+/// sys_kill - 프로세스 시그널 전송
+pub fn sys_kill(pid: isize, sig: i32) -> isize {
+    if sig < 0 || sig > MAX_SIGNAL_COUNT as i32 {
+        return errno::EINVAL;
+    }
+    if pid < 0 {
+        return errno::ESRCH;
+    }
+
+    let target_tid = if pid == 0 {
+        current_tid_or_zero()
+    } else {
+        pid as proc::Tid
+    };
+    let exists = {
+        let mut processes = PROCESS_INFOS.lock();
+        let _ = ensure_process_info_for_tid_locked(&mut processes, current_tid_or_zero());
+        processes.iter().any(|p| p.tid == target_tid)
+    };
+    if !exists {
+        return errno::ESRCH;
+    }
+    if sig != 0 {
+        enqueue_signal(target_tid, sig as u32);
+    }
+    0
+}
+
+/// sys_tkill - 스레드 단위 시그널 전송
+pub fn sys_tkill(tid: isize, sig: i32) -> isize {
+    if sig < 0 || sig > MAX_SIGNAL_COUNT as i32 {
+        return errno::EINVAL;
+    }
+    if tid < 0 {
+        return errno::ESRCH;
+    }
+    let target_tid = if tid == 0 {
+        current_tid_or_zero()
+    } else {
+        tid as proc::Tid
+    };
+    let exists = {
+        let processes = PROCESS_INFOS.lock();
+        processes.iter().any(|p| p.tid == target_tid)
+    };
+    if !exists {
+        return errno::ESRCH;
+    }
+    if sig != 0 {
+        enqueue_signal(target_tid, sig as u32);
+    }
+    0
+}
+
+/// sys_tgkill - 쓰레드 그룹 + 쓰레드 지정 시그널 전송
+pub fn sys_tgkill(tgid: isize, tid: isize, sig: i32) -> isize {
+    if sig < 0 || sig > MAX_SIGNAL_COUNT as i32 {
+        return errno::EINVAL;
+    }
+    if tgid < 0 || tid < 0 {
+        return errno::ESRCH;
+    }
+    let mapped_tgid = if tgid == 0 {
+        current_tid_or_zero() as isize
+    } else {
+        tgid
+    };
+    let mapped_tid = if tid == 0 {
+        current_tid_or_zero() as isize
+    } else {
+        tid
+    };
+    if mapped_tgid != mapped_tid {
+        return errno::ESRCH;
+    }
+    sys_tkill(mapped_tid, sig)
 }
 
 /// sys_rt_sigtimedwait - 지정 시그널 대기
@@ -1628,6 +2351,7 @@ pub fn sys_clone(
             pending_signals: Vec::new(),
             exit_signal,
         });
+        clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
     }
 
     ZOMBIE_CHILDREN.lock().push(ZombieChild {
@@ -1715,6 +2439,7 @@ fn finalize_clone_with_vm_setup(
             pending_signals: Vec::new(),
             exit_signal,
         });
+        clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
 
         (parent_vm_group, child_vm_group)
     };
@@ -1749,21 +2474,23 @@ fn finalize_clone_with_vm_setup(
                         continue;
                     };
                     let _ = crate::mm::page::retain_frame(frame);
-                    let va = region.base + idx * page_size;
-                    if setup_cow_pair(
-                        parent_vm_group,
-                        child_vm_group,
-                        parent_root,
-                        child_root,
-                        va,
-                        frame,
-                        false,
-                    )
-                    .is_err()
-                    {
-                        return errno::ENOMEM;
+                    if !region.direct_phys {
+                        let va = region.base + idx * page_size;
+                        if setup_cow_pair(
+                            parent_vm_group,
+                            child_vm_group,
+                            parent_root,
+                            child_root,
+                            va,
+                            frame,
+                            false,
+                        )
+                        .is_err()
+                        {
+                            return errno::ENOMEM;
+                        }
+                        needs_tlb_flush = true;
                     }
-                    needs_tlb_flush = true;
                 }
                 child_regions.push(cloned);
             }
@@ -1789,7 +2516,7 @@ fn finalize_clone_with_vm_setup(
 
                 for (idx, frame) in region.pages.iter().copied().enumerate() {
                     let _ = crate::mm::page::retain_frame(frame);
-                    if private_mapping && writable {
+                    if !region.direct_phys && private_mapping && writable {
                         let va = region.base + idx * page_size;
                         if setup_cow_pair(
                             parent_vm_group,
@@ -1943,6 +2670,7 @@ pub fn sys_clone_with_user_context(
             pending_signals: Vec::new(),
             exit_signal,
         });
+        clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
 
         (parent_vm_group, child_vm_group)
     };
@@ -1977,21 +2705,23 @@ pub fn sys_clone_with_user_context(
                         continue;
                     };
                     let _ = crate::mm::page::retain_frame(frame);
-                    let va = region.base + idx * page_size;
-                    if setup_cow_pair(
-                        parent_vm_group,
-                        child_vm_group,
-                        parent_root,
-                        child_root,
-                        va,
-                        frame,
-                        false,
-                    )
-                    .is_err()
-                    {
-                        return errno::ENOMEM;
+                    if !region.direct_phys {
+                        let va = region.base + idx * page_size;
+                        if setup_cow_pair(
+                            parent_vm_group,
+                            child_vm_group,
+                            parent_root,
+                            child_root,
+                            va,
+                            frame,
+                            false,
+                        )
+                        .is_err()
+                        {
+                            return errno::ENOMEM;
+                        }
+                        needs_tlb_flush = true;
                     }
-                    needs_tlb_flush = true;
                 }
                 child_regions.push(cloned);
             }
@@ -2017,7 +2747,7 @@ pub fn sys_clone_with_user_context(
 
                 for (idx, frame) in region.pages.iter().copied().enumerate() {
                     let _ = crate::mm::page::retain_frame(frame);
-                    if private_mapping && writable {
+                    if !region.direct_phys && private_mapping && writable {
                         let va = region.base + idx * page_size;
                         if setup_cow_pair(
                             parent_vm_group,
@@ -2377,6 +3107,7 @@ fn unmap_mmap_range_locked(
         let removed: Vec<usize> = regions[i].pages[first_page..first_page + unmap_pages].to_vec();
         let write = (regions[i].prot & PROT_WRITE) != 0;
         let execute = (regions[i].prot & PROT_EXEC) != 0;
+        let direct_phys = regions[i].direct_phys;
 
         if write && matches!(regions[i].backing, MmapBacking::File(_)) {
             if flush_file_region_pages(&regions[i], first_page, unmap_pages).is_err() {
@@ -2384,26 +3115,33 @@ fn unmap_mmap_range_locked(
             }
         }
 
-        let mut unmapped = 0usize;
-        for page in 0..removed.len() {
-            let va = unmap_start + page * page_size;
-            remove_cow_meta(vm_group, va);
-            if crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, va).is_err() {
-                for rolled in 0..unmapped {
-                    let rollback_va = unmap_start + rolled * page_size;
-                    let rollback_pa = removed[rolled];
-                    let _ = crate::arch::mmu::map_user_page_for_root_noflush(
-                        root_table,
-                        rollback_va,
-                        rollback_pa,
-                        write,
-                        execute,
-                    );
+        if !direct_phys {
+            let mut unmapped = 0usize;
+            for page in 0..removed.len() {
+                let va = unmap_start + page * page_size;
+                remove_cow_meta(vm_group, va);
+                if crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, va).is_err() {
+                    for rolled in 0..unmapped {
+                        let rollback_va = unmap_start + rolled * page_size;
+                        let rollback_pa = removed[rolled];
+                        let _ = crate::arch::mmu::map_user_page_for_root_noflush(
+                            root_table,
+                            rollback_va,
+                            rollback_pa,
+                            write,
+                            execute,
+                        );
+                    }
+                    flush_user_tlb();
+                    return Err(errno::EINVAL);
                 }
-                flush_user_tlb();
-                return Err(errno::EINVAL);
+                unmapped += 1;
             }
-            unmapped += 1;
+        } else {
+            for page in 0..removed.len() {
+                let va = unmap_start + page * page_size;
+                remove_cow_meta(vm_group, va);
+            }
         }
 
         for frame in removed.iter() {
@@ -2470,6 +3208,7 @@ fn unmap_mmap_range_locked(
                 .saturating_sub((first_page + unmap_pages) * page_size),
             prot: regions[i].prot,
             flags: regions[i].flags,
+            direct_phys: regions[i].direct_phys,
             pages: right_pages,
             backing: right_backing,
         });
@@ -2515,12 +3254,23 @@ pub fn sys_brk(addr: usize) -> isize {
                 base: phys_base,
                 current: phys_base,
                 limit: phys_base + BRK_REGION_SIZE,
+                direct_phys: true,
                 pages: page_vec,
             });
             regions.len() - 1
         };
 
         let region = &mut regions[idx];
+        if region.direct_phys {
+            if addr == 0 {
+                return region.current as isize;
+            }
+            if addr < region.base || addr > region.limit {
+                return region.current as isize;
+            }
+            region.current = align_up(addr, 16);
+            return region.current as isize;
+        }
         if addr == 0 {
             return region.current as isize;
         }
@@ -2533,6 +3283,44 @@ pub fn sys_brk(addr: usize) -> isize {
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
+        #[cfg(target_arch = "riscv64")]
+        if use_riscv_kernel_direct_vm() {
+            let mut regions = BRK_REGIONS.lock();
+            let idx = if let Some(pos) = regions.iter().position(|r| r.vm_group == vm_group) {
+                pos
+            } else {
+                let pages = BRK_REGION_SIZE / page_size;
+                let phys_base = match crate::mm::page::alloc_frames(pages) {
+                    Some(v) => v,
+                    None => return errno::ENOMEM,
+                };
+                let mut page_vec = Vec::new();
+                page_vec.resize(pages, None);
+                for (i, slot) in page_vec.iter_mut().enumerate() {
+                    *slot = Some(phys_base + i * page_size);
+                }
+                regions.push(BrkRegion {
+                    vm_group,
+                    base: phys_base,
+                    current: phys_base,
+                    limit: phys_base + BRK_REGION_SIZE,
+                    direct_phys: true,
+                    pages: page_vec,
+                });
+                regions.len() - 1
+            };
+
+            let region = &mut regions[idx];
+            if addr == 0 {
+                return region.current as isize;
+            }
+            if addr < region.base || addr > region.limit {
+                return region.current as isize;
+            }
+            region.current = align_up(addr, 16);
+            return region.current as isize;
+        }
+
         let root_table = vm_root_for_group(vm_group);
         let mut regions = BRK_REGIONS.lock();
         let idx = if let Some(pos) = regions.iter().position(|r| r.vm_group == vm_group) {
@@ -2549,6 +3337,7 @@ pub fn sys_brk(addr: usize) -> isize {
                 base,
                 current: base,
                 limit: base + BRK_REGION_SIZE,
+                direct_phys: false,
                 pages: page_vec,
             });
             regions.len() - 1
@@ -2716,6 +3505,7 @@ pub fn sys_mmap(
             requested_len: len,
             prot,
             flags,
+            direct_phys: true,
             pages: page_vec,
             backing: MmapBacking::Anonymous,
         });
@@ -2724,6 +3514,76 @@ pub fn sys_mmap(
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
+        #[cfg(target_arch = "riscv64")]
+        if use_riscv_kernel_direct_vm() {
+            if !anonymous {
+                if fd < 0 {
+                    return errno::EBADF;
+                }
+                return errno::ENOSYS;
+            }
+            if fd != -1 || offset != 0 {
+                return errno::EINVAL;
+            }
+
+            let mut regions = MMAP_REGIONS.lock();
+
+            if flags & MAP_FIXED != 0 {
+                if addr == 0 || addr & (page_size - 1) != 0 {
+                    return errno::EINVAL;
+                }
+                let end = match addr.checked_add(size) {
+                    Some(v) => v,
+                    None => return errno::ENOMEM,
+                };
+                if addr < MIN_USER_VADDR || end > MMAP_REGION_END {
+                    return errno::ENOMEM;
+                }
+
+                if let Some(region) = regions.iter_mut().find(|region| {
+                    region.vm_group == vm_group
+                        && region.direct_phys
+                        && region.base == addr
+                        && region.len == size
+                }) {
+                    for frame in region.pages.iter().copied() {
+                        unsafe {
+                            // SAFETY: direct_phys anonymous mmap 프레임은 4KB 페이지 단위로 zero-fill 가능하다.
+                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        }
+                    }
+                    region.prot = prot;
+                    region.flags = flags;
+                    region.requested_len = len;
+                    return addr as isize;
+                }
+
+                return errno::ENOMEM;
+            }
+
+            let phys = match crate::mm::page::alloc_frames(pages) {
+                Some(v) => v,
+                None => return errno::ENOMEM,
+            };
+            let mut page_vec = Vec::new();
+            page_vec.reserve(pages);
+            for i in 0..pages {
+                page_vec.push(phys + i * page_size);
+            }
+            regions.push(MmapRegion {
+                vm_group,
+                base: phys,
+                len: size,
+                requested_len: len,
+                prot,
+                flags,
+                direct_phys: true,
+                pages: page_vec,
+                backing: MmapBacking::Anonymous,
+            });
+            return phys as isize;
+        }
+
         let root_table = vm_root_for_group(vm_group);
         let file_backing = if anonymous {
             if fd != -1 || offset != 0 {
@@ -2899,6 +3759,7 @@ pub fn sys_mmap(
             requested_len: len,
             prot,
             flags,
+            direct_phys: false,
             pages: mapped_pages,
             backing,
         });
@@ -3028,12 +3889,14 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
             let start_page = (cursor - regions[idx].base) / page_size;
             for page in 0..pages {
                 let va = cursor + page * page_size;
-                if crate::arch::mmu::update_user_page_flags_for_root_noflush(
-                    root_table, va, map_write, execute,
-                )
-                .is_err()
-                {
-                    return errno::EINVAL;
+                if !regions[idx].direct_phys {
+                    if crate::arch::mmu::update_user_page_flags_for_root_noflush(
+                        root_table, va, map_write, execute,
+                    )
+                    .is_err()
+                    {
+                        return errno::EINVAL;
+                    }
                 }
 
                 if force_cow_ro {

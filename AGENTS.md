@@ -367,6 +367,7 @@ kerners/
 │   │   │   ├── exception.rs # Exception handling
 │   │   │   ├── gic.rs       # GIC (interrupt controller)
 │   │   │   ├── mmu.rs       # Memory management unit
+│   │   │   ├── rtc.rs       # PL031 RTC driver
 │   │   │   ├── timer.rs     # Timer driver
 │   │   │   └── uart.rs      # UART driver
 │   │   └── riscv64/         # RISC-V 64 implementation
@@ -374,8 +375,11 @@ kerners/
 │   │       ├── trap.rs      # Trap handling
 │   │       ├── plic.rs      # PLIC (interrupt controller)
 │   │       ├── mmu.rs       # Memory management unit
+│   │       ├── rtc.rs       # Goldfish RTC driver
 │   │       ├── timer.rs     # Timer driver
 │   │       └── uart.rs      # UART driver
+│   ├── time/                # Time core (monotonic/realtime/resolution)
+│   │   └── mod.rs           # RTC offset + clock helpers
 │   ├── mm/                  # Memory management
 │   │   ├── mod.rs           # Memory subsystem
 │   │   ├── heap.rs          # Heap allocator (linked_list_allocator)
@@ -434,6 +438,7 @@ kerners/
 ├── modules/test_fork/       # fork/waitid/uname compatibility test module
 ├── modules/test_brk/        # brk grow/shrink regression test module
 ├── modules/test_mmap/       # mmap/munmap/mprotect regression test module
+├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep regression test module
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files

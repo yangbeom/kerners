@@ -58,8 +58,8 @@ pub fn schedule() {
             Some(idx) => idx,
             None => {
                 if let Some(thread) = threads.get_mut(current_idx) {
-                    if thread.state == ThreadState::Terminated {
-                        // 종료된 스레드 → 이 CPU의 idle 스레드로 전환
+                    if thread.state == ThreadState::Terminated || thread.state == ThreadState::Blocked {
+                        // 종료/블록된 스레드 → 이 CPU의 idle 스레드로 전환
                         let idle_idx = pc.idle_thread_idx.load(Ordering::Relaxed) as usize;
                         if idle_idx < threads.len() {
                             idle_idx

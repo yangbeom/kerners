@@ -9,6 +9,7 @@ pub mod page;
 pub mod heap;
 
 use crate::kprintln;
+use crate::sync::RwLock;
 
 /// 메모리 영역 정보
 #[derive(Debug, Clone, Copy)]
@@ -19,7 +20,7 @@ pub struct MemoryRegion {
 }
 
 /// 커널 메모리 레이아웃
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct KernelMemoryLayout {
     /// 커널 코드/데이터 시작 (링커 스크립트 기준)
     pub kernel_start: usize,
@@ -38,6 +39,8 @@ pub struct KernelMemoryLayout {
     /// 페이지 프레임 할당 영역 크기
     pub frame_alloc_size: usize,
 }
+
+static KERNEL_LAYOUT: RwLock<Option<KernelMemoryLayout>> = RwLock::new(None);
 
 impl KernelMemoryLayout {
     pub fn dump(&self) {
@@ -110,13 +113,47 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<KernelMemoryLayout, &'s
     
     // 페이지 프레임 할당 영역: 힙 이후 ~ RAM 끝 (DTB 영역 제외)
     // DTB는 RAM 끝에서 2MB 전에 위치하므로 4MB 여유 확보
-    let frame_alloc_start = (heap_end + 0xFFF) & !0xFFF;
-    let reserved_at_end = 4 * 1024 * 1024; // 4MB 예약 (DTB 등)
-    let frame_alloc_end = if ram_end > reserved_at_end {
-        ram_end - reserved_at_end
+    let mut frame_alloc_start = (heap_end + 0xFFF) & !0xFFF;
+    let mut frame_alloc_end = ram_end;
+
+    // DTB blob의 실제 위치/크기를 반영해 프레임 풀을 조정한다.
+    if let Some((dtb_base, dtb_size)) = crate::dtb::blob_range() {
+        let dtb_start = dtb_base & !0xFFF;
+        let dtb_end = (dtb_base.saturating_add(dtb_size).saturating_add(0xFFF)) & !0xFFF;
+
+        // DTB가 현재 RAM/프레임 풀 후보 구간에 걸쳐 있으면 풀 범위를 잘라낸다.
+        if dtb_start < ram_end && dtb_end > ram_start {
+            if dtb_start <= frame_alloc_start && dtb_end > frame_alloc_start {
+                frame_alloc_start = core::cmp::min(dtb_end, ram_end);
+                kprintln!(
+                    "[MM] DTB reservation overlap at frame start: [{:#x}, {:#x})",
+                    dtb_start,
+                    dtb_end
+                );
+            } else if dtb_start > frame_alloc_start && dtb_start < frame_alloc_end {
+                frame_alloc_end = dtb_start;
+                kprintln!(
+                    "[MM] DTB reservation trims frame pool end: [{:#x}, {:#x})",
+                    dtb_start,
+                    dtb_end
+                );
+            } else {
+                kprintln!(
+                    "[MM] DTB blob in RAM: [{:#x}, {:#x}) (no frame pool overlap)",
+                    dtb_start,
+                    dtb_end
+                );
+            }
+        }
     } else {
-        ram_end
-    };
+        // DTB 정보를 얻지 못한 경우에는 기존 보수 정책을 폴백으로 유지한다.
+        let reserved_at_end = 4 * 1024 * 1024;
+        frame_alloc_end = frame_alloc_end.saturating_sub(reserved_at_end);
+        kprintln!(
+            "[MM] DTB range unavailable, reserving fallback tail region: {} MB",
+            reserved_at_end / (1024 * 1024)
+        );
+    }
     
     let frame_alloc_size = if frame_alloc_end > frame_alloc_start {
         frame_alloc_end - frame_alloc_start
@@ -134,6 +171,11 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<KernelMemoryLayout, &'s
         frame_alloc_start,
         frame_alloc_size,
     };
+
+    {
+        let mut guard = KERNEL_LAYOUT.write();
+        *guard = Some(layout);
+    }
     
     layout.dump();
     
@@ -150,4 +192,37 @@ pub fn init(ram_start: usize, ram_size: usize) -> Result<KernelMemoryLayout, &'s
     kprintln!("[MM] Memory management initialized successfully");
     
     Ok(layout)
+}
+
+/// 런타임 커널 메모리 레이아웃 조회
+pub fn layout() -> Option<KernelMemoryLayout> {
+    *KERNEL_LAYOUT.read()
+}
+
+/// 런타임 RAM 범위 조회
+pub fn ram_range() -> Option<(usize, usize)> {
+    layout().map(|l| (l.ram_start, l.ram_start.saturating_add(l.ram_size)))
+}
+
+/// 주소가 런타임 RAM/커널 매핑 범위 안인지 확인
+pub fn is_kernel_mapped_addr(addr: usize) -> bool {
+    let Some(layout) = layout() else {
+        return false;
+    };
+
+    let ram_end = layout.ram_start.saturating_add(layout.ram_size);
+    if addr >= layout.ram_start && addr < ram_end {
+        return true;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        let kernel_virt_base = crate::arch::mmu::KERNEL_VIRT_BASE;
+        let kernel_virt_end = kernel_virt_base.saturating_add(layout.ram_size);
+        if addr >= kernel_virt_base && addr < kernel_virt_end {
+            return true;
+        }
+    }
+
+    false
 }

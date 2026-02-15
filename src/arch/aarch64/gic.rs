@@ -33,6 +33,16 @@ fn gicc_base() -> usize {
     }
 }
 
+#[inline]
+fn timer_irq() -> u32 {
+    crate::drivers::config::timer_irq()
+}
+
+#[inline]
+fn uart_irq() -> u32 {
+    crate::drivers::config::uart_irq()
+}
+
 /// Distributor 레지스터 오프셋
 const GICD_CTLR: usize = 0x000;        // Distributor Control
 const GICD_TYPER: usize = 0x004;       // Interrupt Controller Type
@@ -46,12 +56,6 @@ const GICC_CTLR: usize = 0x000;        // CPU Interface Control
 const GICC_PMR: usize = 0x004;         // Interrupt Priority Mask
 const GICC_IAR: usize = 0x00C;         // Interrupt Acknowledge
 const GICC_EOIR: usize = 0x010;        // End of Interrupt
-
-/// Physical Timer IRQ 번호 (QEMU virt)
-pub const IRQ_PHYS_TIMER: u32 = 30;
-
-/// UART IRQ 번호 (QEMU virt)
-pub const IRQ_UART: u32 = 33;
 
 /// GIC 레지스터 읽기
 #[inline]
@@ -127,6 +131,9 @@ pub fn init() -> Result<(), &'static str> {
     kprintln!("\n[GIC] Initializing GICv2...");
     
     unsafe {
+        let timer_irq = timer_irq();
+        let uart_irq = uart_irq();
+
         // 1. Distributor 정보 확인
         let typer = gicd_read(GICD_TYPER);
         let it_lines_number = typer & 0x1F;
@@ -142,16 +149,17 @@ pub fn init() -> Result<(), &'static str> {
         // 4. Priority Mask 설정 (모든 우선순위 허용)
         gicc_write(GICC_PMR, 0xFF);
         
-        // 5. Physical Timer IRQ는 현재 비활성화
-        // TODO: 커널 선점/IRQ 경로 안정화 후 재활성화
-        kprintln!("[GIC] Physical Timer IRQ {} disabled (temporary)", IRQ_PHYS_TIMER);
-        
+        // 5. Physical Timer IRQ 설정
+        set_priority(timer_irq, 0x80);
+        enable_irq(timer_irq);
+        kprintln!("[GIC] Physical Timer IRQ {} enabled", timer_irq);
+
         // 6. UART IRQ 설정
-        set_priority(IRQ_UART, 0x80);       // 높은 우선순위
-        set_target(IRQ_UART, 1);            // CPU 0에 전달
-        enable_irq(IRQ_UART);
+        set_priority(uart_irq, 0x80);       // 높은 우선순위
+        set_target(uart_irq, 1);            // CPU 0에 전달
+        enable_irq(uart_irq);
         
-        kprintln!("[GIC] UART IRQ {} enabled", IRQ_UART);
+        kprintln!("[GIC] UART IRQ {} enabled", uart_irq);
     }
     
     kprintln!("[GIC] GICv2 initialized");
@@ -193,6 +201,8 @@ pub const SGI_RESCHEDULE: u32 = 0;
 /// IRQ 핸들러에서 호출
 pub fn handle_irq() {
     unsafe {
+        let timer_irq = timer_irq();
+        let uart_irq = uart_irq();
         let irq = ack_irq();
         let irq_num = irq & 0x3FF; // 하위 10비트가 IRQ 번호
 
@@ -209,11 +219,11 @@ pub fn handle_irq() {
             }
         }
         // 타이머 인터럽트인 경우
-        else if irq_num == IRQ_PHYS_TIMER {
+        else if irq_num == timer_irq {
             super::timer::handle_irq();
         }
         // UART 인터럽트인 경우
-        else if irq_num == IRQ_UART {
+        else if irq_num == uart_irq {
             super::uart::handle_irq();
         }
         // VirtIO 디바이스 인터럽트

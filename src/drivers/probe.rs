@@ -57,9 +57,11 @@ pub fn probe_platform() -> PlatformConfig {
 fn probe_gic(dt: Option<&DeviceTree>) -> InterruptControllerConfig {
     if let Some(info) = dt.and_then(|d| d.find_gic()) {
         crate::kprintln!(
-            "[probe] GIC found via DTB: GICD={:#x}, GICC={:#x}, version={:?}",
+            "[probe] GIC found via DTB: GICD={:#x}({:#x}), GICC={:#x}({:#x}), version={:?}",
             info.distributor_base,
+            info.distributor_size,
             info.cpu_interface_base,
+            info.cpu_interface_size,
             info.version
         );
 
@@ -70,8 +72,11 @@ fn probe_gic(dt: Option<&DeviceTree>) -> InterruptControllerConfig {
 
         InterruptControllerConfig::Gic(GicConfig {
             distributor_base: info.distributor_base as usize,
+            distributor_size: info.distributor_size as usize,
             cpu_interface_base: info.cpu_interface_base as usize,
+            cpu_interface_size: info.cpu_interface_size as usize,
             redistributor_base: info.redistributor_base.map(|b| b as usize),
+            redistributor_size: info.redistributor_size.map(|s| s as usize),
             version,
         })
     } else {
@@ -84,8 +89,11 @@ fn probe_gic(dt: Option<&DeviceTree>) -> InterruptControllerConfig {
 
         InterruptControllerConfig::Gic(GicConfig {
             distributor_base: CurrentBoard::GICD_BASE,
+            distributor_size: 0x1_0000,
             cpu_interface_base: CurrentBoard::GICC_BASE,
+            cpu_interface_size: 0x1_0000,
             redistributor_base: None,
+            redistributor_size: None,
             version: GicVersion::V2,
         })
     }
@@ -208,24 +216,35 @@ fn probe_timer(dt: Option<&DeviceTree>) -> TimerConfig {
             freq
         );
 
+        let irq = dt
+            .and_then(find_arm_timer_irq)
+            .unwrap_or_else(boards::timer_irq);
+
+        crate::kprintln!("[probe] ARM Generic Timer IRQ: {}", irq);
+
         TimerConfig {
             timer_type: TimerType::ArmGenericTimer,
             frequency: freq,
-            irq: boards::timer_irq(), // Physical Timer PPI
+            irq,
         }
     }
 
     #[cfg(target_arch = "riscv64")]
     {
-        // RISC-V CLINT 타이머
-        // 주파수는 DTB의 /cpus/timebase-frequency에 있을 수 있지만,
-        // 대부분 하드코딩 필요
-        let freq = CurrentBoard::TIMER_FREQ;
-
-        crate::kprintln!(
-            "[probe] RISC-V CLINT Timer: freq={}Hz (from BoardConfig)",
-            freq
-        );
+        // RISC-V CLINT 타이머: /cpus/timebase-frequency 우선, 보드 폴백
+        let dtb_freq = dt.and_then(|d| d.get_timebase_frequency());
+        let freq = dtb_freq.unwrap_or(CurrentBoard::TIMER_FREQ);
+        if dtb_freq.is_some() {
+            crate::kprintln!(
+                "[probe] RISC-V CLINT Timer: freq={}Hz (from DTB /cpus/timebase-frequency)",
+                freq
+            );
+        } else {
+            crate::kprintln!(
+                "[probe] RISC-V CLINT Timer: freq={}Hz (from BoardConfig fallback)",
+                freq
+            );
+        }
 
         TimerConfig {
             timer_type: TimerType::RiscvClint,
@@ -242,4 +261,34 @@ fn probe_timer(dt: Option<&DeviceTree>) -> TimerConfig {
             irq: 0,
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn find_arm_timer_irq(dt: &DeviceTree) -> Option<u32> {
+    let timer = dt.find_compatible("arm,armv8-timer").into_iter().next()?;
+
+    // GIC interrupt specifier: <type irq flags>
+    // type: 0 = SPI(+32), 1 = PPI(+16)
+    let decode = |cells: &[u32]| -> Option<u32> {
+        if cells.len() < 2 {
+            return None;
+        }
+        let irq_type = cells[0];
+        let irq_num = cells[1];
+        Some(match irq_type {
+            0 => irq_num.saturating_add(32),
+            1 => irq_num.saturating_add(16),
+            _ => irq_num,
+        })
+    };
+
+    // ARM generic timer는 보통 4개의 인터럽트 엔트리를 가진다.
+    // non-secure physical timer(PPI 14)를 우선 선택한다.
+    for chunk in timer.interrupts.chunks(3) {
+        if chunk.len() >= 2 && chunk[0] == 1 && chunk[1] == 14 {
+            return decode(chunk);
+        }
+    }
+
+    timer.interrupts.chunks(3).find_map(decode)
 }

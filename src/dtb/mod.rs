@@ -105,6 +105,21 @@ pub enum DtbError {
 }
 
 impl DeviceTree {
+    /// DTB blob 시작 주소 반환
+    pub fn base_addr(&self) -> usize {
+        self.base
+    }
+
+    /// DTB blob 크기 반환
+    pub fn total_size(&self) -> usize {
+        self.header.totalsize as usize
+    }
+
+    /// DTB blob 범위 반환 (base, size)
+    pub fn blob_range(&self) -> (usize, usize) {
+        (self.base_addr(), self.total_size())
+    }
+
     /// DTB 주소에서 DeviceTree 생성
     ///
     /// # Safety
@@ -184,6 +199,11 @@ impl DeviceTree {
     /// 메모리 영역 찾기 (/memory 노드의 reg 프로퍼티)
     pub fn get_memory(&self) -> Result<MemoryRegion, DtbError> {
         unsafe { self.find_memory_region() }
+    }
+
+    /// `/cpus/timebase-frequency` 값 반환 (RISC-V)
+    pub fn get_timebase_frequency(&self) -> Option<u64> {
+        unsafe { self.find_timebase_frequency() }
     }
 
     /// /memory 노드에서 메모리 정보 추출
@@ -269,6 +289,79 @@ impl DeviceTree {
             }
 
             Err(DtbError::NodeNotFound)
+        }
+    }
+
+    /// `/cpus/timebase-frequency` 속성 파싱
+    unsafe fn find_timebase_frequency(&self) -> Option<u64> {
+        unsafe {
+            let struct_base = self.struct_base();
+            let mut offset = 0usize;
+            let mut depth = 0i32;
+            let mut cpus_depth: Option<i32> = None;
+
+            loop {
+                let token_ptr = (struct_base + offset) as *const u32;
+                let token = u32::from_be(token_ptr.read_volatile());
+                offset += 4;
+
+                match token {
+                    FDT_BEGIN_NODE => {
+                        let name_ptr = (struct_base + offset) as *const u8;
+                        let name = self.read_cstring(name_ptr);
+                        let name_len = name.len() + 1;
+                        offset = Self::align4(offset + name_len);
+
+                        depth += 1;
+                        if depth == 2 && name == "cpus" {
+                            cpus_depth = Some(depth);
+                        }
+                    }
+                    FDT_END_NODE => {
+                        if cpus_depth == Some(depth) {
+                            cpus_depth = None;
+                        }
+                        depth -= 1;
+                    }
+                    FDT_PROP => {
+                        let len =
+                            u32::from_be(((struct_base + offset) as *const u32).read_volatile());
+                        offset += 4;
+                        let nameoff =
+                            u32::from_be(((struct_base + offset) as *const u32).read_volatile());
+                        offset += 4;
+
+                        let prop_name = self.get_string(nameoff);
+                        let prop_data = (struct_base + offset) as *const u8;
+
+                        if cpus_depth == Some(depth) && prop_name == "timebase-frequency" {
+                            let value = match len {
+                                4 => {
+                                    u32::from_be((prop_data as *const u32).read_volatile()) as u64
+                                }
+                                8 => {
+                                    let hi =
+                                        u32::from_be((prop_data as *const u32).read_volatile())
+                                            as u64;
+                                    let lo = u32::from_be(
+                                        (prop_data as *const u32).add(1).read_volatile(),
+                                    ) as u64;
+                                    (hi << 32) | lo
+                                }
+                                _ => 0,
+                            };
+                            if value != 0 {
+                                return Some(value);
+                            }
+                        }
+
+                        offset = Self::align4(offset + len as usize);
+                    }
+                    FDT_NOP => {}
+                    FDT_END => return None,
+                    _ => return None,
+                }
+            }
         }
     }
 
@@ -546,8 +639,15 @@ impl DeviceTree {
 
                 return Some(GicInfo {
                     distributor_base: info.reg_base,
+                    distributor_size: info.reg_size,
                     cpu_interface_base,
+                    cpu_interface_size: info.reg_extra.first().map(|(_, s)| *s).unwrap_or(0),
                     redistributor_base,
+                    redistributor_size: if version == GicVersion::V3 {
+                        info.reg_extra.get(1).map(|(_, s)| *s)
+                    } else {
+                        None
+                    },
                     version,
                 });
             }
@@ -725,8 +825,11 @@ impl DeviceTree {
 #[derive(Debug, Clone)]
 pub struct GicInfo {
     pub distributor_base: u64,
+    pub distributor_size: u64,
     pub cpu_interface_base: u64,
+    pub cpu_interface_size: u64,
     pub redistributor_base: Option<u64>,
+    pub redistributor_size: Option<u64>,
     pub version: GicVersion,
 }
 
@@ -843,4 +946,9 @@ pub unsafe fn init_scan(ram_start: usize, ram_size: usize) -> Result<(), DtbErro
 /// 전역 DTB 참조 얻기
 pub fn get() -> Option<&'static DeviceTree> {
     unsafe { (*DTB_HOLDER.inner.get()).as_ref() }
+}
+
+/// 전역 DTB blob 범위 반환 (base, size)
+pub fn blob_range() -> Option<(usize, usize)> {
+    get().map(|dt| dt.blob_range())
 }

@@ -22,6 +22,11 @@ fn plic_base() -> usize {
     }
 }
 
+#[inline]
+fn uart_irq() -> u32 {
+    crate::drivers::config::uart_irq()
+}
+
 /// Priority 레지스터 베이스 오프셋
 const PLIC_PRIORITY_OFFSET: usize = 0x0;
 
@@ -33,9 +38,6 @@ const PLIC_THRESHOLD_OFFSET: usize = 0x20_0000;
 
 /// Claim/Complete 레지스터 오프셋 (Context 0)
 const PLIC_CLAIM_OFFSET: usize = 0x20_0004;
-
-/// UART IRQ 번호 (QEMU virt)
-pub const IRQ_UART: u32 = 10;
 
 /// 인터럽트 우선순위 설정
 pub unsafe fn set_priority(irq: u32, priority: u32) {
@@ -77,14 +79,15 @@ pub fn init() -> Result<(), &'static str> {
     kprintln!("\n[PLIC] Initializing PLIC...");
     
     unsafe {
+        let uart_irq = uart_irq();
         // Threshold 설정 (0 = 모든 우선순위 허용)
         set_threshold(0);
         
         // UART 인터럽트 설정
-        set_priority(IRQ_UART, 1);
-        enable_irq(IRQ_UART);
+        set_priority(uart_irq, 1);
+        enable_irq(uart_irq);
         
-        kprintln!("[PLIC] UART IRQ {} enabled", IRQ_UART);
+        kprintln!("[PLIC] UART IRQ {} enabled", uart_irq);
         
         // MIE에서 외부 인터럽트 + 소프트웨어 인터럽트(IPI) 활성화
         core::arch::asm!(
@@ -105,14 +108,15 @@ pub fn init_secondary(hart_id: u32) {
     let context = (hart_id as usize) * 2; // M-mode context
 
     unsafe {
+        let uart_irq = uart_irq();
         // Per-context threshold 설정
         let threshold_addr = plic_base() + 0x20_0000 + context * 0x1000;
         write_volatile(threshold_addr as *mut u32, 0);
 
         // Per-context enable 레지스터에서 UART IRQ 활성화
         let enable_base = plic_base() + 0x2000 + context * 0x80;
-        let reg_idx = (IRQ_UART / 32) as usize;
-        let bit_idx = IRQ_UART % 32;
+        let reg_idx = (uart_irq / 32) as usize;
+        let bit_idx = uart_irq % 32;
         let enable_addr = enable_base + reg_idx * 4;
         let mut val = read_volatile(enable_addr as *const u32);
         val |= 1 << bit_idx;
@@ -129,13 +133,14 @@ pub fn init_secondary(hart_id: u32) {
 /// 외부 인터럽트 핸들러
 pub fn handle_irq() {
     unsafe {
+        let uart_irq = uart_irq();
         let irq = claim_irq();
 
         if irq == 0 {
             return; // spurious interrupt
         }
 
-        if irq == IRQ_UART {
+        if irq == uart_irq {
             super::uart::handle_irq();
         } else if crate::virtio::irq::handle_virtio_irq(irq) {
             // VirtIO 디바이스가 처리함

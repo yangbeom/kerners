@@ -1,6 +1,7 @@
 pub mod exception;
 pub mod gic;
 pub mod mmu;
+pub mod rtc;
 pub mod timer;
 pub mod uart;
 

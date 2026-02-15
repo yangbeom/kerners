@@ -7,6 +7,11 @@ mod fs;
 mod process;
 
 use crate::kprintln;
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(target_arch = "riscv64")]
+static USER_SYSCALL_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // Linux AArch64/RISC-V 시스템 콜 번호 (asm-generic)
@@ -57,6 +62,9 @@ pub const SYS_NEWFSTATAT: usize = 79;
 /// clock_gettime(clockid, tp) -> int
 pub const SYS_CLOCK_GETTIME: usize = 113;
 
+/// clock_getres(clockid, tp) -> int
+pub const SYS_CLOCK_GETRES: usize = 114;
+
 /// gettimeofday(tv, tz) -> int
 pub const SYS_GETTIMEOFDAY: usize = 169;
 
@@ -71,6 +79,15 @@ pub const SYS_WAITID: usize = 95;
 
 /// sched_yield() -> int
 pub const SYS_SCHED_YIELD: usize = 124;
+
+/// kill(pid, sig) -> int
+pub const SYS_KILL: usize = 129;
+
+/// tkill(tid, sig) -> int
+pub const SYS_TKILL: usize = 130;
+
+/// tgkill(tgid, tid, sig) -> int
+pub const SYS_TGKILL: usize = 131;
 
 /// getpid() -> pid_t
 pub const SYS_GETPID: usize = 172;
@@ -110,6 +127,9 @@ pub const SYS_RT_SIGPROCMASK: usize = 135;
 
 /// rt_sigtimedwait(set, info, timeout, sigsetsize) -> int
 pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
+
+/// rt_sigreturn() -> int
+pub const SYS_RT_SIGRETURN: usize = 139;
 
 /// setgid(gid) -> int
 pub const SYS_SETGID: usize = 144;
@@ -208,6 +228,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[3] as usize,
         ),
         SYS_CLOCK_GETTIME => process::sys_clock_gettime(args[0] as i32, args[1] as *mut u8),
+        SYS_CLOCK_GETRES => process::sys_clock_getres(args[0] as i32, args[1] as *mut u8),
         SYS_GETTIMEOFDAY => process::sys_gettimeofday(args[0] as *mut u8, args[1] as *mut u8),
         SYS_EXIT => process::sys_exit(args[0] as i32),
         SYS_EXIT_GROUP => process::sys_exit(args[0] as i32),
@@ -219,6 +240,9 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[4] as *mut u8,
         ),
         SYS_SCHED_YIELD => process::sys_yield(),
+        SYS_KILL => process::sys_kill(args[0] as isize, args[1] as i32),
+        SYS_TKILL => process::sys_tkill(args[0] as isize, args[1] as i32),
+        SYS_TGKILL => process::sys_tgkill(args[0] as isize, args[1] as isize, args[2] as i32),
         SYS_GETPID => process::sys_getpid(),
         SYS_GETPPID => process::sys_getppid(),
         SYS_GETUID => process::sys_getuid(),
@@ -246,6 +270,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[2] as *const u8,
             args[3],
         ),
+        SYS_RT_SIGRETURN => process::sys_rt_sigreturn(),
         SYS_SETGID => process::sys_setgid(args[0] as u32),
         SYS_SETUID => process::sys_setuid(args[0] as u32),
         SYS_SETPGID => process::sys_setpgid(args[0] as isize, args[1] as isize),
@@ -332,6 +357,7 @@ pub fn syscall_handler_aarch64_with_user_context(
             spsr,
             sp_el0,
         ),
+        SYS_RT_SIGRETURN => process::sys_rt_sigreturn_aarch64(gpr, elr, spsr, sp_el0),
         _ => syscall_handler(syscall_num, args),
     }
 }
@@ -344,7 +370,8 @@ pub fn syscall_handler_riscv64_with_user_context(
     mstatus: u64,
     mepc: u64,
 ) -> isize {
-    match syscall_num {
+    USER_SYSCALL_DEPTH.fetch_add(1, Ordering::AcqRel);
+    let ret = match syscall_num {
         SYS_CLONE => process::sys_clone_with_user_context_riscv(
             args[0],
             args[1],
@@ -355,8 +382,21 @@ pub fn syscall_handler_riscv64_with_user_context(
             mstatus,
             mepc,
         ),
+        SYS_RT_SIGRETURN => process::sys_rt_sigreturn_riscv(gpr, mstatus, mepc),
         _ => syscall_handler(syscall_num, args),
-    }
+    };
+    USER_SYSCALL_DEPTH.fetch_sub(1, Ordering::AcqRel);
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn in_user_syscall_context() -> bool {
+    USER_SYSCALL_DEPTH.load(Ordering::Acquire) != 0
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub(crate) fn in_user_syscall_context() -> bool {
+    false
 }
 
 /// 현재 스레드의 pending exec 전이 정보를 가져온다.
@@ -387,6 +427,34 @@ pub fn handle_user_page_fault_aarch64(far: usize, esr: u64) -> bool {
 #[cfg(target_arch = "riscv64")]
 pub fn handle_user_page_fault_riscv64(far: usize, cause: u64) -> bool {
     process::handle_user_page_fault_riscv64(far, cause)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn deliver_pending_signal_aarch64(
+    ctx: &mut crate::arch::exception::ExceptionContext,
+) -> bool {
+    process::deliver_pending_signal_aarch64(ctx)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn deliver_pending_signal_riscv64(
+    ctx: &mut crate::arch::trap::TrapContext,
+) -> bool {
+    process::deliver_pending_signal_riscv64(ctx)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn apply_pending_sigreturn_aarch64(
+    ctx: &mut crate::arch::exception::ExceptionContext,
+) -> bool {
+    process::apply_pending_sigreturn_aarch64(ctx)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn apply_pending_sigreturn_riscv64(
+    ctx: &mut crate::arch::trap::TrapContext,
+) -> bool {
+    process::apply_pending_sigreturn_riscv64(ctx)
 }
 
 /// 에러 코드 (Linux 호환)

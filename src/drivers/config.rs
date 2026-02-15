@@ -19,8 +19,11 @@ pub struct UartConfig {
 #[derive(Debug, Clone)]
 pub struct GicConfig {
     pub distributor_base: usize,
+    pub distributor_size: usize,
     pub cpu_interface_base: usize,
+    pub cpu_interface_size: usize,
     pub redistributor_base: Option<usize>, // GICv3용
+    pub redistributor_size: Option<usize>, // GICv3용
     pub version: GicVersion,
 }
 
@@ -93,13 +96,20 @@ pub fn init_platform_config(config: PlatformConfig) {
     match &config.interrupt_controller {
         InterruptControllerConfig::Gic(gic) => {
             crate::kprintln!(
-                "  GIC: GICD={:#x}, GICC={:#x}",
+                "  GIC: GICD={:#x}({:#x}), GICC={:#x}({:#x})",
                 gic.distributor_base,
-                gic.cpu_interface_base
+                gic.distributor_size,
+                gic.cpu_interface_base,
+                gic.cpu_interface_size
             );
         }
         InterruptControllerConfig::Plic(plic) => {
-            crate::kprintln!("  PLIC: base={:#x}, sources={}", plic.base, plic.num_sources);
+            crate::kprintln!(
+                "  PLIC: base={:#x}, size={:#x}, sources={}",
+                plic.base,
+                plic.size,
+                plic.num_sources
+            );
         }
         InterruptControllerConfig::None => {
             crate::kprintln!("  Interrupt Controller: None");
@@ -107,9 +117,10 @@ pub fn init_platform_config(config: PlatformConfig) {
     }
 
     crate::kprintln!(
-        "  Timer: type={:?}, freq={}Hz",
+        "  Timer: type={:?}, freq={}Hz, irq={}",
         config.timer.timer_type,
-        config.timer.frequency
+        config.timer.frequency,
+        config.timer.irq
     );
     crate::kprintln!("  CPUs: {}", config.cpu_count);
 
@@ -198,6 +209,22 @@ pub fn gicc_base() -> usize {
         .unwrap_or_else(crate::boards::gicc_base)
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn gicd_size() -> usize {
+    gic_config()
+        .map(|c| c.distributor_size)
+        .filter(|&size| size != 0)
+        .unwrap_or(0x1_0000)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn gicc_size() -> usize {
+    gic_config()
+        .map(|c| c.cpu_interface_size)
+        .filter(|&size| size != 0)
+        .unwrap_or(0x1_0000)
+}
+
 // PLIC 설정 헬퍼 함수들 (폴백 포함)
 #[cfg(target_arch = "riscv64")]
 pub fn plic_base() -> usize {
@@ -206,12 +233,35 @@ pub fn plic_base() -> usize {
         .unwrap_or_else(crate::boards::plic_base)
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn plic_size() -> usize {
+    plic_config()
+        .map(|c| c.size)
+        .filter(|&size| size != 0)
+        .unwrap_or(0x40_0000)
+}
+
 // CLINT/Timer 설정 헬퍼 함수들 (폴백 포함)
 #[cfg(target_arch = "riscv64")]
 pub fn clint_base() -> usize {
     clint_config()
         .map(|c| c.base)
         .unwrap_or_else(crate::boards::clint_base)
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn clint_size() -> usize {
+    clint_config()
+        .map(|c| c.size)
+        .filter(|&size| size != 0)
+        .unwrap_or(0x1_0000)
+}
+
+pub fn uart_size() -> usize {
+    uart_config()
+        .map(|c| c.size)
+        .filter(|&size| size != 0)
+        .unwrap_or(0x1000)
 }
 
 pub fn timer_freq() -> u64 {

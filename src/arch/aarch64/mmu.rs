@@ -9,6 +9,14 @@ use crate::sync::Mutex;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+const PAGE_SIZE: usize = 4096;
+const MMIO_DEFAULT_SIZE: usize = PAGE_SIZE;
+const PL031_RTC_COMPAT: &str = "arm,pl031";
+const PL031_RTC_FALLBACK_BASE: usize = 0x0901_0000;
+const VIRTIO_MMIO_COMPAT: &str = "virtio,mmio";
+const VIRTIO_FALLBACK_BASE: usize = 0x0A00_0000;
+const VIRTIO_FALLBACK_SLOTS: usize = 4;
+
 /// Higher-half 커널 베이스 주소
 pub const KERNEL_VIRT_BASE: usize = 0xFFFF_0000_0000_0000;
 
@@ -303,26 +311,133 @@ pub fn create_identity_mapping(
         pt_mgr.map_2mb_block(aligned_addr, aligned_addr, PageFlags::kernel_rwx())?;
     }
 
-    // MMIO 영역: UART (0x09000000)
-    kprintln!("[MMU] Mapping UART MMIO...");
-    pt_mgr.map_page(0x0900_0000, 0x0900_0000, PageFlags::device())?;
+    // MMIO 영역: UART (drivers::config 우선)
+    let uart_base = crate::drivers::config::uart_base();
+    let uart_size = crate::drivers::config::uart_size();
+    kprintln!(
+        "[MMU] Mapping UART MMIO: base={:#x}, size={:#x}",
+        uart_base, uart_size
+    );
+    map_mmio_region(&mut pt_mgr, uart_base, uart_size)?;
 
-    // MMIO 영역: GIC (0x08000000 - 0x08020000)
-    kprintln!("[MMU] Mapping GIC MMIO...");
-    pt_mgr.map_page(0x0800_0000, 0x0800_0000, PageFlags::device())?; // GICD
-    pt_mgr.map_page(0x0801_0000, 0x0801_0000, PageFlags::device())?; // GICC
+    // MMIO 영역: RTC PL031 (DTB 우선)
+    let (rtc_base, rtc_size) = rtc_region_from_dtb_or_fallback();
+    kprintln!(
+        "[MMU] Mapping RTC MMIO: base={:#x}, size={:#x}",
+        rtc_base, rtc_size
+    );
+    map_mmio_region(&mut pt_mgr, rtc_base, rtc_size)?;
 
-    // MMIO 영역: VirtIO (0x0a000000 - 0x0a004000, 32개 슬롯)
-    kprintln!("[MMU] Mapping VirtIO MMIO...");
-    for i in 0..4 {
-        let addr = 0x0a00_0000 + i * 0x1000;
-        pt_mgr.map_page(addr, addr, PageFlags::device())?;
+    // MMIO 영역: GIC (DTB reg 크기 우선, config 폴백)
+    let gicd_base = crate::drivers::config::gicd_base();
+    let gicd_size = crate::drivers::config::gicd_size();
+    let gicc_base = crate::drivers::config::gicc_base();
+    let gicc_size = crate::drivers::config::gicc_size();
+    kprintln!(
+        "[MMU] Mapping GICD MMIO: base={:#x}, size={:#x}",
+        gicd_base, gicd_size
+    );
+    map_mmio_region(&mut pt_mgr, gicd_base, gicd_size)?;
+    kprintln!(
+        "[MMU] Mapping GICC MMIO: base={:#x}, size={:#x}",
+        gicc_base, gicc_size
+    );
+    map_mmio_region(&mut pt_mgr, gicc_base, gicc_size)?;
+
+    if let Some(gic) = crate::drivers::config::gic_config() {
+        if let Some(gicr_base) = gic.redistributor_base {
+            let gicr_size = gic.redistributor_size.unwrap_or(0x2_0000);
+            kprintln!(
+                "[MMU] Mapping GICR MMIO: base={:#x}, size={:#x}",
+                gicr_base, gicr_size
+            );
+            map_mmio_region(&mut pt_mgr, gicr_base, gicr_size)?;
+        }
+    }
+
+    // MMIO 영역: VirtIO (DTB 노드 우선)
+    let mut virtio_mapped = 0usize;
+    if let Some(dt) = crate::dtb::get() {
+        for info in dt.find_compatible(VIRTIO_MMIO_COMPAT) {
+            if info.reg_base == 0 {
+                continue;
+            }
+            let base = info.reg_base as usize;
+            let size = if info.reg_size != 0 {
+                info.reg_size as usize
+            } else {
+                MMIO_DEFAULT_SIZE
+            };
+            kprintln!(
+                "[MMU] Mapping VirtIO MMIO (DTB): base={:#x}, size={:#x}",
+                base, size
+            );
+            map_mmio_region(&mut pt_mgr, base, size)?;
+            virtio_mapped += 1;
+        }
+    }
+    if virtio_mapped == 0 {
+        kprintln!(
+            "[MMU] Mapping VirtIO MMIO fallback slots: base={:#x}, slots={}",
+            VIRTIO_FALLBACK_BASE,
+            VIRTIO_FALLBACK_SLOTS
+        );
+        for i in 0..VIRTIO_FALLBACK_SLOTS {
+            let addr = VIRTIO_FALLBACK_BASE + i * MMIO_DEFAULT_SIZE;
+            map_mmio_region(&mut pt_mgr, addr, MMIO_DEFAULT_SIZE)?;
+        }
     }
 
     kprintln!("[MMU] Identity mapping created");
     kprintln!("      Root table at: {:#x}", pt_mgr.root_table_addr());
 
     Ok(pt_mgr)
+}
+
+#[inline]
+fn align_down_page(addr: usize) -> usize {
+    addr & !(PAGE_SIZE - 1)
+}
+
+#[inline]
+fn align_up_page(addr: usize) -> usize {
+    (addr.saturating_add(PAGE_SIZE - 1)) & !(PAGE_SIZE - 1)
+}
+
+fn map_mmio_region(
+    pt_mgr: &mut PageTableManager,
+    base: usize,
+    size: usize,
+) -> Result<(), &'static str> {
+    if base == 0 {
+        return Ok(());
+    }
+    let size = if size == 0 { MMIO_DEFAULT_SIZE } else { size };
+    let start = align_down_page(base);
+    let end = align_up_page(base.saturating_add(size));
+    if end <= start {
+        return Ok(());
+    }
+    for addr in (start..end).step_by(PAGE_SIZE) {
+        pt_mgr.map_page(addr, addr, PageFlags::device())?;
+    }
+    Ok(())
+}
+
+fn rtc_region_from_dtb_or_fallback() -> (usize, usize) {
+    if let Some(dt) = crate::dtb::get() {
+        if let Some(info) = dt.find_compatible(PL031_RTC_COMPAT).into_iter().next() {
+            if info.reg_base != 0 {
+                let size = if info.reg_size != 0 {
+                    info.reg_size as usize
+                } else {
+                    MMIO_DEFAULT_SIZE
+                };
+                return (info.reg_base as usize, size);
+            }
+        }
+    }
+    (PL031_RTC_FALLBACK_BASE, MMIO_DEFAULT_SIZE)
 }
 
 /// MMU 활성화

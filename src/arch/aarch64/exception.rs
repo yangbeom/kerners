@@ -83,6 +83,10 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
     // IRQ 처리 (exception_type % 4 == 1)
     if exception_type % 4 == 1 {
         super::gic::handle_irq();
+        // Lower EL에서 올라온 IRQ 복귀 직전에 pending signal 전달
+        if exception_type == 9 || exception_type == 13 {
+            let _ = crate::syscall::deliver_pending_signal_aarch64(ctx);
+        }
         return;
     }
 
@@ -146,6 +150,10 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
         } else {
             ctx.gpr[0] = ret as u64; // 일반 syscall 반환값
         }
+        if crate::syscall::apply_pending_sigreturn_aarch64(ctx) {
+            return;
+        }
+        let _ = crate::syscall::deliver_pending_signal_aarch64(ctx);
         // elr은 기본적으로 svc 다음 명령어를 가리킴
         return;
     }

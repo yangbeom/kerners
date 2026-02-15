@@ -150,6 +150,12 @@ pub fn handle_irq() {
 
     // Per-CPU 틱 카운터 업데이트
     crate::proc::percpu::current().tick_count.fetch_add(1, Ordering::Relaxed);
+
+    // aarch64 정책: 타이머 틱마다 강제 선점하지 않고, wake 이벤트가 있을 때만 스케줄링
+    let woke = crate::proc::wake_sleepers_by_timer(crate::time::monotonic_now_ns());
+    if woke > 0 {
+        crate::proc::scheduler::schedule();
+    }
 }
 
 /// 현재 틱 수 반환

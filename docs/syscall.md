@@ -42,16 +42,19 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_getgid`/`sys_getegid` | 176/177 | `getgid()/getegid()` | baseline: 0(root) 반환 |
 | `sys_gettid` | 178 | `gettid() -> tid` | 현재 스레드 ID 조회 |
 | `sys_set_tid_address` | 96 | `set_tid_address(ptr)` | baseline: tid 반환, clear_child_tid 미구현 |
-| `sys_clock_gettime` | 113 | `clock_gettime(clockid, tp)` | baseline: monotonic counter 기반 |
-| `sys_rt_sigaction` | 134 | `rt_sigaction(...)` | baseline stub (시그널 전달 미구현) |
+| `sys_clock_gettime` | 113 | `clock_gettime(clockid, tp)` | `CLOCK_MONOTONIC/CLOCK_REALTIME` 분리, RTC 폴백 지원 |
+| `sys_clock_getres` | 114 | `clock_getres(clockid, tp)` | 시계 해상도 반환 (`tp=NULL` 허용) |
+| `sys_kill`/`sys_tkill`/`sys_tgkill` | 129/130/131 | `kill()/tkill()/tgkill()` | 대상 검증 + `sig=0` probe + pending enqueue |
+| `sys_rt_sigaction` | 134 | `rt_sigaction(...)` | sighand_group 단위 액션 set/get + 전달 경로 연동 |
 | `sys_rt_sigprocmask` | 135 | `rt_sigprocmask(...)` | 64-bit 시그널 마스크 추적 (`SIG_BLOCK/UNBLOCK/SETMASK`) |
 | `sys_rt_sigtimedwait` | 137 | `rt_sigtimedwait(...)` | pending signal queue에서 매칭 시그널 소비, 없으면 `EAGAIN` |
+| `sys_rt_sigreturn` | 139 | `rt_sigreturn()` | 유저 sigframe 기반 레지스터/마스크 복원 |
 | `sys_setuid`/`sys_setgid` | 146/144 | `setuid()/setgid()` | baseline no-op 성공 |
 | `sys_setpgid`/`sys_getpgid` | 154/155 | `setpgid()/getpgid()` | 최소 pgid 추적 |
 | `sys_setsid`/`sys_getsid` | 157/156 | `setsid()/getsid()` | 최소 sid 추적 |
 | `sys_uname` | 160 | `uname(buf)` | `struct utsname` 반환 (`Kerners`, arch별 machine) |
-| `sys_gettimeofday` | 169 | `gettimeofday(tv, tz)` | baseline: monotonic wrapper |
-| `sys_nanosleep` | 101 | `nanosleep(req, rem)` | baseline: yield 기반 최소 동작 |
+| `sys_gettimeofday` | 169 | `gettimeofday(tv, tz)` | realtime 기반 `timeval`, `timezone` zero-fill |
+| `sys_nanosleep` | 101 | `nanosleep(req, rem)` | sleep queue block/wakeup + `EINTR/rem` |
 | `sys_socket` | 198 | `socket(domain, type, proto)` | baseline: `EAFNOSUPPORT` |
 | `sys_sendto` | 206 | `sendto(fd, buf, len, ...)` | baseline: `EBADF`/`EAFNOSUPPORT` |
 | `sys_brk` | 214 | `brk(addr) -> new_brk` | vm_group별 16MB 힙 윈도우 + 페이지 단위 확장/축소 및 매핑/해제 |
@@ -148,7 +151,7 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
 - 현재 제약:
   - `argv/envp`는 개수/길이 + 총량(현재 32KiB) 상한을 검사하며, 초과 시 `E2BIG`
   - aarch64/riscv64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)
-  - 유저 포인터 fault 복구(페이지 폴트 복귀)는 아직 미구현
+  - 유저 포인터 fault 복구는 제한적이며, 현재는 COW write fault 경로 중심으로만 복구
   - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHNUM/AT_PAGESZ`)를 스택에 제공
   - 동적 ELF(`PT_INTERP`, `ET_DYN`)는 아직 미지원
 

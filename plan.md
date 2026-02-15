@@ -111,12 +111,17 @@
 | 94 | `exit_group` | ✅ 구현 | exit으로 포워딩 |
 | 95 | `waitid` | ✅ 구현 | `P_ALL/P_PID/P_PGID` + `WEXITED/WNOHANG/WNOWAIT` baseline |
 | 96 | `set_tid_address` | ✅ 구현 | baseline: tid 반환, clear_child_tid 미구현 |
-| 101 | `nanosleep` | ✅ 구현 | baseline: yield 기반 최소 동작 |
-| 113 | `clock_gettime` | ✅ 구현 | baseline: monotonic 기반 realtime/monotonic 반환 |
+| 101 | `nanosleep` | ✅ 구현 | `timespec` 검증 + sleep queue block/wake + `EINTR/rem` |
+| 113 | `clock_gettime` | ✅ 구현 | `CLOCK_MONOTONIC/CLOCK_REALTIME` 분리, RTC 폴백 지원 |
+| 114 | `clock_getres` | ✅ 구현 | `CLOCK_MONOTONIC/CLOCK_REALTIME` 해상도 반환 (`tp=NULL` 허용) |
 | 124 | `sched_yield` | ✅ 구현 | |
-| 134 | `rt_sigaction` | ✅ 구현 | baseline stub (handler delivery 미구현) |
+| 129 | `kill` | ✅ 구현 | 존재 검증 + `sig=0` probe + pending enqueue |
+| 130 | `tkill` | ✅ 구현 | thread 단위 시그널 전송 |
+| 131 | `tgkill` | ✅ 구현 | tgid/tid 검증 후 thread 전달 |
+| 134 | `rt_sigaction` | ✅ 구현 | sighand_group 단위 액션 set/get + 핵심 플래그 저장 |
 | 135 | `rt_sigprocmask` | ✅ 구현 | 프로세스별 64-bit 마스크 추적 (`SIG_BLOCK/UNBLOCK/SETMASK`) |
 | 137 | `rt_sigtimedwait` | ✅ 구현 | pending signal queue 조회/소비 (`EAGAIN` 포함) |
+| 139 | `rt_sigreturn` | ✅ 구현 | sigframe 기반 컨텍스트/마스크 복원 |
 | 144 | `setgid` | ✅ 구현 | baseline no-op 성공 |
 | 146 | `setuid` | ✅ 구현 | baseline no-op 성공 |
 | 154 | `setpgid` | ✅ 구현 | 최소 pgid 추적 갱신 |
@@ -124,7 +129,7 @@
 | 156 | `getsid` | ✅ 구현 | 추적된 sid 반환 |
 | 157 | `setsid` | ✅ 구현 | sid/pgid를 현재 tid로 갱신 |
 | 160 | `uname` | ✅ 구현 | `struct utsname` (`Kerners`, machine/domain 포함) |
-| 169 | `gettimeofday` | ✅ 구현 | baseline: monotonic wrapper |
+| 169 | `gettimeofday` | ✅ 구현 | realtime 기반 `timeval` + `timezone` zero-fill |
 | 172 | `getpid` | ✅ 구현 | tid 반환 |
 | 173 | `getppid` | ✅ 구현 | 부모 PID 추적 반환 |
 | 174 | `getuid` | ✅ 구현 | baseline: 0 반환 |
@@ -134,11 +139,12 @@
 | 178 | `gettid` | ✅ 구현 | tid 반환 |
 | 198 | `socket` | ✅ 구현 | baseline: `EAFNOSUPPORT` |
 | 206 | `sendto` | ✅ 구현 | baseline: `EBADF`/`EAFNOSUPPORT` |
-| 214 | `brk` | ✅ 구현 | 스레드별 고정 16MB 영역 baseline |
-| 215 | `munmap` | ✅ 구현 | full unmap만 지원(부분 해제 미지원) |
+| 214 | `brk` | ✅ 구현 | vm_group별 힙 영역 트래킹 + 페이지 단위 확장/축소 |
+| 215 | `munmap` | ✅ 구현 | 부분/전체 unmap + shared dirty writeback flush |
 | 220 | `clone` | ✅ 구현 | baseline + aarch64/riscv64 user-context + CLONE_* 리소스 그룹 추적 |
 | 221 | `execve` | ✅ 구현 | static ELF(`ET_EXEC`) + argv/env 경계검증 + 확장 auxv |
-| 222 | `mmap` | ✅ 구현 | anonymous(private/shared) baseline |
+| 222 | `mmap` | ✅ 구현 | anonymous + file-backed(shared/private COW) |
+| 226 | `mprotect` | ✅ 구현 | 매핑 권한(R/W/X) 변경 + TLB flush |
 | 260 | `wait4` | ✅ 구현 | zombie 회수 + Linux wait status + `WNOHANG` + 자식 대기/`ECHILD` |
 
 ---
@@ -333,47 +339,82 @@
 
 ### Phase 12: 시간 및 타이머 시스템 콜 (단기)
 
-- [x] `sys_nanosleep` (NR 101) baseline 구현
-  - [ ] struct timespec {tv_sec, tv_nsec} 파싱
-  - [ ] 스레드를 SLEEPING 상태로 전환
-  - [ ] 타이머 만료 시 READY로 복귀
-- [x] `sys_clock_gettime` (NR 113) baseline 구현
-- [ ] `sys_clock_gettime` (NR 113) 고도화
-  - [ ] CLOCK_REALTIME — 부팅 후 경과 시간 (에폭 타임 미지원 시 부팅 기준)
-  - [ ] CLOCK_MONOTONIC — 아키텍처 타이머 카운터 기반
-- [ ] `sys_clock_getres` (NR 114)
-- [x] `sys_gettimeofday` (NR 169) baseline 구현 — clock_gettime wrapper
-- [ ] `sys_gettimeofday` (NR 169) 고도화 (RTC 연동/epoch 기준)
-- [ ] 테스트: `modules/test_timer`
+- [x] `sys_nanosleep` (NR 101) 완성 구현
+  - [x] `timespec(tv_sec/tv_nsec)` 파싱 및 범위 검증
+  - [x] sleep queue 기반 block/wakeup (`Blocked` ↔ `Ready`)
+  - [x] signal interrupt 시 `EINTR` + `rem` 기록
+- [x] `sys_clock_gettime` (NR 113) 고도화 완료
+  - [x] `CLOCK_REALTIME` — RTC 스냅샷 + monotonic 오프셋(폴백 포함)
+  - [x] `CLOCK_MONOTONIC` — 아키텍처 타이머 카운터 기반
+- [x] `sys_clock_getres` (NR 114)
+- [x] `sys_gettimeofday` (NR 169) 고도화 완료 (realtime + timezone zero-fill)
+- [x] 시간 코어 분리: `src/time/mod.rs` + arch RTC(`pl031`/`goldfish-rtc`)
+- [x] 테스트: `modules/test_timer`
+
+#### 12-A. DTB 기반 주소대역 동적화 (구현 완료, 회귀 검증 대기)
+
+- [x] P0. MMU MMIO 매핑 주소 하드코딩 제거 (aarch64/riscv64 공통)
+  - [x] aarch64: `src/arch/aarch64/mmu.rs`의 UART/RTC/GIC/VirtIO MMIO 매핑을 DTB/`drivers::config` 기반으로 전환
+  - [x] riscv64: `src/arch/riscv64/mmu.rs`의 UART/RTC/CLINT/PLIC MMIO 매핑을 DTB/`drivers::config` 기반으로 전환
+  - [x] PLIC/GIC 크기/범위는 DTB `reg` 크기 우선, 없으면 보드 폴백 유지
+
+- [x] P1. IRQ/타이머 주파수 하드코딩 제거
+  - [x] aarch64: `src/arch/aarch64/gic.rs`의 `IRQ_PHYS_TIMER`/`IRQ_UART` 상수 의존 제거, `drivers::config::{timer_irq, uart_irq}` 사용
+  - [x] riscv64: `src/arch/riscv64/plic.rs`의 `IRQ_UART` 상수 의존 제거, `drivers::config::uart_irq()` 사용
+  - [x] riscv64: `src/drivers/probe.rs`에서 `/cpus/timebase-frequency` 파싱 우선, 미존재 시 보드 폴백
+
+- [x] P2. 런타임 메모리 범위 기반 검증으로 전환
+  - [x] `src/fs/fat32/mod.rs`, `src/fs/fat32/fat.rs`의 `is_probably_kernel_ptr` 하드코딩 범위를 런타임 RAM/커널 매핑 범위 기반으로 교체
+  - [x] `src/mm/mod.rs`의 프레임 풀 끝단 고정 4MB 예약을 DTB 실제 위치/크기 반영 방식으로 개선
+
+- [x] P3. 부트/테스트 보조 하드코딩 정리
+  - [x] `src/main.rs`의 DTB 탐색 fallback RAM 시작 상수 경로를 보드/플랫폼 설정 경로와 정합화
+  - [x] `src/test_runner.rs`의 QEMU finisher 주소(0x100000) 하드코딩은 테스트 전용 정책으로 유지 여부 문서화 (또는 DTB 기반 탐색으로 전환)
+
+- [x] 범위 제외(정책 고정)
+  - [x] `USER_STACK_BASE`, `BRK/MMAP` 베이스, `KERNEL_VIRT_BASE` 등 가상주소 레이아웃 상수는 DTB 동적화 대상에서 제외
+
+##### 테스트 케이스 및 시나리오 (해당 우선순위 구현 후 수용 기준)
+
+- [x] `./scripts/run_tests.sh aarch64 60` 통과
+- [x] `./scripts/run_tests.sh riscv64 60` 통과
+- [x] 부팅 로그에서 MMIO/IRQ/timer 설정이 DTB 또는 `drivers::config` 값으로 출력되어 하드코딩 경로 미사용 확인
+- [ ] 기존 BusyBox smoke 회귀 통과 (`aarch64`, `riscv64`)
+
+##### 가정 및 기본값
+
+- 기본 정책: **DTB 우선, BoardConfig 폴백 유지**
+- DTB 미존재/파싱 실패 환경을 계속 지원
+- 주소공간 정책 상수(유저 VA 레이아웃)는 이번 동적화 범위에서 제외
 
 ### Phase 13: 시그널 처리 (중기)
 
 #### 13-1. 시그널 인프라
 - [x] 프로세스별 시그널 마스크 (sigset_t, 최소 64-bit)
-- [ ] 시그널 핸들러 테이블 (64개 시그널)
+- [x] 시그널 핸들러 테이블 (64개 시그널)
 - [x] 시그널 큐 (pending signals, 최소 FIFO)
-- [ ] 시그널 전달 시점: syscall 복귀 / 인터럽트 복귀
+- [x] 시그널 전달 시점: syscall 복귀 / 인터럽트 복귀
 
 #### 13-2. 시그널 시스템 콜
-- [ ] `sys_kill` (NR 129) — 프로세스에 시그널 전송
-- [ ] `sys_tkill` (NR 130) — 스레드에 시그널 전송
-- [ ] `sys_tgkill` (NR 131)
-- [x] `sys_rt_sigaction` (NR 134) baseline stub 구현
-- [ ] `sys_rt_sigaction` (NR 134) 완성 구현 — 시그널 핸들러 등록
-  - [ ] SA_SIGINFO, SA_RESTART, SA_NODEFER 플래그
+- [x] `sys_kill` (NR 129) — 프로세스에 시그널 전송
+- [x] `sys_tkill` (NR 130) — 스레드에 시그널 전송
+- [x] `sys_tgkill` (NR 131)
+- [x] `sys_rt_sigaction` (NR 134) 완성 구현 — 시그널 핸들러 등록
+  - [x] SA_SIGINFO, SA_RESTART, SA_NODEFER 플래그 저장/조회
+  - [ ] SA_RESTART 기반 자동 syscall 재시작 정책
 - [x] `sys_rt_sigprocmask` (NR 135) 최소 구현 — 시그널 마스크 변경
-- [ ] `sys_rt_sigprocmask` (NR 135) 완성 구현 — 시그널 마스크 변경
-  - [ ] SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK
+- [x] `sys_rt_sigprocmask` (NR 135) 완성 구현 — 시그널 마스크 변경
+  - [x] SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK
 - [x] `sys_rt_sigtimedwait` (NR 137) 최소 구현 — pending queue 조회/소비 + `EAGAIN`
 - [ ] `sys_rt_sigtimedwait` (NR 137) 완성 구현
-- [ ] `sys_rt_sigreturn` (NR 139) — 시그널 핸들러 복귀
-  - [ ] 유저 스택에 저장한 컨텍스트 복원
+- [x] `sys_rt_sigreturn` (NR 139) — 시그널 핸들러 복귀
+  - [x] 유저 스택 sigframe 기반 컨텍스트/마스크 복원
 
 #### 13-3. 기본 시그널 동작
 - [ ] SIGKILL (9) — 무조건 종료
 - [ ] SIGTERM (15) — 종료 요청
 - [ ] SIGSEGV (11) — 잘못된 메모리 접근
-- [ ] SIGCHLD (17) — 자식 종료 통지
+- [x] SIGCHLD (17) — 자식 종료 통지
 - [ ] SIGSTOP / SIGCONT — 프로세스 정지/재개
 - [ ] 테스트: `modules/test_signal`
 

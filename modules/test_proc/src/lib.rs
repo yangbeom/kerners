@@ -31,12 +31,21 @@ unsafe extern "C" {
         oldset: *mut u8,
         sigsetsize: usize,
     ) -> i64;
+    fn kernel_sys_rt_sigaction(
+        signum: i32,
+        act: *const u8,
+        oldact: *mut u8,
+        sigsetsize: usize,
+    ) -> i64;
     fn kernel_sys_rt_sigtimedwait(
         set: *const u8,
         info: *mut u8,
         timeout: *const u8,
         sigsetsize: usize,
     ) -> i64;
+    fn kernel_sys_kill(pid: isize, sig: i32) -> i64;
+    fn kernel_sys_tkill(tid: isize, sig: i32) -> i64;
+    fn kernel_sys_tgkill(tgid: isize, tid: isize, sig: i32) -> i64;
     fn kernel_sys_wait4(pid: isize, status: *mut i32, options: i32) -> i64;
     fn kernel_sys_fork() -> i64;
     fn kernel_sys_vfork() -> i64;
@@ -51,9 +60,21 @@ const PAGE_SIZE: usize = 4096;
 const EBADF: i64 = -9;
 const EAGAIN: i64 = -11;
 const ECHILD: i64 = -10;
+const ESRCH: i64 = -3;
+const EINVAL: i64 = -22;
 const SIGCHLD: u32 = 17;
 const SIG_SETMASK: i32 = 2;
 const WNOHANG: i32 = 0x1;
+const SIGSET_SIZE: usize = core::mem::size_of::<u64>();
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSigAction {
+    sa_handler: u64,
+    sa_flags: u64,
+    sa_restorer: u64,
+    sa_mask: u64,
+}
 
 fn print(s: &str) {
     unsafe { kernel_print(s.as_ptr(), s.len()) };
@@ -182,14 +203,12 @@ pub extern "C" fn module_init() -> i32 {
     let mut old_mask: u64 = 0;
     let wait_set: u64 = 1u64 << (SIGCHLD - 1);
     let mut siginfo: [u8; 16] = [0; 16];
-    let sigset_size = core::mem::size_of::<u64>();
-
     let setmask_ok = unsafe {
         kernel_sys_rt_sigprocmask(
             SIG_SETMASK,
             &wait_set as *const u64 as *const u8,
             &mut old_mask as *mut u64 as *mut u8,
-            sigset_size,
+            SIGSET_SIZE,
         )
     };
     if setmask_ok != 0 {
@@ -208,7 +227,7 @@ pub extern "C" fn module_init() -> i32 {
             &wait_set as *const u64 as *const u8,
             siginfo.as_mut_ptr(),
             core::ptr::null(),
-            sigset_size,
+            SIGSET_SIZE,
         )
     };
     if got != SIGCHLD as i64 {
@@ -221,7 +240,7 @@ pub extern "C" fn module_init() -> i32 {
             &wait_set as *const u64 as *const u8,
             siginfo.as_mut_ptr(),
             core::ptr::null(),
-            sigset_size,
+            SIGSET_SIZE,
         )
     };
     if empty != EAGAIN {
@@ -235,7 +254,7 @@ pub extern "C" fn module_init() -> i32 {
             SIG_SETMASK,
             &old_mask as *const u64 as *const u8,
             core::ptr::null_mut(),
-            sigset_size,
+            SIGSET_SIZE,
         )
     };
     if restore != 0 {
@@ -244,42 +263,128 @@ pub extern "C" fn module_init() -> i32 {
     }
     print("PASS\n");
 
-    // 테스트 7: fork + wait4
+    // 테스트 7: rt_sigaction set/get roundtrip
+    print("[test_proc] test: rt_sigaction set/get ... ");
+    let new_action = LinuxSigAction {
+        sa_handler: 0x1000,
+        sa_flags: 0x1234_0000,
+        sa_restorer: 0x2000,
+        sa_mask: wait_set,
+    };
+    let mut old_action = LinuxSigAction {
+        sa_handler: 0,
+        sa_flags: 0,
+        sa_restorer: 0,
+        sa_mask: 0,
+    };
+    let set_action = unsafe {
+        kernel_sys_rt_sigaction(
+            SIGCHLD as i32,
+            &new_action as *const _ as *const u8,
+            &mut old_action as *mut _ as *mut u8,
+            SIGSET_SIZE,
+        )
+    };
+    if set_action != 0 {
+        print("FAIL (set)\n");
+        return -17;
+    }
+
+    let mut got_action = LinuxSigAction {
+        sa_handler: 0,
+        sa_flags: 0,
+        sa_restorer: 0,
+        sa_mask: 0,
+    };
+    let get_action = unsafe {
+        kernel_sys_rt_sigaction(
+            SIGCHLD as i32,
+            core::ptr::null(),
+            &mut got_action as *mut _ as *mut u8,
+            SIGSET_SIZE,
+        )
+    };
+    if get_action != 0 || got_action.sa_handler != new_action.sa_handler || got_action.sa_restorer != new_action.sa_restorer || got_action.sa_mask != new_action.sa_mask {
+        print("FAIL (get)\n");
+        return -18;
+    }
+    print("PASS\n");
+
+    // 테스트 8: kill/tkill/tgkill 기본/에러 경로
+    print("[test_proc] test: kill/tkill/tgkill ... ");
+    let me = unsafe { kernel_sys_gettid() };
+    if me < 0 {
+        print("FAIL (tid)\n");
+        return -19;
+    }
+    if unsafe { kernel_sys_kill(me as isize, 0) } != 0
+        || unsafe { kernel_sys_tkill(me as isize, 0) } != 0
+        || unsafe { kernel_sys_tgkill(me as isize, me as isize, 0) } != 0
+    {
+        print("FAIL (probe)\n");
+        return -20;
+    }
+    if unsafe { kernel_sys_kill(999_999, 0) } != ESRCH
+        || unsafe { kernel_sys_tkill(999_999, 0) } != ESRCH
+        || unsafe { kernel_sys_tgkill(me as isize, (me + 1) as isize, 0) } != ESRCH
+        || unsafe { kernel_sys_kill(me as isize, 99) } != EINVAL
+    {
+        print("FAIL (errno)\n");
+        return -21;
+    }
+
+    let mut siginfo2: [u8; 16] = [0; 16];
+    let sent = unsafe { kernel_sys_tkill(me as isize, SIGCHLD as i32) };
+    let recv = unsafe {
+        kernel_sys_rt_sigtimedwait(
+            &wait_set as *const u64 as *const u8,
+            siginfo2.as_mut_ptr(),
+            core::ptr::null(),
+            SIGSET_SIZE,
+        )
+    };
+    if sent != 0 || (recv != SIGCHLD as i64 && recv != EAGAIN) {
+        print("FAIL (delivery)\n");
+        return -22;
+    }
+    print("PASS\n");
+
+    // 테스트 9: fork + wait4
     print("[test_proc] test: fork/wait4 ... ");
     let child = unsafe { kernel_sys_fork() };
     if child <= 0 {
         print("FAIL (fork)\n");
-        return -17;
+        return -23;
     }
     let mut wait_status: i32 = -1;
     let waited = unsafe { kernel_sys_wait4(child as isize, &mut wait_status as *mut i32, 0) };
     if waited != child {
         print("FAIL (wait)\n");
-        return -18;
+        return -24;
     }
     if wait_status != 0 {
         print("FAIL (status)\n");
-        return -19;
+        return -25;
     }
     let no_child = unsafe { kernel_sys_wait4(child as isize, &mut wait_status as *mut i32, WNOHANG) };
     if no_child != ECHILD {
         print("FAIL (wnohang)\n");
-        return -20;
+        return -26;
     }
     print("PASS\n");
 
-    // 테스트 8: vfork + wait4
+    // 테스트 10: vfork + wait4
     print("[test_proc] test: vfork/wait4 ... ");
     let vchild = unsafe { kernel_sys_vfork() };
     if vchild <= 0 {
         print("FAIL (vfork)\n");
-        return -21;
+        return -27;
     }
     wait_status = -1;
     let vwaited = unsafe { kernel_sys_wait4(vchild as isize, &mut wait_status as *mut i32, 0) };
     if vwaited != vchild || wait_status != 0 {
         print("FAIL\n");
-        return -22;
+        return -28;
     }
     print("PASS\n");
 

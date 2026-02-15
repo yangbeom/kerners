@@ -20,6 +20,9 @@ src/mm/
 | `mm::init()` | DTB에서 획득한 RAM 정보로 전체 메모리 시스템 초기화 |
 | `mm::heap` | `Box`, `Vec`, `String` 등 동적 할당 지원 |
 | `mm::page` | 물리 페이지 프레임 할당/해제 |
+| `mm::layout()` | 런타임 커널 메모리 레이아웃 조회 |
+| `mm::ram_range()` | 런타임 RAM 범위 조회 |
+| `mm::is_kernel_mapped_addr()` | 주소가 RAM/커널 매핑 범위인지 판별 |
 
 ---
 
@@ -50,7 +53,7 @@ RAM 시작: 0x40000000
            │  (bitmap allocator)      │  (비트맵 포함)
            │                          │
            ├──────────────────────────┤
-           │  Reserved                │  4MB (DTB 등)
+           │  Reserved                │  DTB blob 실제 위치/크기 기반
            └──────────────────────────┘  ← RAM 끝
 ```
 
@@ -260,7 +263,7 @@ _entry()
               │     ├─► boot_stack_top = _stack_start (링커 심볼)
               │     ├─► heap_start = align_4k(boot_stack_top)
               │     ├─► heap_size = min(ram_size/4, 128MB)
-              │     └─► frame_alloc = heap_end ~ (ram_end - 4MB)
+              │     └─► frame_alloc = heap_end ~ ram_end (DTB blob 영역 제외)
               │
               ├─► heap::init(heap_start, heap_size)
               │     └─► linked_list_allocator 초기화
@@ -277,7 +280,7 @@ _entry()
 | 상수/변수 | 위치 | 기본값 | 설명 |
 |-----------|------|--------|------|
 | `max_heap_size` | `mm/mod.rs` | 128MB | 힙 최대 크기 |
-| `reserved_at_end` | `mm/mod.rs` | 4MB | RAM 끝 예약 영역 (DTB 등) |
+| `dtb::blob_range()` | `src/dtb/mod.rs` | N/A | DTB blob 실제 범위를 frame pool 계산에 반영 |
 | `_stack_start - _end` | 링커 스크립트 | aarch64: 1MB, riscv64: 256KB | bootstrap 스택 예약 영역 |
 | `PAGE_SIZE` | `mm/page.rs` | 4096 | 페이지 크기 |
 

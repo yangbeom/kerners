@@ -18,6 +18,7 @@ mod module;
 mod proc;
 mod sync;
 mod syscall;
+mod time;
 mod virtio;
 
 #[cfg(feature = "test_runner")]
@@ -128,9 +129,13 @@ fn aarch64_start(dtb_addr: usize) -> ! {
 
     console::puts("kerners booting...\n\n");
 
-    // QEMU virt (aarch64): RAM starts at 0x40000000
-    const RAM_START: usize = 0x4000_0000;
-    const DEFAULT_RAM_SIZE: usize = 512 * 1024 * 1024; // 512MB
+    let ram_start_fallback = boards::ram_base();
+    let default_ram_size = boards::ram_size();
+    kprintln!(
+        "[boot] DTB fallback RAM range (board config): base={:#x}, size={:#x}",
+        ram_start_fallback,
+        default_ram_size
+    );
 
     kprintln!("[boot] DTB address from register x0: {:#x}", dtb_addr);
 
@@ -145,9 +150,9 @@ fn aarch64_start(dtb_addr: usize) -> ! {
 
             // QEMU virt는 일반적으로 DTB를 RAM 시작 주소나 커널 바로 앞에 배치
             let common_locations = [
-                RAM_START,           // 0x40000000 - RAM 시작
-                RAM_START + 0x8000,  // 0x40008000 - 일반적인 위치
-                RAM_START + 0x10000, // 0x40010000
+                ram_start_fallback,
+                ram_start_fallback + 0x8000,
+                ram_start_fallback + 0x10000,
             ];
 
             let mut found = None;
@@ -164,7 +169,7 @@ fn aarch64_start(dtb_addr: usize) -> ! {
                 dtb::init(addr)
             } else {
                 kprintln!("[DTB] Not found at common locations, scanning memory...");
-                dtb::init_scan(RAM_START, DEFAULT_RAM_SIZE)
+                dtb::init_scan(ram_start_fallback, default_ram_size)
             }
         };
 
@@ -186,16 +191,16 @@ fn aarch64_start(dtb_addr: usize) -> ! {
                         }
                         Err(_) => {
                             kprintln!("[DTB] Warning: Could not find memory node, using defaults");
-                            (RAM_START, DEFAULT_RAM_SIZE)
+                            (ram_start_fallback, default_ram_size)
                         }
                     }
                 } else {
-                    (RAM_START, DEFAULT_RAM_SIZE)
+                    (ram_start_fallback, default_ram_size)
                 }
             }
             Err(_) => {
                 kprintln!("[DTB] Warning: Failed to find/parse DTB, using defaults");
-                (RAM_START, DEFAULT_RAM_SIZE)
+                (ram_start_fallback, default_ram_size)
             }
         }
     };
@@ -228,6 +233,9 @@ fn aarch64_start(dtb_addr: usize) -> ! {
                             // 타이머 초기화
                             match arch::timer::init() {
                                 Ok(()) => {
+                                    // 시간 코어 초기화 (RTC + monotonic)
+                                    time::init();
+
                                     // IRQ 활성화
                                     unsafe {
                                         enable_irq();
@@ -1294,9 +1302,13 @@ fn riscv64_start(dtb_addr: usize) -> ! {
 
     console::puts("kerners booting...\n\n");
 
-    // QEMU virt (riscv64): RAM starts at 0x80000000
-    const RAM_START: usize = 0x8000_0000;
-    const DEFAULT_RAM_SIZE: usize = 512 * 1024 * 1024; // 512MB
+    let ram_start_fallback = boards::ram_base();
+    let default_ram_size = boards::ram_size();
+    kprintln!(
+        "[boot] DTB fallback RAM range (board config): base={:#x}, size={:#x}",
+        ram_start_fallback,
+        default_ram_size
+    );
 
     kprintln!("[boot] DTB address from register: {:#x}", dtb_addr);
 
@@ -1307,7 +1319,7 @@ fn riscv64_start(dtb_addr: usize) -> ! {
             dtb::init(dtb_addr)
         } else {
             kprintln!("[DTB] Register address invalid, scanning memory...");
-            dtb::init_scan(RAM_START, DEFAULT_RAM_SIZE)
+            dtb::init_scan(ram_start_fallback, default_ram_size)
         };
 
         match result {
@@ -1327,16 +1339,16 @@ fn riscv64_start(dtb_addr: usize) -> ! {
                         }
                         Err(_) => {
                             kprintln!("[DTB] Warning: Could not find memory node, using defaults");
-                            (RAM_START, DEFAULT_RAM_SIZE)
+                            (ram_start_fallback, default_ram_size)
                         }
                     }
                 } else {
-                    (RAM_START, DEFAULT_RAM_SIZE)
+                    (ram_start_fallback, default_ram_size)
                 }
             }
             Err(_) => {
                 kprintln!("[DTB] Warning: Failed to find/parse DTB, using defaults");
-                (RAM_START, DEFAULT_RAM_SIZE)
+                (ram_start_fallback, default_ram_size)
             }
         }
     };
@@ -1364,6 +1376,9 @@ fn riscv64_start(dtb_addr: usize) -> ! {
                             // 타이머 초기화
                             match arch::timer::init() {
                                 Ok(()) => {
+                                    // 시간 코어 초기화 (RTC + monotonic)
+                                    time::init();
+
                                     // 인터럽트 활성화
                                     unsafe {
                                         enable_irq_riscv();

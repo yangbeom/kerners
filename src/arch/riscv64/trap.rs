@@ -92,6 +92,14 @@ pub extern "C" fn trap_handler(ctx: &mut TrapContext) {
 
     if is_interrupt {
         handle_interrupt(ctx, cause_code);
+        // 이전 privilege가 U-mode면 복귀 직전에 pending signal 전달
+        let from_user = ((ctx.mstatus >> 11) & 0x3) == 0;
+        if from_user {
+            if crate::syscall::apply_pending_sigreturn_riscv64(ctx) {
+                return;
+            }
+            let _ = crate::syscall::deliver_pending_signal_riscv64(ctx);
+        }
     } else {
         handle_exception(ctx, cause_code);
     }
@@ -224,6 +232,8 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
                 ctx.gpr[10] = ret as u64; // 반환값을 a0에 저장
                 ctx.mepc += 4; // ecall 다음 명령어로 (ecall은 4바이트)
             }
+
+            let _ = crate::syscall::deliver_pending_signal_riscv64(ctx);
         }
         12 => {
             // Instruction page fault

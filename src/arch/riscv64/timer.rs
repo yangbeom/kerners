@@ -123,6 +123,8 @@ pub fn handle_irq() {
         kprintln!("[Timer] {} seconds elapsed", seconds);
     }
 
+    let _ = crate::proc::wake_sleepers_by_timer(crate::time::monotonic_now_ns());
+
     // 선점 스케줄링: 타이머 틱마다 스케줄러 호출
     crate::proc::scheduler::schedule();
 }

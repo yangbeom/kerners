@@ -12,7 +12,7 @@ use crate::{kprintln, block, fs, module};
 /// QEMU 종료
 ///
 /// - aarch64: ARM semihosting SYS_EXIT (HLT #0xF000)
-/// - riscv64: sifive_test 디바이스 (0x100000)에 write
+/// - riscv64: DTB의 sifive_test(syscon) 베이스에 write (미탐지 시 0x100000 폴백)
 pub fn qemu_exit(code: u32) -> ! {
     #[cfg(target_arch = "aarch64")]
     {
@@ -32,7 +32,8 @@ pub fn qemu_exit(code: u32) -> ! {
 
     #[cfg(target_arch = "riscv64")]
     {
-        // sifive_test 디바이스: 0x100000
+        let finisher_base = riscv_test_finisher_base();
+        // sifive_test 디바이스
         // FINISHER_PASS = 0x5555, FINISHER_FAIL = (code << 16) | 0x3333
         let value: u32 = if code == 0 {
             0x5555
@@ -40,12 +41,28 @@ pub fn qemu_exit(code: u32) -> ! {
             (code << 16) | 0x3333
         };
         unsafe {
-            core::ptr::write_volatile(0x10_0000 as *mut u32, value);
+            core::ptr::write_volatile(finisher_base as *mut u32, value);
         }
         loop {
             core::hint::spin_loop();
         }
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn riscv_test_finisher_base() -> usize {
+    const FINISHER_FALLBACK_BASE: usize = 0x10_0000;
+    if let Some(dt) = crate::dtb::get() {
+        const FINISHER_COMPATS: &[&str] = &["sifive,test1", "sifive,test0", "syscon"];
+        for compat in FINISHER_COMPATS {
+            if let Some(info) = dt.find_compatible(compat).into_iter().next() {
+                if info.reg_base != 0 {
+                    return info.reg_base as usize;
+                }
+            }
+        }
+    }
+    FINISHER_FALLBACK_BASE
 }
 
 /// FAT32 자동 마운트

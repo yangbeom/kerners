@@ -322,8 +322,7 @@ impl FatTable {
 
 #[inline]
 fn is_probably_kernel_ptr(addr: usize) -> bool {
-    // 현재 QEMU virt 환경에서 커널/힙/텍스트가 0x4000_0000 이상에 배치된다.
-    addr >= 0x4000_0000 && addr < 0x8000_0000
+    crate::mm::is_kernel_mapped_addr(addr)
 }
 
 /// FAT 테이블 에러

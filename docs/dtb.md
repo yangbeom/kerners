@@ -73,7 +73,7 @@ pub struct DeviceInfo {
 | 타입 | 용도 | 주요 필드 |
 |------|------|-----------|
 | `MemoryRegion` | RAM 영역 | base, size |
-| `GicInfo` | GIC (aarch64) | distributor_base, cpu_interface_base, version |
+| `GicInfo` | GIC (aarch64) | distributor_base/size, cpu_interface_base/size, redistributor_base/size, version |
 | `PlicInfo` | PLIC (riscv64) | base, size |
 | `ClintInfo` | CLINT (riscv64) | base, size |
 | `UartInfo` | UART | base, size, irq, clock_freq |
@@ -91,6 +91,9 @@ unsafe { dtb::init_scan(ram_start, ram_size) }
 
 // 전역 DTB 참조 얻기
 let dt: Option<&DeviceTree> = dtb::get();
+
+// DTB blob 실제 범위 (base, size)
+let blob: Option<(usize, usize)> = dtb::blob_range();
 ```
 
 `init_scan`은 RAM 끝에서 2MB 전 위치(QEMU 기본 배치)를 먼저 확인하고, 실패 시 RAM 시작 512KB 범위를 4KB 단위로 스캔합니다.
@@ -101,6 +104,9 @@ let dt: Option<&DeviceTree> = dtb::get();
 let region = dt.get_memory()?;
 // region.base: RAM 시작 주소
 // region.size: RAM 크기
+
+// (RISC-V) /cpus/timebase-frequency
+let timebase_hz: Option<u64> = dt.get_timebase_frequency();
 ```
 
 ### 디바이스 탐색
