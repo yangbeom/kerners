@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use crate::console;
 use crate::fs::{self, VfsError, VNodeType, FileMode};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
+use crate::proc;
 use crate::sync::Mutex;
 use super::errno;
 
@@ -45,6 +46,14 @@ const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
 const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
+const PPOLL_MAX_FDS: usize = 1024;
+
+const POLLIN: i16 = 0x0001;
+const POLLPRI: i16 = 0x0002;
+const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -107,6 +116,21 @@ struct LinuxStatFs {
     f_frsize: i64,
     f_flags: i64,
     f_spare: [i64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
 }
 
 const DT_UNKNOWN: u8 = 0;
@@ -903,6 +927,108 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
         core::ptr::write_unaligned(buf as *mut LinuxStatFs, linux);
     }
     0
+}
+
+/// sys_ppoll - 파일 디스크립터 이벤트 대기
+///
+/// baseline:
+/// - POLLIN/POLLPRI/POLLOUT만 readiness를 보고한다.
+/// - timeout이 지정된 경우에만 sleep 대기한다.
+/// - sigmask/sigsetsize는 현재 미사용이다.
+pub fn sys_ppoll(
+    fds: *mut u8,
+    nfds: usize,
+    timeout: *const u8,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> isize {
+    if nfds > PPOLL_MAX_FDS {
+        return errno::EINVAL;
+    }
+    if nfds > 0 && fds.is_null() {
+        return errno::EFAULT;
+    }
+
+    let timeout_deadline_ns = if timeout.is_null() {
+        None
+    } else {
+        let ts = unsafe {
+            // SAFETY: timeout 포인터가 non-null인지 확인했고, 리눅스 timespec ABI 크기만큼 읽는다.
+            core::ptr::read_unaligned(timeout as *const LinuxTimespec)
+        };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return errno::EINVAL;
+        }
+        let timeout_ns = (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64);
+        Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
+    };
+
+    let pollfds = fds as *mut LinuxPollFd;
+
+    loop {
+        let table = match fd::kernel_fd_table() {
+            Ok(t) => t,
+            Err(_) => return errno::EIO,
+        };
+
+        let mut ready = 0isize;
+        for idx in 0..nfds {
+            let entry_ptr = unsafe {
+                // SAFETY: nfds 경계를 보장한 루프에서 배열 원소 포인터를 계산한다.
+                pollfds.add(idx)
+            };
+            let mut entry = unsafe {
+                // SAFETY: 엔트리 크기만큼 비정렬 읽기를 수행한다.
+                core::ptr::read_unaligned(entry_ptr)
+            };
+            entry.revents = 0;
+
+            if entry.fd >= 0 {
+                if table.get(entry.fd).is_err() {
+                    entry.revents = POLLNVAL;
+                } else {
+                    if entry.events & POLLIN != 0 {
+                        entry.revents |= POLLIN;
+                    }
+                    if entry.events & POLLPRI != 0 {
+                        entry.revents |= POLLPRI;
+                    }
+                    if entry.events & POLLOUT != 0 {
+                        entry.revents |= POLLOUT;
+                    }
+                }
+            }
+
+            if entry.revents & (POLLIN | POLLPRI | POLLOUT | POLLERR | POLLHUP | POLLNVAL) != 0 {
+                ready += 1;
+            }
+
+            unsafe {
+                // SAFETY: 같은 엔트리 위치에 동일 크기 구조체를 비정렬 기록한다.
+                core::ptr::write_unaligned(entry_ptr, entry);
+            }
+        }
+
+        if ready > 0 {
+            return ready;
+        }
+
+        match timeout_deadline_ns {
+            Some(deadline_ns) => {
+                let now_ns = crate::time::monotonic_now_ns();
+                if now_ns >= deadline_ns {
+                    return 0;
+                }
+                let wake_reason = proc::sleep_current_until(deadline_ns);
+                if wake_reason == proc::SleepWakeReason::Signal {
+                    return errno::EINTR;
+                }
+            }
+            None => return 0,
+        }
+    }
 }
 
 /// sys_mkdir - 디렉토리 생성

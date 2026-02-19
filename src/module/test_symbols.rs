@@ -511,6 +511,28 @@ pub extern "C" fn kernel_sys_statfs(path: *const u8, statfs_buf: *mut u8) -> i64
     ) as i64
 }
 
+/// ppoll syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_ppoll(
+    fds: *mut u8,
+    nfds: usize,
+    timeout: *const u8,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_PPOLL,
+        [
+            fds as usize,
+            nfds,
+            timeout as usize,
+            sigmask as usize,
+            sigsetsize,
+            0,
+        ],
+    ) as i64
+}
+
 /// clock_gettime syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_clock_gettime(clock_id: i32, tp: *mut u8) -> i64 {
@@ -829,6 +851,7 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_pipe2", kernel_sys_pipe2 as usize);
     register_symbol("kernel_sys_readlinkat", kernel_sys_readlinkat as usize);
     register_symbol("kernel_sys_statfs", kernel_sys_statfs as usize);
+    register_symbol("kernel_sys_ppoll", kernel_sys_ppoll as usize);
     register_symbol("kernel_sys_clock_gettime", kernel_sys_clock_gettime as usize);
     register_symbol("kernel_sys_clock_getres", kernel_sys_clock_getres as usize);
     register_symbol("kernel_sys_gettimeofday", kernel_sys_gettimeofday as usize);
@@ -866,5 +889,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 56);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 57);
 }

@@ -29,6 +29,9 @@ pub const SYS_PIPE2: usize = 59;
 /// getdents64(fd, dirp, count) -> int
 pub const SYS_GETDENTS64: usize = 61;
 
+/// ppoll(fds, nfds, timeout, sigmask, sigsetsize) -> int
+pub const SYS_PPOLL: usize = 73;
+
 /// readlinkat(dirfd, path, buf, bufsiz) -> ssize_t
 pub const SYS_READLINKAT: usize = 78;
 
@@ -225,6 +228,13 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         SYS_STATFS => fs::sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYS_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1] as u32),
         SYS_GETDENTS64 => fs::sys_getdents64(args[0] as i32, args[1] as *mut u8, args[2]),
+        SYS_PPOLL => fs::sys_ppoll(
+            args[0] as *mut u8,
+            args[1],
+            args[2] as *const u8,
+            args[3] as *const u8,
+            args[4],
+        ),
         SYS_READLINKAT => fs::sys_readlinkat(
             args[0] as i32,
             args[1] as *const u8,
