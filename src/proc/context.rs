@@ -42,8 +42,16 @@ impl Context {
     /// 빈 컨텍스트 생성
     pub const fn empty() -> Self {
         Context {
-            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
-            x24: 0, x25: 0, x26: 0, x27: 0, x28: 0,
+            x19: 0,
+            x20: 0,
+            x21: 0,
+            x22: 0,
+            x23: 0,
+            x24: 0,
+            x25: 0,
+            x26: 0,
+            x27: 0,
+            x28: 0,
             fp: 0,
             lr: 0,
             sp: 0,
@@ -56,10 +64,18 @@ impl Context {
     /// stack_top: 스택 최상위 주소
     pub fn new(entry: usize, stack_top: usize) -> Self {
         Context {
-            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
-            x24: 0, x25: 0, x26: 0, x27: 0, x28: 0,
+            x19: 0,
+            x20: 0,
+            x21: 0,
+            x22: 0,
+            x23: 0,
+            x24: 0,
+            x25: 0,
+            x26: 0,
+            x27: 0,
+            x28: 0,
             fp: 0,
-            lr: entry as u64,  // 컨텍스트 스위치 후 "ret"이 이 주소로 점프
+            lr: entry as u64, // 컨텍스트 스위치 후 "ret"이 이 주소로 점프
             sp: stack_top as u64,
         }
     }
@@ -75,7 +91,7 @@ pub struct Context {
     /// Stack pointer (x2)
     pub sp: u64,
     /// Saved registers s0-s11 (x8-x9, x18-x27)
-    pub s0: u64,  // x8 / fp
+    pub s0: u64, // x8 / fp
     pub s1: u64,  // x9
     pub s2: u64,  // x18
     pub s3: u64,  // x19
@@ -96,18 +112,38 @@ impl Context {
         Context {
             ra: 0,
             sp: 0,
-            s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0,
-            s6: 0, s7: 0, s8: 0, s9: 0, s10: 0, s11: 0,
+            s0: 0,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
         }
     }
 
     /// 새 스레드를 위한 컨텍스트 생성
     pub fn new(entry: usize, stack_top: usize) -> Self {
         Context {
-            ra: entry as u64,  // ret이 이 주소로 점프
+            ra: entry as u64, // ret이 이 주소로 점프
             sp: stack_top as u64,
-            s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0,
-            s6: 0, s7: 0, s8: 0, s9: 0, s10: 0, s11: 0,
+            s0: 0,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
         }
     }
 }

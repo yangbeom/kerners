@@ -4,9 +4,9 @@
 //! 전역 THREADS 리스트에서 Ready 상태의 스레드를 선택합니다.
 //! CPU 친화도(cpu_affinity)가 설정된 스레드는 지정된 CPU에서만 실행됩니다.
 
-use super::{ThreadState, THREADS};
-use super::context::{Context, context_switch};
+use super::context::{context_switch, Context};
 use super::percpu;
+use super::{ThreadState, THREADS};
 use core::sync::atomic::Ordering;
 
 /// 스케줄러: 현재 CPU에서 다음 실행할 스레드를 선택하고 컨텍스트 스위칭 수행
@@ -58,7 +58,9 @@ pub fn schedule() {
             Some(idx) => idx,
             None => {
                 if let Some(thread) = threads.get_mut(current_idx) {
-                    if thread.state == ThreadState::Terminated || thread.state == ThreadState::Blocked {
+                    if thread.state == ThreadState::Terminated
+                        || thread.state == ThreadState::Blocked
+                    {
                         // 종료/블록된 스레드 → 이 CPU의 idle 스레드로 전환
                         let idle_idx = pc.idle_thread_idx.load(Ordering::Relaxed) as usize;
                         if idle_idx < threads.len() {
@@ -91,14 +93,15 @@ pub fn schedule() {
         }
 
         // 컨텍스트 포인터 얻기
-        let old_ctx = threads.get_mut(current_idx)
+        let old_ctx = threads
+            .get_mut(current_idx)
             .map(|t| &mut t.context as *mut Context);
-        let new_ctx = threads.get(next_idx)
-            .map(|t| &t.context as *const Context);
+        let new_ctx = threads.get(next_idx).map(|t| &t.context as *const Context);
         let next_root = threads.get(next_idx).map(|t| t.user_root_table);
 
         // Per-CPU 현재 스레드 인덱스 업데이트
-        pc.current_thread_idx.store(next_idx as u32, Ordering::Release);
+        pc.current_thread_idx
+            .store(next_idx as u32, Ordering::Release);
 
         match (old_ctx, new_ctx, next_root) {
             (Some(old), Some(new), Some(root)) => (old, new, root),
@@ -124,11 +127,17 @@ pub fn schedule() {
 /// 실행 가능한 스레드 수 반환
 pub fn ready_count() -> usize {
     let threads = THREADS.lock();
-    threads.iter().filter(|t| t.state == ThreadState::Ready).count()
+    threads
+        .iter()
+        .filter(|t| t.state == ThreadState::Ready)
+        .count()
 }
 
 /// 활성 스레드 수 반환 (종료되지 않은)
 pub fn active_count() -> usize {
     let threads = THREADS.lock();
-    threads.iter().filter(|t| t.state != ThreadState::Terminated).count()
+    threads
+        .iter()
+        .filter(|t| t.state != ThreadState::Terminated)
+        .count()
 }

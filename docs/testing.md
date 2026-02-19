@@ -28,6 +28,7 @@ make test
   │     → target/modules/{arch}/test_fork.ko
   │     → target/modules/{arch}/test_brk.ko
   │     → target/modules/{arch}/test_mmap.ko
+  │     → target/modules/{arch}/test_signal.ko
   │
   ├─ 2) FAT32 디스크 이미지 생성 + .ko 파일 복사
   │     → disk.img (mcopy로 .ko를 FAT32에 넣음, `KERNERS_DISK_IMG`로 경로 override 가능)
@@ -68,7 +69,7 @@ $ make test ARCH=aarch64
 
 === KERNERS TEST SUITE START ===
 
-[test] Found 11 test module(s)
+[test] Found 12 test module(s)
 
 [test] Loading /mnt/TEST_IPC.KO ...     (FAT32 8.3 대문자)
 [test_ipc] mq create .................. PASS
@@ -116,8 +117,13 @@ $ make test ARCH=aarch64
 [test_mmap] anonymous map/mprotect .... PASS
 [test_mmap] MAP_FIXED replace ......... PASS
 
+[test] Loading /mnt/test_signal.ko ...
+[test_signal] rt_sigtimedwait poll ..... PASS
+[test_signal] masked signal wake ....... PASS
+[test_signal] EINTR path ............... PASS
+
 === KERNERS TEST SUITE END ===
-RESULT: 11 passed, 0 failed
+RESULT: 12 passed, 0 failed
 TEST_STATUS: PASS
 
 → qemu_exit(0)
@@ -194,6 +200,10 @@ make test-all
   - `mmap` + `munmap` 부분 해제
   - `mprotect` 권한 변경 호출
   - `MAP_FIXED` 덮어쓰기 매핑
+- `modules/test_signal`
+  - `rt_sigtimedwait` poll/timeout/blocking/EINTR
+  - `SIGKILL`/`SIGSTOP` unmaskable + `rt_sigaction` 제약
+  - `SIGCONT` pending wait 경로
 
 ### modules/test_mm — 메모리 관리
 
@@ -295,6 +305,17 @@ make test-all
 | shared writeback | `munmap` 후 재매핑/재읽기에서 flush 결과 반영 확인 |
 | invalid args | `fd`, `offset` 정렬, `offset+len > file_size`(`EINVAL`) 검증 |
 | riscv file-backed arg check | invalid fd에서 `EBADF` 반환 확인 |
+
+### modules/test_signal — signal syscall
+
+| 테스트 | 설명 |
+|--------|------|
+| rt_sigtimedwait poll/timeout | 매칭 pending 없음 + 0/유한 timeout에서 `EAGAIN` 검증 |
+| masked signal wake + consume | 마스크된 `SIGTERM` pending을 `rt_sigtimedwait`로 수신 검증 |
+| EINTR path | waitset 밖 시그널(`SIGCHLD`)로 `rt_sigtimedwait`가 `EINTR`로 깨어나는지 검증 |
+| SIGCONT wait | `SIGCONT` pending을 waitset으로 수신 검증 |
+| unmaskable check | `SIGKILL`/`SIGSTOP` bit가 `rt_sigprocmask`에서 적용되지 않는지 검증 |
+| sigaction restrictions | `SIGKILL`/`SIGSTOP`에 대한 `rt_sigaction`이 `EINVAL`인지 검증 |
 
 ## 커널 심볼 익스포트
 

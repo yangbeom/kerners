@@ -4,6 +4,8 @@
 
 use super::errno;
 use crate::fs;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+use crate::fs::fd;
 use crate::kprintln;
 use crate::proc;
 use crate::sync::Mutex;
@@ -11,8 +13,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-use crate::fs::fd;
 
 const MAX_EXEC_PATH_LEN: usize = 4096;
 const MAX_EXEC_ARG_COUNT: usize = 128;
@@ -109,6 +109,7 @@ struct ProcessInfo {
     files_group: u64,
     sighand_group: u64,
     signal_mask: u64,
+    sigtimedwait_mask: u64,
     pending_signals: Vec<u32>,
     exit_signal: u32,
 }
@@ -235,7 +236,9 @@ const WAITID_IDTYPE_PID: i32 = 1;
 const WAITID_IDTYPE_PGID: i32 = 2;
 const SIGNAL_SIGKILL: u32 = 9;
 const SIGNAL_SIGSEGV: u32 = 11;
+const SIGNAL_SIGTERM: u32 = 15;
 const SIGNAL_SIGCHLD: u32 = 17;
+const SIGNAL_SIGCONT: u32 = 18;
 const SIGNAL_SIGSTOP: u32 = 19;
 const SIGINFO_CLD_EXITED: i32 = 1;
 const SIGINFO_CLD_KILLED: i32 = 2;
@@ -604,6 +607,7 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         files_group: default_group,
         sighand_group: default_group,
         signal_mask: 0,
+        sigtimedwait_mask: 0,
         pending_signals: Vec::new(),
         exit_signal: 0,
     });
@@ -722,8 +726,8 @@ fn ensure_vm_space_root(vm_group: u64) -> usize {
     if let Some(space) = spaces.iter().find(|s| s.vm_group == vm_group) {
         return space.root_table;
     }
-    let root = crate::proc::current_user_root_table()
-        .unwrap_or(crate::arch::mmu::current_root_table());
+    let root =
+        crate::proc::current_user_root_table().unwrap_or(crate::arch::mmu::current_root_table());
     spaces.push(VmSpace {
         vm_group,
         root_table: root,
@@ -950,7 +954,11 @@ fn get_or_create_file_cache_page(
     Ok(frame)
 }
 
-fn flush_file_region_pages(region: &MmapRegion, start_page: usize, pages: usize) -> Result<(), isize> {
+fn flush_file_region_pages(
+    region: &MmapRegion,
+    start_page: usize,
+    pages: usize,
+) -> Result<(), isize> {
     let MmapBacking::File(backing) = &region.backing else {
         return Ok(());
     };
@@ -1031,10 +1039,14 @@ fn setup_cow_pair(
     frame: usize,
     execute: bool,
 ) -> Result<(), isize> {
-    if crate::arch::mmu::update_user_page_flags_for_root_noflush(parent_root, va, false, execute).is_err() {
+    if crate::arch::mmu::update_user_page_flags_for_root_noflush(parent_root, va, false, execute)
+        .is_err()
+    {
         return Err(errno::EINVAL);
     }
-    if crate::arch::mmu::update_user_page_flags_for_root_noflush(child_root, va, false, execute).is_err() {
+    if crate::arch::mmu::update_user_page_flags_for_root_noflush(child_root, va, false, execute)
+        .is_err()
+    {
         return Err(errno::EINVAL);
     }
     set_cow_meta(parent_vm_group, va, frame, execute, CowOrigin::Fork);
@@ -1051,8 +1063,8 @@ fn handle_user_page_fault_write(far: usize) -> bool {
     }
 
     let current_vm_group = current_vm_group();
-    let active_root = crate::proc::current_user_root_table()
-        .unwrap_or(crate::arch::mmu::current_root_table());
+    let active_root =
+        crate::proc::current_user_root_table().unwrap_or(crate::arch::mmu::current_root_table());
     let (vm_group, cow) = {
         let cows = COW_PAGES.lock();
         if let Some(item) = cows
@@ -1069,7 +1081,12 @@ fn handle_user_page_fault_write(far: usize) -> bool {
                     break;
                 }
             }
-            (fallback.map(|item| item.vm_group).unwrap_or(current_vm_group), fallback)
+            (
+                fallback
+                    .map(|item| item.vm_group)
+                    .unwrap_or(current_vm_group),
+                fallback,
+            )
         }
     };
     let Some(cow) = cow else {
@@ -1104,8 +1121,14 @@ fn handle_user_page_fault_write(far: usize) -> bool {
                 page_size,
             );
         }
-        if crate::arch::mmu::map_user_page_for_root_noflush(root_table, va, new_frame, true, cow.execute)
-            .is_err()
+        if crate::arch::mmu::map_user_page_for_root_noflush(
+            root_table,
+            va,
+            new_frame,
+            true,
+            cow.execute,
+        )
+        .is_err()
         {
             unsafe {
                 // SAFETY: map 실패 시 새 프레임만 즉시 반납한다.
@@ -1118,8 +1141,13 @@ fn handle_user_page_fault_write(far: usize) -> bool {
             // SAFETY: 기존 공유 프레임에 대한 현재 매핑 참조를 해제한다.
             crate::mm::page::free_frame(source_frame);
         }
-    } else if crate::arch::mmu::update_user_page_flags_for_root_noflush(root_table, va, true, cow.execute)
-        .is_err()
+    } else if crate::arch::mmu::update_user_page_flags_for_root_noflush(
+        root_table,
+        va,
+        true,
+        cow.execute,
+    )
+    .is_err()
     {
         return false;
     }
@@ -1183,15 +1211,61 @@ fn signal_is_blocked(mask: u64, signum: u32) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultSignalDisposition {
+    Ignore,
+    Terminate,
+    Stop,
+    Continue,
+}
+
+fn default_signal_disposition(signum: u32) -> DefaultSignalDisposition {
+    match signum {
+        SIGNAL_SIGCHLD => DefaultSignalDisposition::Ignore,
+        SIGNAL_SIGSTOP => DefaultSignalDisposition::Stop,
+        SIGNAL_SIGCONT => DefaultSignalDisposition::Continue,
+        SIGNAL_SIGKILL | SIGNAL_SIGTERM | SIGNAL_SIGSEGV => DefaultSignalDisposition::Terminate,
+        _ => DefaultSignalDisposition::Terminate,
+    }
+}
+
+fn set_sigtimedwait_mask_for_tid(tid: proc::Tid, mask: u64) {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let unwaitable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
+    processes[idx].sigtimedwait_mask = mask & !unwaitable;
+}
+
+fn clear_sigtimedwait_mask_for_tid(tid: proc::Tid) {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].sigtimedwait_mask = 0;
+}
+
 fn enqueue_signal(tid: proc::Tid, signum: u32) {
     if signal_to_mask(signum) == 0 {
         return;
     }
+
     let mut processes = PROCESS_INFOS.lock();
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
     let mask = processes[idx].signal_mask;
+    let sigtimedwait_mask = processes[idx].sigtimedwait_mask;
+
+    if signum == SIGNAL_SIGCONT {
+        processes[idx]
+            .pending_signals
+            .retain(|&pending| pending != SIGNAL_SIGSTOP);
+    } else if signum == SIGNAL_SIGSTOP {
+        processes[idx]
+            .pending_signals
+            .retain(|&pending| pending != SIGNAL_SIGCONT);
+    }
+
     processes[idx].pending_signals.push(signum);
-    let wake_for_signal = !signal_is_blocked(mask, signum);
+    let wake_for_sigtimedwait = signal_mask_contains(sigtimedwait_mask, signum);
+    let wake_for_signal =
+        wake_for_sigtimedwait || !signal_is_blocked(mask, signum) || signum == SIGNAL_SIGCONT;
     drop(processes);
 
     if wake_for_signal {
@@ -1251,8 +1325,31 @@ fn prepare_pending_signal_delivery(tid: proc::Tid) -> Option<(u32, LinuxSigActio
         if action.sa_handler == SIG_IGN {
             continue;
         }
-        if action.sa_handler == SIG_DFL && signum == SIGNAL_SIGCHLD {
-            continue;
+
+        if action.sa_handler == SIG_DFL {
+            match default_signal_disposition(signum) {
+                DefaultSignalDisposition::Ignore | DefaultSignalDisposition::Continue => {
+                    continue;
+                }
+                DefaultSignalDisposition::Stop => {
+                    let _ = proc::block_thread_for_signal_stop(tid);
+                    proc::yield_now();
+                    continue;
+                }
+                DefaultSignalDisposition::Terminate => {
+                    finalize_exit_by_signal(tid, signum);
+                    kprintln!(
+                        "[signal] tid={} default action terminate by signal {}",
+                        tid,
+                        signum
+                    );
+                    if tid == current_tid_or_zero() {
+                        proc::exit();
+                    }
+                    let _ = proc::terminate_thread_for_signal(tid);
+                    return None;
+                }
+            }
         }
 
         let old_mask = {
@@ -1267,16 +1364,6 @@ fn prepare_pending_signal_delivery(tid: proc::Tid) -> Option<(u32, LinuxSigActio
             processes[idx].signal_mask = next_mask & !unmaskable;
             old
         };
-
-        if action.sa_handler == SIG_DFL {
-            finalize_exit_by_signal(tid, signum);
-            kprintln!(
-                "[signal] tid={} default action terminate by signal {}",
-                tid,
-                signum
-            );
-            proc::exit();
-        }
 
         return Some((signum, action, old_mask));
     }
@@ -1383,12 +1470,7 @@ pub fn deliver_pending_signal_riscv64(ctx: &mut crate::arch::trap::TrapContext) 
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn sys_rt_sigreturn_aarch64(
-    _gpr: [u64; 31],
-    _elr: u64,
-    _spsr: u64,
-    sp_el0: usize,
-) -> isize {
+pub fn sys_rt_sigreturn_aarch64(_gpr: [u64; 31], _elr: u64, _spsr: u64, sp_el0: usize) -> isize {
     let frame_size = core::mem::size_of::<KernelSigFrameAarch64>();
     if validate_user_pointer(sp_el0, frame_size).is_err() {
         return errno::EFAULT;
@@ -1421,11 +1503,7 @@ pub fn sys_rt_sigreturn_aarch64(
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn sys_rt_sigreturn_riscv(
-    gpr: [u64; 32],
-    _mstatus: u64,
-    _mepc: u64,
-) -> isize {
+pub fn sys_rt_sigreturn_riscv(gpr: [u64; 32], _mstatus: u64, _mepc: u64) -> isize {
     let sp = gpr[2] as usize;
     let frame_size = core::mem::size_of::<KernelSigFrameRiscv64>();
     if validate_user_pointer(sp, frame_size).is_err() {
@@ -1462,9 +1540,7 @@ pub fn sys_rt_sigreturn() -> isize {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn apply_pending_sigreturn_aarch64(
-    ctx: &mut crate::arch::exception::ExceptionContext,
-) -> bool {
+pub fn apply_pending_sigreturn_aarch64(ctx: &mut crate::arch::exception::ExceptionContext) -> bool {
     let tid = current_tid_or_zero();
     let mut pending = PENDING_SIGRETURN_AARCH64.lock();
     let pos = match pending.iter().position(|item| item.tid == tid) {
@@ -1490,9 +1566,7 @@ pub fn apply_pending_sigreturn_aarch64(
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn apply_pending_sigreturn_riscv64(
-    ctx: &mut crate::arch::trap::TrapContext,
-) -> bool {
+pub fn apply_pending_sigreturn_riscv64(ctx: &mut crate::arch::trap::TrapContext) -> bool {
     let tid = current_tid_or_zero();
     let mut pending = PENDING_SIGRETURN_RISCV64.lock();
     let pos = match pending.iter().position(|item| item.tid == tid) {
@@ -1895,22 +1969,21 @@ pub fn sys_set_tid_address(_tidptr: *mut i32) -> isize {
 /// sys_rt_sigaction - 시그널 액션 설정
 ///
 /// sighand_group 단위로 시그널 핸들러를 등록/조회한다.
-pub fn sys_rt_sigaction(
-    signum: i32,
-    act: *const u8,
-    oldact: *mut u8,
-    sigsetsize: usize,
-) -> isize {
+pub fn sys_rt_sigaction(signum: i32, act: *const u8, oldact: *mut u8, sigsetsize: usize) -> isize {
     if sigsetsize < MIN_SIGSET_SIZE {
         return errno::EINVAL;
     }
     if signum <= 0 || signum > MAX_SIGNAL_COUNT as i32 {
         return errno::EINVAL;
     }
-    if !oldact.is_null() && validate_user_pointer(oldact as usize, core::mem::size_of::<LinuxSigAction>()).is_err() {
+    if !oldact.is_null()
+        && validate_user_pointer(oldact as usize, core::mem::size_of::<LinuxSigAction>()).is_err()
+    {
         return errno::EFAULT;
     }
-    if !act.is_null() && validate_user_pointer(act as usize, core::mem::size_of::<LinuxSigAction>()).is_err() {
+    if !act.is_null()
+        && validate_user_pointer(act as usize, core::mem::size_of::<LinuxSigAction>()).is_err()
+    {
         return errno::EFAULT;
     }
 
@@ -1980,6 +2053,11 @@ pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize:
         _ => return errno::EINVAL,
     }
 
+    drop(processes);
+    if has_unmasked_pending_signal(tid) {
+        let _ = proc::wake_thread_for_signal(tid);
+    }
+
     0
 }
 
@@ -1993,7 +2071,9 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
     if validate_user_pointer(req as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
         return errno::EFAULT;
     }
-    if !rem.is_null() && validate_user_pointer(rem as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+    if !rem.is_null()
+        && validate_user_pointer(rem as usize, core::mem::size_of::<LinuxTimespec>()).is_err()
+    {
         return errno::EFAULT;
     }
 
@@ -2010,7 +2090,10 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
         .saturating_add(req_ts.tv_nsec as u64);
     if req_ns == 0 {
         if !rem.is_null() {
-            let zero = LinuxTimespec { tv_sec: 0, tv_nsec: 0 };
+            let zero = LinuxTimespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
             unsafe {
                 // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
                 core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
@@ -2036,7 +2119,10 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
         let now = crate::time::monotonic_now_ns();
         if now >= deadline_ns {
             if !rem.is_null() {
-                let zero = LinuxTimespec { tv_sec: 0, tv_nsec: 0 };
+                let zero = LinuxTimespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
                 unsafe {
                     // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
                     core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
@@ -2177,7 +2263,10 @@ pub fn sys_kill(pid: isize, sig: i32) -> isize {
         processes.iter().any(|p| p.tid == target_tid)
     };
     if !exists {
-        return errno::ESRCH;
+        if !proc::thread_exists(target_tid) {
+            return errno::ESRCH;
+        }
+        ensure_process_info_for_tid(target_tid);
     }
     if sig != 0 {
         enqueue_signal(target_tid, sig as u32);
@@ -2203,7 +2292,10 @@ pub fn sys_tkill(tid: isize, sig: i32) -> isize {
         processes.iter().any(|p| p.tid == target_tid)
     };
     if !exists {
-        return errno::ESRCH;
+        if !proc::thread_exists(target_tid) {
+            return errno::ESRCH;
+        }
+        ensure_process_info_for_tid(target_tid);
     }
     if sig != 0 {
         enqueue_signal(target_tid, sig as u32);
@@ -2235,13 +2327,30 @@ pub fn sys_tgkill(tgid: isize, tid: isize, sig: i32) -> isize {
     sys_tkill(mapped_tid, sig)
 }
 
+fn write_sigtimedwait_info(info: *mut u8, signum: u32) {
+    if info.is_null() {
+        return;
+    }
+
+    let siginfo = LinuxSigInfoHeader {
+        si_signo: signum as i32,
+        si_errno: 0,
+        si_code: 0,
+        _pad: 0,
+    };
+    unsafe {
+        // SAFETY: 호출자가 전달한 사용자 포인터 범위를 선검증한 뒤 siginfo 헤더를 기록한다.
+        core::ptr::write_unaligned(info as *mut LinuxSigInfoHeader, siginfo);
+    }
+}
+
 /// sys_rt_sigtimedwait - 지정 시그널 대기
 ///
 /// pending signal queue에서 조건에 맞는 시그널을 하나 꺼내 반환한다.
 pub fn sys_rt_sigtimedwait(
     set: *const u8,
     info: *mut u8,
-    _timeout: *const u8,
+    timeout: *const u8,
     sigsetsize: usize,
 ) -> isize {
     if set.is_null() {
@@ -2250,26 +2359,83 @@ pub fn sys_rt_sigtimedwait(
     if sigsetsize < MIN_SIGSET_SIZE {
         return errno::EINVAL;
     }
+    if validate_user_pointer(set as usize, MIN_SIGSET_SIZE).is_err() {
+        return errno::EFAULT;
+    }
+    if !info.is_null()
+        && validate_user_pointer(info as usize, core::mem::size_of::<LinuxSigInfoHeader>()).is_err()
+    {
+        return errno::EFAULT;
+    }
 
-    let accepted = read_user_u64(set);
-    let tid = current_tid_or_zero();
-    if let Some(signum) = take_pending_signal(tid, accepted) {
-        if !info.is_null() {
-            let siginfo = LinuxSigInfoHeader {
-                si_signo: signum as i32,
-                si_errno: 0,
-                si_code: 0,
-                _pad: 0,
-            };
-            unsafe {
-                // SAFETY: syscall 호출자 계약 상 info 포인터는 siginfo_t 저장 가능한 영역을 가리킨다.
-                core::ptr::write_unaligned(info as *mut LinuxSigInfoHeader, siginfo);
-            }
+    let timeout_deadline_ns = if timeout.is_null() {
+        None
+    } else {
+        if validate_user_pointer(timeout as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
+            return errno::EFAULT;
         }
+        let ts = unsafe {
+            // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 읽는다.
+            core::ptr::read_unaligned(timeout as *const LinuxTimespec)
+        };
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return errno::EINVAL;
+        }
+        let timeout_ns = (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64);
+        Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
+    };
+
+    let unwaitable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
+    let accepted = read_user_u64(set) & !unwaitable;
+    let tid = current_tid_or_zero();
+    clear_sigtimedwait_mask_for_tid(tid);
+
+    if let Some(signum) = take_pending_signal(tid, accepted) {
+        write_sigtimedwait_info(info, signum);
         return signum as isize;
     }
 
-    errno::EAGAIN
+    if let Some(deadline_ns) = timeout_deadline_ns {
+        if crate::time::monotonic_now_ns() >= deadline_ns {
+            return errno::EAGAIN;
+        }
+    }
+
+    loop {
+        set_sigtimedwait_mask_for_tid(tid, accepted);
+
+        if let Some(signum) = take_pending_signal(tid, accepted) {
+            clear_sigtimedwait_mask_for_tid(tid);
+            write_sigtimedwait_info(info, signum);
+            return signum as isize;
+        }
+
+        let sleep_deadline = timeout_deadline_ns.unwrap_or(u64::MAX);
+        if sleep_deadline != u64::MAX && crate::time::monotonic_now_ns() >= sleep_deadline {
+            clear_sigtimedwait_mask_for_tid(tid);
+            return errno::EAGAIN;
+        }
+
+        let wake_reason = proc::sleep_current_until(sleep_deadline);
+        clear_sigtimedwait_mask_for_tid(tid);
+
+        if let Some(signum) = take_pending_signal(tid, accepted) {
+            write_sigtimedwait_info(info, signum);
+            return signum as isize;
+        }
+
+        if let Some(deadline_ns) = timeout_deadline_ns {
+            if crate::time::monotonic_now_ns() >= deadline_ns {
+                return errno::EAGAIN;
+            }
+        }
+
+        if wake_reason == proc::SleepWakeReason::Signal {
+            return errno::EINTR;
+        }
+    }
 }
 
 /// sys_socket - 소켓 생성
@@ -2348,6 +2514,7 @@ pub fn sys_clone(
             files_group: child_files_group,
             sighand_group: child_sighand_group,
             signal_mask: parent_mask,
+            sigtimedwait_mask: 0,
             pending_signals: Vec::new(),
             exit_signal,
         });
@@ -2436,6 +2603,7 @@ fn finalize_clone_with_vm_setup(
             files_group: child_files_group,
             sighand_group: child_sighand_group,
             signal_mask: parent_mask,
+            sigtimedwait_mask: 0,
             pending_signals: Vec::new(),
             exit_signal,
         });
@@ -2667,6 +2835,7 @@ pub fn sys_clone_with_user_context(
             files_group: child_files_group,
             sighand_group: child_sighand_group,
             signal_mask: parent_mask,
+            sigtimedwait_mask: 0,
             pending_signals: Vec::new(),
             exit_signal,
         });
@@ -3365,10 +3534,8 @@ pub fn sys_brk(addr: usize) -> isize {
                     None => {
                         for (rollback_idx, rollback_frame) in staged.drain(..).rev() {
                             let va = region.base + rollback_idx * page_size;
-                            let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(
-                                root_table,
-                                va,
-                            );
+                            let _ =
+                                crate::arch::mmu::unmap_user_page_for_root_noflush(root_table, va);
                             region.pages[rollback_idx] = None;
                             unsafe {
                                 // SAFETY: 실패 경로에서 이번 호출 중 확보한 프레임만 반환한다.
@@ -3713,11 +3880,7 @@ pub fn sys_mmap(
             };
 
             if crate::arch::mmu::map_user_page_for_root_noflush(
-                root_table,
-                va,
-                frame,
-                map_write,
-                execute,
+                root_table, va, frame, map_write, execute,
             )
             .is_err()
             {
@@ -3865,11 +4028,9 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
         let mut cursor = addr;
         while cursor < end {
-            let found_idx = regions
-                .iter()
-                .position(|r| {
-                    r.vm_group == vm_group && r.base <= cursor && cursor < mmap_region_end(r)
-                });
+            let found_idx = regions.iter().position(|r| {
+                r.vm_group == vm_group && r.base <= cursor && cursor < mmap_region_end(r)
+            });
             let Some(idx) = found_idx else {
                 return errno::ENOMEM;
             };

@@ -33,10 +33,10 @@ Rust로 작성된 aarch64/riscv64 베어메탈 커널
 
 ```bash
 # aarch64 빌드
-cargo build --release --target targets/aarch64-unknown-none.json
+cargo build --release --target aarch64-unknown-none-softfloat
 
 # riscv64 빌드
-cargo build --release --target targets/riscv64-unknown-elf.json
+cargo build --release --target riscv64gc-unknown-none-elf
 ```
 
 ### QEMU 실행

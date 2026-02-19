@@ -20,13 +20,13 @@
 
 ```bash
 # Build for aarch64 (default)
-cargo build --release --target targets/aarch64-unknown-none.json
+cargo build --release --target aarch64-unknown-none-softfloat
 
 # Build for riscv64
-cargo build --release --target targets/riscv64-unknown-elf.json
+cargo build --release --target riscv64gc-unknown-none-elf
 
 # Build with embedded test module
-cargo build --release --target targets/aarch64-unknown-none.json --features embed_test_module
+cargo build --release --target aarch64-unknown-none-softfloat --features embed_test_module
 ```
 
 ### Running with QEMU
@@ -439,6 +439,7 @@ kerners/
 ├── modules/test_brk/        # brk grow/shrink regression test module
 ├── modules/test_mmap/       # mmap/munmap/mprotect regression test module
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep regression test module
+├── modules/test_signal/     # signal syscall regression test module
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files

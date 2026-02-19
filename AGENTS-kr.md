@@ -99,6 +99,7 @@ kerners/
 ├── modules/test_brk/        # brk 확장/축소 회귀 테스트 모듈
 ├── modules/test_mmap/       # mmap/munmap/mprotect 회귀 테스트 모듈
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
+├── modules/test_signal/     # signal syscall 회귀 테스트 모듈
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
@@ -113,10 +114,10 @@ kerners/
 
 ```bash
 # aarch64 빌드
-cargo build --release --target targets/aarch64-unknown-none.json
+cargo build --release --target aarch64-unknown-none-softfloat
 
 # riscv64 빌드
-cargo build --release --target targets/riscv64-unknown-elf.json
+cargo build --release --target riscv64gc-unknown-none-elf
 
 # QEMU로 실행 (기본: aarch64, 512MB RAM)
 ./run.sh
@@ -199,7 +200,7 @@ mount                # 마운트 목록
 ./run.sh
 
 # 테스트 모듈 포함 빌드
-cargo build --release --target targets/aarch64-unknown-none.json --features embed_test_module
+cargo build --release --target aarch64-unknown-none-softfloat --features embed_test_module
 ```
 
 ## Development Workflow

@@ -1,11 +1,20 @@
 {
-    "llvm-target": "riscv64-unknown-elf",
-    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n64-S128",
+    "llvm-target": "riscv64",
+    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
     "arch": "riscv64",
     "os": "none",
     "vendor": "unknown",
-    "linker": "riscv64-unknown-elf-gcc",
+    "linker-flavor": "gnu-lld",
+    "linker": "rust-lld",
     "executables": true,
-    "cpu": "generic",
-    "features": ""
+    "cpu": "generic-rv64",
+    "features": "+m,+a,+f,+d,+c,+zicsr,+zifencei",
+    "target-pointer-width": 64,
+    "panic-strategy": "abort",
+    "code-model": "medium",
+    "relocation-model": "static",
+    "eh-frame-header": false,
+    "emit-debug-gdb-scripts": false,
+    "llvm-abiname": "lp64d",
+    "max-atomic-width": 64
 }

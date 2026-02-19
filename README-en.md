@@ -33,10 +33,10 @@ A bare-metal Rust kernel for aarch64 and riscv64 architectures.
 
 ```bash
 # Build for aarch64
-cargo build --release --target targets/aarch64-unknown-none.json
+cargo build --release --target aarch64-unknown-none-softfloat
 
 # Build for riscv64
-cargo build --release --target targets/riscv64-unknown-elf.json
+cargo build --release --target riscv64gc-unknown-none-elf
 ```
 
 ### Run with QEMU

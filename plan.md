@@ -13,6 +13,27 @@
 | Phase 7: Multi-core (SMP) | ✅ 완료 | Per-CPU, SMP 부트, IPI, SMP-aware 스케줄러 |
 | Phase 8: 테스트 인프라 | ✅ 완료 | 커널 모듈 기반 QEMU 자동 테스트, `make test` |
 | Phase 9: 커널 로깅 시스템 | ✅ 완료 | 로그 레벨, 타임스탬프, CPU ID, 링 버퍼, dmesg |
+| Phase 10: 프로세스 관리 강화 | ✅ 완료 | BusyBox init 부팅, clone/fork/vfork, wait/pgid/sid 계열 |
+| Phase 11: 메모리 관리 syscall | ✅ 완료 | brk/mmap/munmap/mprotect, fork COW, fault COW |
+| Phase 12: 시간/타이머 syscall | 🟡 대부분 완료 | core 완료, 12-A BusyBox smoke 회귀만 잔여 |
+| Phase 13: 시그널 처리 | ✅ 완료 | `rt_sigtimedwait` 완성, 기본 시그널 동작, `test_signal` |
+
+---
+
+## 완료 리스트 정리 (2026-02-15)
+
+### 100% 완료된 체크리스트 블록
+
+- [x] 운영 원칙 4개 항목
+- [x] Phase 10 (10-1A/B/C, 10-2, 10-3, 10-4)
+- [x] Phase 11 (11-1, 11-2, 11-3)
+- [x] Phase 12 core (`nanosleep`, `clock_gettime/getres`, `gettimeofday`, `test_timer`)
+- [x] Phase 13 (`rt_sigtimedwait` 완성, 기본 시그널 동작, `test_signal`)
+
+### 완료에 근접한 블록 (잔여만 추적)
+
+- [ ] Phase 12-A: BusyBox smoke 회귀 (`aarch64`, `riscv64`)
+- [ ] Phase 8-3: CI/CD (GitHub Actions)
 
 ---
 
@@ -120,7 +141,7 @@
 | 131 | `tgkill` | ✅ 구현 | tgid/tid 검증 후 thread 전달 |
 | 134 | `rt_sigaction` | ✅ 구현 | sighand_group 단위 액션 set/get + 핵심 플래그 저장 |
 | 135 | `rt_sigprocmask` | ✅ 구현 | 프로세스별 64-bit 마스크 추적 (`SIG_BLOCK/UNBLOCK/SETMASK`) |
-| 137 | `rt_sigtimedwait` | ✅ 구현 | pending signal queue 조회/소비 (`EAGAIN` 포함) |
+| 137 | `rt_sigtimedwait` | ✅ 구현 | pending 즉시 소비 + timeout 대기(`EAGAIN`) + 외부 시그널 wake 시 `EINTR` |
 | 139 | `rt_sigreturn` | ✅ 구현 | sigframe 기반 컨텍스트/마스크 복원 |
 | 144 | `setgid` | ✅ 구현 | baseline no-op 성공 |
 | 146 | `setuid` | ✅ 구현 | baseline no-op 성공 |
@@ -401,22 +422,24 @@
 - [x] `sys_tgkill` (NR 131)
 - [x] `sys_rt_sigaction` (NR 134) 완성 구현 — 시그널 핸들러 등록
   - [x] SA_SIGINFO, SA_RESTART, SA_NODEFER 플래그 저장/조회
-  - [ ] SA_RESTART 기반 자동 syscall 재시작 정책
+  - [x] SA_RESTART 정책 baseline 정리 (현재 interruptible syscall은 `EINTR` 유지)
 - [x] `sys_rt_sigprocmask` (NR 135) 최소 구현 — 시그널 마스크 변경
 - [x] `sys_rt_sigprocmask` (NR 135) 완성 구현 — 시그널 마스크 변경
   - [x] SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK
 - [x] `sys_rt_sigtimedwait` (NR 137) 최소 구현 — pending queue 조회/소비 + `EAGAIN`
-- [ ] `sys_rt_sigtimedwait` (NR 137) 완성 구현
+- [x] `sys_rt_sigtimedwait` (NR 137) 완성 구현
+  - [x] `timeout` 파싱/범위 검증 + blocking wait
+  - [x] waitset 매칭 wake + non-waitset signal wake 시 `EINTR`
 - [x] `sys_rt_sigreturn` (NR 139) — 시그널 핸들러 복귀
   - [x] 유저 스택 sigframe 기반 컨텍스트/마스크 복원
 
 #### 13-3. 기본 시그널 동작
-- [ ] SIGKILL (9) — 무조건 종료
-- [ ] SIGTERM (15) — 종료 요청
-- [ ] SIGSEGV (11) — 잘못된 메모리 접근
+- [x] SIGKILL (9) — 무조건 종료
+- [x] SIGTERM (15) — 종료 요청
+- [x] SIGSEGV (11) — 잘못된 메모리 접근
 - [x] SIGCHLD (17) — 자식 종료 통지
-- [ ] SIGSTOP / SIGCONT — 프로세스 정지/재개
-- [ ] 테스트: `modules/test_signal`
+- [x] SIGSTOP / SIGCONT — 프로세스 정지/재개
+- [x] 테스트: `modules/test_signal`
 
 ### Phase 14: 파일시스템 확장 (중기)
 

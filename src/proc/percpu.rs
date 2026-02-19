@@ -53,8 +53,14 @@ impl PerCpuData {
 
 /// 전역 Per-CPU 데이터 배열
 static PER_CPU: [PerCpuData; MAX_CPUS] = [
-    PerCpuData::new(), PerCpuData::new(), PerCpuData::new(), PerCpuData::new(),
-    PerCpuData::new(), PerCpuData::new(), PerCpuData::new(), PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
+    PerCpuData::new(),
 ];
 
 /// 온라인 CPU 수
@@ -73,7 +79,11 @@ pub fn init(cpu_count: u32) {
     PER_CPU[cpu_id as usize].set_online();
     NUM_CPUS_ONLINE.store(1, Ordering::Release);
 
-    crate::kprintln!("[percpu] Initialized for {} CPUs (primary CPU {})", cpu_count, cpu_id);
+    crate::kprintln!(
+        "[percpu] Initialized for {} CPUs (primary CPU {})",
+        cpu_count,
+        cpu_id
+    );
 }
 
 /// Secondary CPU 초기화 (secondary CPU에서 호출)
@@ -151,8 +161,14 @@ pub mod stacks {
 
     /// Secondary CPU 스택 포인터 배열 (스택 top 주소)
     static STACK_TOPS: [AtomicUsize; MAX_CPUS] = [
-        AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
-        AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
     ];
 
     /// Secondary CPU 스택 할당 (primary CPU에서 호출)
@@ -173,7 +189,11 @@ pub mod stacks {
             // Vec의 메모리를 leak하여 커널이 계속 사용할 수 있도록 함
             core::mem::forget(stack);
 
-            crate::kprintln!("[percpu] CPU {} stack allocated: top={:#x}", cpu_id, stack_top);
+            crate::kprintln!(
+                "[percpu] CPU {} stack allocated: top={:#x}",
+                cpu_id,
+                stack_top
+            );
         }
     }
 

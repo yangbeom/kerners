@@ -8,11 +8,11 @@ pub mod percpu;
 pub mod scheduler;
 pub mod user;
 
+use crate::sync::IrqSpinlock;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::IrqSpinlock;
 
 use crate::kprintln;
 use context::Context;
@@ -151,8 +151,7 @@ impl Thread {
 /// 전역 스레드 리스트 (모든 CPU가 공유)
 pub(crate) static THREADS: IrqSpinlock<Vec<Box<Thread>>> = IrqSpinlock::new(Vec::new());
 static SLEEP_QUEUE: IrqSpinlock<Vec<SleepEntry>> = IrqSpinlock::new(Vec::new());
-static SLEEP_WAKE_REASONS: IrqSpinlock<Vec<(Tid, SleepWakeReason)>> =
-    IrqSpinlock::new(Vec::new());
+static SLEEP_WAKE_REASONS: IrqSpinlock<Vec<(Tid, SleepWakeReason)>> = IrqSpinlock::new(Vec::new());
 
 /// 프로세스 서브시스템 초기화
 pub fn init() {
@@ -244,6 +243,36 @@ pub fn current_tid() -> Option<Tid> {
     threads.get(idx as usize).map(|t| t.tid)
 }
 
+/// tid에 해당하는 스레드가 존재하는지 확인한다.
+pub fn thread_exists(tid: Tid) -> bool {
+    let threads = THREADS.lock();
+    threads.iter().any(|thread| thread.tid == tid)
+}
+
+/// tid에 해당하는 스레드를 Blocked 상태로 전환한다.
+pub fn block_thread_for_signal_stop(tid: Tid) -> bool {
+    let mut threads = THREADS.lock();
+    let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) else {
+        return false;
+    };
+    if thread.state != ThreadState::Terminated {
+        thread.state = ThreadState::Blocked;
+    }
+    true
+}
+
+/// tid에 해당하는 스레드를 Terminated 상태로 전환한다.
+pub fn terminate_thread_for_signal(tid: Tid) -> bool {
+    let mut threads = THREADS.lock();
+    let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) else {
+        return false;
+    };
+    if thread.state != ThreadState::Terminated {
+        thread.state = ThreadState::Terminated;
+    }
+    true
+}
+
 /// 현재 스레드의 컨텍스트 포인터 반환
 pub fn current_context_ptr() -> Option<*mut Context> {
     let idx = percpu::current().current_thread_idx.load(Ordering::Acquire);
@@ -251,7 +280,9 @@ pub fn current_context_ptr() -> Option<*mut Context> {
         return None;
     }
     let mut threads = THREADS.lock();
-    threads.get_mut(idx as usize).map(|t| &mut t.context as *mut Context)
+    threads
+        .get_mut(idx as usize)
+        .map(|t| &mut t.context as *mut Context)
 }
 
 /// 현재 스레드의 유저 스택을 설정
@@ -298,7 +329,11 @@ pub fn dump_threads() {
     let threads = THREADS.lock();
     let online = percpu::online_count();
 
-    kprintln!("\n[proc] Thread list ({} threads, {} CPUs online):", threads.len(), online);
+    kprintln!(
+        "\n[proc] Thread list ({} threads, {} CPUs online):",
+        threads.len(),
+        online
+    );
     for (i, thread) in threads.iter().enumerate() {
         // 이 스레드가 어느 CPU에서 실행 중인지 확인
         let mut running_on = None;
@@ -315,7 +350,10 @@ pub fn dump_threads() {
         };
         kprintln!(
             "  tid={}, name='{}', state={:?}{}",
-            thread.tid, thread.name, thread.state, cpu_mark
+            thread.tid,
+            thread.name,
+            thread.state,
+            cpu_mark
         );
     }
 }
@@ -443,22 +481,26 @@ pub fn wake_sleepers_by_timer(now_ns: u64) -> usize {
 
 /// 지정 스레드를 시그널 사유로 깨운다.
 pub fn wake_thread_for_signal(tid: Tid) -> bool {
+    let mut removed_from_sleep_queue = false;
     {
         let mut queue = SLEEP_QUEUE.lock();
         if let Some(pos) = queue.iter().position(|entry| entry.tid == tid) {
             queue.swap_remove(pos);
-        } else {
-            return false;
+            removed_from_sleep_queue = true;
         }
     }
 
     let mut threads = THREADS.lock();
     if let Some(thread) = threads.iter_mut().find(|thread| thread.tid == tid) {
+        let mut woke = removed_from_sleep_queue;
         if thread.state == ThreadState::Blocked {
             thread.state = ThreadState::Ready;
+            woke = true;
         }
-        record_sleep_wake_reason(tid, SleepWakeReason::Signal);
-        true
+        if woke {
+            record_sleep_wake_reason(tid, SleepWakeReason::Signal);
+        }
+        woke
     } else {
         false
     }

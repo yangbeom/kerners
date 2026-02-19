@@ -1,15 +1,28 @@
 {
-    "llvm-target": "aarch64-none-none",
-    "data-layout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+    "llvm-target": "aarch64-unknown-none",
+    "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
     "arch": "aarch64",
     "os": "none",
     "vendor": "unknown",
-    "linker-flavor": "ld.lld",
+    "linker-flavor": "gnu-lld",
     "linker": "rust-lld",
     "executables": true,
-    "cpu": "generic",
-    "features": "",
+    "features": "+v8a,+strict-align,+neon",
     "target-pointer-width": 64,
     "panic-strategy": "abort",
-    "disable-redzone": true
+    "disable-redzone": true,
+    "default-uwtable": true,
+    "max-atomic-width": 128,
+    "relocation-model": "static",
+    "stack-probes": {
+        "kind": "inline"
+    },
+    "pre-link-args": {
+        "gnu": [
+            "--fix-cortex-a53-843419"
+        ],
+        "gnu-lld": [
+            "--fix-cortex-a53-843419"
+        ]
+    }
 }

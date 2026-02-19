@@ -44,10 +44,10 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_set_tid_address` | 96 | `set_tid_address(ptr)` | baseline: tid 반환, clear_child_tid 미구현 |
 | `sys_clock_gettime` | 113 | `clock_gettime(clockid, tp)` | `CLOCK_MONOTONIC/CLOCK_REALTIME` 분리, RTC 폴백 지원 |
 | `sys_clock_getres` | 114 | `clock_getres(clockid, tp)` | 시계 해상도 반환 (`tp=NULL` 허용) |
-| `sys_kill`/`sys_tkill`/`sys_tgkill` | 129/130/131 | `kill()/tkill()/tgkill()` | 대상 검증 + `sig=0` probe + pending enqueue |
+| `sys_kill`/`sys_tkill`/`sys_tgkill` | 129/130/131 | `kill()/tkill()/tgkill()` | 대상 검증 + `sig=0` probe + pending enqueue (`SIGCONT` wake, `SIGSTOP`/`SIGCONT` pending 정리) |
 | `sys_rt_sigaction` | 134 | `rt_sigaction(...)` | sighand_group 단위 액션 set/get + 전달 경로 연동 |
 | `sys_rt_sigprocmask` | 135 | `rt_sigprocmask(...)` | 64-bit 시그널 마스크 추적 (`SIG_BLOCK/UNBLOCK/SETMASK`) |
-| `sys_rt_sigtimedwait` | 137 | `rt_sigtimedwait(...)` | pending signal queue에서 매칭 시그널 소비, 없으면 `EAGAIN` |
+| `sys_rt_sigtimedwait` | 137 | `rt_sigtimedwait(...)` | pending 매칭 즉시 소비 + timeout 대기(`EAGAIN`) + 외부 시그널 wake 시 `EINTR` |
 | `sys_rt_sigreturn` | 139 | `rt_sigreturn()` | 유저 sigframe 기반 레지스터/마스크 복원 |
 | `sys_setuid`/`sys_setgid` | 146/144 | `setuid()/setgid()` | baseline no-op 성공 |
 | `sys_setpgid`/`sys_getpgid` | 154/155 | `setpgid()/getpgid()` | 최소 pgid 추적 |
@@ -174,6 +174,15 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
 - `sys_wait4`는 zombie를 회수해 Linux 호환 wait status(`exit_code << 8`)를 기록합니다.
 - `sys_waitid`는 `P_ALL/P_PID/P_PGID` + `WEXITED/WNOHANG/WNOWAIT` 조합을 지원합니다.
 - 부모가 먼저 종료되면 고아 자식/좀비는 init(`pid=1`)에 재부모화(reparent)됩니다.
+
+## 시그널 기본 동작
+
+- 기본 액션(`SIG_DFL`) 처리:
+  - `SIGKILL(9)`, `SIGTERM(15)`, `SIGSEGV(11)` → 종료
+  - `SIGSTOP(19)` → stop (blocked 상태 전환)
+  - `SIGCONT(18)` → continue (`SIGSTOP` pending 제거 + wake)
+  - `SIGCHLD(17)` → 기본 무시
+- `rt_sigtimedwait`는 `SIGKILL`/`SIGSTOP` 비대기 규칙을 적용합니다.
 
 ## 부팅 PID 1 실행 경로
 
