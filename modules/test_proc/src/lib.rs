@@ -76,6 +76,13 @@ struct LinuxSigAction {
     sa_mask: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 fn print(s: &str) {
     unsafe { kernel_print(s.as_ptr(), s.len()) };
 }
@@ -235,11 +242,15 @@ pub extern "C" fn module_init() -> i32 {
         return -14;
     }
 
+    let poll_timeout = LinuxTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let empty = unsafe {
         kernel_sys_rt_sigtimedwait(
             &wait_set as *const u64 as *const u8,
             siginfo.as_mut_ptr(),
-            core::ptr::null(),
+            &poll_timeout as *const LinuxTimespec as *const u8,
             SIGSET_SIZE,
         )
     };
@@ -339,7 +350,7 @@ pub extern "C" fn module_init() -> i32 {
         kernel_sys_rt_sigtimedwait(
             &wait_set as *const u64 as *const u8,
             siginfo2.as_mut_ptr(),
-            core::ptr::null(),
+            &poll_timeout as *const LinuxTimespec as *const u8,
             SIGSET_SIZE,
         )
     };

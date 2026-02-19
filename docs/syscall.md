@@ -105,6 +105,17 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `fs.rs` | 파일시스템 관련 syscall 구현 (VFS 연동) |
 | `process.rs` | 프로세스 관련 syscall 구현 (`execve` 전이 큐 포함) |
 
+## 테스트 전용 헬퍼 (non-Linux syscall ABI)
+
+`src/syscall/mod.rs`에는 테스트 모듈 경로에서만 사용하는 helper가 포함됩니다.
+이 함수들은 유저 모드 `SVC/ECALL` ABI로 노출되지 않으며, `src/module/test_symbols.rs`를 통해서만 접근합니다.
+
+- `enqueue_signal_for_test(signum)`:
+  - 현재 tid의 pending signal 큐에 삽입
+- `enqueue_signal_to_tid_for_test(tid, signum)`:
+  - 지정 tid의 pending signal 큐에 삽입
+  - 대상 tid 존재 여부를 검증하고, 필요 시 최소 process metadata를 생성한 뒤 enqueue
+
 ## 디스패처
 
 ```rust

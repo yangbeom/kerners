@@ -456,6 +456,11 @@ pub fn enqueue_signal_for_test(signum: u32) -> isize {
     process::test_enqueue_signal_for_current(signum)
 }
 
+/// 테스트 모듈용: 지정 tid의 pending signal 큐에 시그널 삽입
+pub fn enqueue_signal_to_tid_for_test(tid: isize, signum: u32) -> isize {
+    process::test_enqueue_signal_for_tid(tid, signum)
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn handle_user_page_fault_aarch64(far: usize, esr: u64) -> bool {
     process::handle_user_page_fault_aarch64(far, esr)

@@ -107,13 +107,17 @@ pub extern "C" fn module_init() -> i32 {
 
     // 이전 테스트에서 남아 있을 수 있는 SIGCHLD pending을 비운다.
     let wait_set: u64 = 1u64 << ((SIGCHLD as u32) - 1);
+    let poll_timeout = LinuxTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     loop {
         let mut siginfo = [0u8; 16];
         let got = unsafe {
             kernel_sys_rt_sigtimedwait(
                 &wait_set as *const u64 as *const u8,
                 siginfo.as_mut_ptr(),
-                core::ptr::null(),
+                &poll_timeout as *const LinuxTimespec as *const u8,
                 core::mem::size_of::<u64>(),
             )
         };
@@ -179,7 +183,7 @@ pub extern "C" fn module_init() -> i32 {
         kernel_sys_rt_sigtimedwait(
             &wait_set as *const u64 as *const u8,
             siginfo.as_mut_ptr(),
-            core::ptr::null(),
+            &poll_timeout as *const LinuxTimespec as *const u8,
             core::mem::size_of::<u64>(),
         )
     };

@@ -4258,6 +4258,29 @@ pub fn test_enqueue_signal_for_current(signum: u32) -> isize {
     0
 }
 
+/// 테스트/디버그용: 지정한 tid의 pending signal 큐에 시그널을 삽입한다.
+pub fn test_enqueue_signal_for_tid(tid: isize, signum: u32) -> isize {
+    if signum == 0 || signum > MAX_SIGNAL_COUNT as u32 {
+        return errno::EINVAL;
+    }
+    if tid < 0 {
+        return errno::ESRCH;
+    }
+
+    let target_tid = tid as proc::Tid;
+    let exists = {
+        let processes = PROCESS_INFOS.lock();
+        processes.iter().any(|p| p.tid == target_tid)
+    };
+    if !exists && !proc::thread_exists(target_tid) {
+        return errno::ESRCH;
+    }
+
+    ensure_process_info_for_tid(target_tid);
+    enqueue_signal(target_tid, signum);
+    0
+}
+
 fn exec_error_to_errno(err: proc::user::ExecError) -> isize {
     match err {
         proc::user::ExecError::NotFound => errno::ENOENT,

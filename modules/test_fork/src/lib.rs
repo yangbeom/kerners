@@ -60,6 +60,13 @@ struct LinuxUtsName {
     domainname: [u8; 65],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 fn print(s: &str) {
     unsafe {
         kernel_print(s.as_ptr(), s.len());
@@ -226,12 +233,16 @@ pub extern "C" fn module_init() -> i32 {
     }
 
     let mut siginfo: [u8; 16] = [0; 16];
+    let poll_timeout = LinuxTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     loop {
         let rc = unsafe {
             kernel_sys_rt_sigtimedwait(
                 &sigchld_mask as *const u64 as *const u8,
                 siginfo.as_mut_ptr(),
-                core::ptr::null(),
+                &poll_timeout as *const LinuxTimespec as *const u8,
                 sigset_size,
             )
         };

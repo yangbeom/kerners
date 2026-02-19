@@ -31,6 +31,7 @@
 - [x] Phase 12 core (`nanosleep`, `clock_gettime/getres`, `gettimeofday`, `test_timer`)
 - [x] Phase 13 (`rt_sigtimedwait` 완성, 기본 시그널 동작, `test_signal`)
 - [x] Phase 14 (`getdents64/pipe2/readlinkat/statfs`, FAT32 LFN/삭제/truncate, ProcFS, `test_procfs`)
+- [x] Post-Phase 안정화 (2026-02-19, signal/thread 테스트 경합 제거 + 양 아키텍처 회귀 통과)
 
 ### 완료에 근접한 블록 (잔여만 추적)
 
@@ -488,6 +489,17 @@
 - [x] `/proc/cpuinfo` — CPU 정보
 - [x] `/proc/uptime` — 부팅 시간
 - [x] 테스트: `modules/test_procfs`
+
+### Post-Phase 안정화 (2026-02-19)
+
+#### S-1. 테스트 회귀 안정화 (aarch64/riscv64)
+- [x] `modules/test_fork`, `modules/test_proc`, `modules/test_timer`의 `rt_sigtimedwait` 폴링을 `timespec {0,0}` 기반으로 고정해 블로킹 경합 제거
+- [x] `modules/test_signal` delayed worker 시그널 주입을 tid 지정 helper 경로로 전환 (`tid==0` 포함)
+- [x] `modules/test_signal`의 `EINTR` 검증을 타이밍 경합 허용형(`EINTR` 또는 `EAGAIN`+즉시 drain)으로 보강
+- [x] 테스트 훅 추가: `src/syscall/process.rs::test_enqueue_signal_for_tid`, `src/syscall/mod.rs::enqueue_signal_to_tid_for_test`
+- [x] 테스트 심볼 추가: `kernel_test_enqueue_signal_to_tid`
+- [x] `kernel_thread_spawn` 테스트 래퍼를 전역 단일 slot 방식에서 `tid` keyed pending queue 방식으로 교체해 동시 spawn 경합 제거
+- [x] 회귀 검증: `make test`, `make test-riscv64` 모두 `RESULT: 14 passed, 0 failed`
 
 ### Phase 15: 유저스페이스 분리 (중기)
 

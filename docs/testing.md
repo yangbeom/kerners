@@ -197,10 +197,11 @@ make test-all
   - `getpid/gettid/getppid`
   - `brk` 증가/감소
   - `mmap/munmap` (anonymous/private + partial unmap)
-  - `rt_sigprocmask/rt_sigtimedwait` (pending signal queue)
+  - `rt_sigprocmask/rt_sigtimedwait` (pending signal queue, `timespec {0,0}` poll 안정화 포함)
   - `fork/vfork/wait4` 최소 경로
 - `modules/test_fork`
   - `fork/vfork` + `wait4/waitid` 호환 경로
+  - `rt_sigtimedwait(SIGCHLD)` polling wait (`timespec {0,0}`)
   - `uname` 반환값 검증
 - `modules/test_brk`
   - `brk` 페이지 단위 확장/축소
@@ -213,6 +214,9 @@ make test-all
   - `rt_sigtimedwait` poll/timeout/blocking/EINTR
   - `SIGKILL`/`SIGSTOP` unmaskable + `rt_sigaction` 제약
   - `SIGCONT` pending wait 경로
+- `modules/test_timer`
+  - `clock_gettime/getres/gettimeofday/nanosleep` 경로
+  - 시작 시 stale `SIGCHLD`를 `timespec {0,0}` poll로 drain
 
 ### modules/test_mm — 메모리 관리
 
@@ -254,7 +258,7 @@ make test-all
 | 테스트 | 설명 |
 |--------|------|
 | current_tid | 현재 스레드 ID 조회 |
-| spawn thread | `kernel_thread_spawn()` → tid > 0 |
+| spawn thread | `kernel_thread_spawn()` → tid > 0 (커널 래퍼의 tid-keyed handoff로 동시 spawn 경합 방지) |
 | worker execution | 공유 변수(AtomicU32) 변경 확인 (yield 루프로 대기) |
 | yield_now | `yield_now()` 호출 성공 |
 
@@ -281,7 +285,7 @@ make test-all
 | brk grow/shrink | `brk(0)` 조회 및 증가/감소 경로 검증 |
 | mmap/munmap | anonymous/private 매핑 + 읽기/쓰기 + 해제 검증 |
 | file-backed mode | invalid fd에 `EBADF(-9)` 검증 |
-| signal queue | `rt_sigprocmask` + `rt_sigtimedwait`로 pending signal 소비 검증 |
+| signal queue | `rt_sigprocmask` + `rt_sigtimedwait` pending 소비 검증 (`timespec {0,0}` poll) |
 | fork/wait4 | `fork` 후 `wait4`로 자식 회수 및 상태 검증 |
 | vfork/wait4 | `vfork` 후 `wait4`로 자식 회수 검증 |
 | no child (`WNOHANG`) | 자식이 없을 때 `wait4(..., WNOHANG)`의 `ECHILD(-10)` 검증 |
@@ -292,6 +296,7 @@ make test-all
 |--------|------|
 | fork/wait4 status macros | `WIFEXITED/WEXITSTATUS` 호환 wait status 인코딩 검증 |
 | waitid(WNOWAIT) + wait4 | `waitid(..., WNOWAIT)` 이후 `wait4` 회수 가능 여부 검증 |
+| SIGCHLD poll loop | `rt_sigtimedwait(..., timespec {0,0})` 폴링 기반으로 자식 종료 시그널 소모 검증 |
 | vfork/waitid consume | `waitid`가 자식을 회수하고 재대기 시 `ECHILD` 반환 확인 |
 | uname basics | `sys_uname`의 `sysname=Kerners`, machine 필드 기본값 검증 |
 
@@ -321,7 +326,7 @@ make test-all
 |--------|------|
 | rt_sigtimedwait poll/timeout | 매칭 pending 없음 + 0/유한 timeout에서 `EAGAIN` 검증 |
 | masked signal wake + consume | 마스크된 `SIGTERM` pending을 `rt_sigtimedwait`로 수신 검증 |
-| EINTR path | waitset 밖 시그널(`SIGCHLD`)로 `rt_sigtimedwait`가 `EINTR`로 깨어나는지 검증 |
+| EINTR path | waitset 밖 시그널(`SIGCHLD`) 도착 시 `EINTR` 또는 경합 시 `EAGAIN`+즉시 drain 검증 |
 | SIGCONT wait | `SIGCONT` pending을 waitset으로 수신 검증 |
 | unmaskable check | `SIGKILL`/`SIGSTOP` bit가 `rt_sigprocmask`에서 적용되지 않는지 검증 |
 | sigaction restrictions | `SIGKILL`/`SIGSTOP`에 대한 `rt_sigaction`이 `EINVAL`인지 검증 |
@@ -333,7 +338,7 @@ make test-all
 | `clock_gettime` | `CLOCK_MONOTONIC/CLOCK_REALTIME` 값 조회 검증 |
 | `clock_getres` | 해상도 조회 및 기본 범위 검증 |
 | `gettimeofday` | realtime 기반 `timeval` 반환 검증 |
-| `nanosleep` | 유효 인자 sleep + invalid 인자 에러 경로 검증 |
+| `nanosleep` | 시작 시 `SIGCHLD` poll drain 후 유효 인자 sleep + invalid 인자 에러 경로 검증 |
 
 ### modules/test_procfs — procfs + fs syscall
 
@@ -428,6 +433,16 @@ make test-all
 | `kernel_sys_readlinkat` | `(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz: usize) -> i64` |
 | `kernel_sys_statfs` | `(path: *const u8, statfs_buf: *mut u8) -> i64` |
 
+### Test-only Signal Hooks
+
+| 심볼 | 시그니처 |
+|------|---------|
+| `kernel_test_enqueue_signal` | `(signum: u32) -> i64` |
+| `kernel_test_enqueue_signal_to_tid` | `(tid: i64, signum: u32) -> i64` |
+
+> `modules/test_signal`의 delayed worker는 `kernel_test_enqueue_signal_to_tid`를 사용해
+> 지정 tid(필요 시 `tid=0` 포함)에 시그널을 안정적으로 주입합니다.
+
 ### Thread
 
 | 심볼 | 시그니처 |
@@ -517,6 +532,6 @@ fn panic(_info: &PanicInfo) -> ! {
 | 파일 | 설명 |
 |------|------|
 | `src/test_runner.rs` | QEMU 내 테스트 러너 (FAT32 마운트 → 모듈 로드 → 실행 → 결과 집계) |
-| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (55개 심볼) |
+| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (56개 심볼) |
 | `src/module/symbol.rs` | 커널 심볼 테이블 + 컴파일러 intrinsic (memset/memcpy/memmove) |
 | `Cargo.toml` | `test_runner` feature 정의 |

@@ -679,6 +679,49 @@ pub extern "C" fn kernel_test_enqueue_signal(signum: u32) -> i64 {
     crate::syscall::enqueue_signal_for_test(signum) as i64
 }
 
+/// 테스트용 pending signal 삽입 (지정 tid)
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_test_enqueue_signal_to_tid(tid: i64, signum: u32) -> i64 {
+    crate::syscall::enqueue_signal_to_tid_for_test(tid as isize, signum) as i64
+}
+
+#[derive(Clone, Copy)]
+struct ThreadSpawnRequest {
+    tid: crate::proc::Tid,
+    entry: extern "C" fn(usize),
+    arg: usize,
+}
+
+static THREAD_SPAWN_REQUESTS: crate::sync::IrqSpinlock<alloc::vec::Vec<ThreadSpawnRequest>> =
+    crate::sync::IrqSpinlock::new(alloc::vec::Vec::new());
+
+fn take_thread_spawn_request(tid: crate::proc::Tid) -> Option<ThreadSpawnRequest> {
+    let mut pending = THREAD_SPAWN_REQUESTS.lock();
+    let idx = pending.iter().position(|req| req.tid == tid)?;
+    Some(pending.swap_remove(idx))
+}
+
+fn thread_spawn_trampoline() -> ! {
+    let tid = loop {
+        if let Some(tid) = crate::proc::current_tid() {
+            break tid;
+        }
+        crate::proc::yield_now();
+    };
+
+    let request = loop {
+        if let Some(request) = take_thread_spawn_request(tid) {
+            break request;
+        }
+        crate::proc::yield_now();
+    };
+
+    (request.entry)(request.arg);
+    loop {
+        crate::proc::yield_now();
+    }
+}
+
 // ============================================================
 // Thread (스레드)
 // ============================================================
@@ -698,27 +741,11 @@ pub extern "C" fn kernel_thread_spawn(
         None => "test_thread",
     };
 
-    // extern "C" fn(usize) → fn() -> ! 래핑
-    // 인자를 클로저로 캡처하여 스레드 엔트리에 전달
-    // 간단한 방식: 전역 변수로 전달 (단일 스레드 생성 시 안전)
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    static THREAD_ENTRY: AtomicUsize = AtomicUsize::new(0);
-    static THREAD_ARG: AtomicUsize = AtomicUsize::new(0);
-
-    THREAD_ENTRY.store(entry as usize, Ordering::SeqCst);
-    THREAD_ARG.store(arg, Ordering::SeqCst);
-
-    fn thread_wrapper() -> ! {
-        let entry_addr = THREAD_ENTRY.load(Ordering::SeqCst);
-        let arg = THREAD_ARG.load(Ordering::SeqCst);
-        let entry: extern "C" fn(usize) = unsafe { core::mem::transmute(entry_addr) };
-        entry(arg);
-        loop {
-            crate::proc::yield_now();
-        }
+    let tid = crate::proc::spawn(name, thread_spawn_trampoline);
+    {
+        let mut pending = THREAD_SPAWN_REQUESTS.lock();
+        pending.push(ThreadSpawnRequest { tid, entry, arg });
     }
-
-    let tid = crate::proc::spawn(name, thread_wrapper);
     tid as i32
 }
 
@@ -827,6 +854,10 @@ pub fn register_test_symbols() {
         "kernel_test_enqueue_signal",
         kernel_test_enqueue_signal as usize,
     );
+    register_symbol(
+        "kernel_test_enqueue_signal_to_tid",
+        kernel_test_enqueue_signal_to_tid as usize,
+    );
 
     // Thread
     register_symbol("kernel_thread_spawn", kernel_thread_spawn as usize);
@@ -835,5 +866,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 55);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 56);
 }
