@@ -19,6 +19,8 @@ pub mod ramfs;
 pub mod devfs;
 pub mod fat32;
 pub mod fd;
+pub mod pipe;
+pub mod procfs;
 
 /// VFS 에러
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -36,6 +36,15 @@ pub enum ThreadState {
     Terminated,
 }
 
+/// `/proc` 조회용 스레드 스냅샷
+#[derive(Clone)]
+pub struct ThreadSnapshot {
+    pub tid: Tid,
+    pub name: String,
+    pub state: ThreadState,
+    pub user_root_table: usize,
+}
+
 /// sleep 해제 사유
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SleepWakeReason {
@@ -247,6 +256,20 @@ pub fn current_tid() -> Option<Tid> {
 pub fn thread_exists(tid: Tid) -> bool {
     let threads = THREADS.lock();
     threads.iter().any(|thread| thread.tid == tid)
+}
+
+/// 현재 커널이 추적 중인 스레드 목록 스냅샷을 반환한다.
+pub fn thread_snapshots() -> Vec<ThreadSnapshot> {
+    let threads = THREADS.lock();
+    threads
+        .iter()
+        .map(|thread| ThreadSnapshot {
+            tid: thread.tid,
+            name: thread.name.clone(),
+            state: thread.state,
+            user_root_table: thread.user_root_table,
+        })
+        .collect()
 }
 
 /// tid에 해당하는 스레드를 Blocked 상태로 전환한다.

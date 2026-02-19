@@ -87,6 +87,20 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) ->
     dest
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, count: usize) -> i32 {
+    let mut i = 0usize;
+    while i < count {
+        let av = unsafe { core::ptr::read_volatile(a.add(i)) };
+        let bv = unsafe { core::ptr::read_volatile(b.add(i)) };
+        if av != bv {
+            return av as i32 - bv as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// 심볼 테이블 초기화
 pub fn init() {
     if INITIALIZED.swap(true, Ordering::SeqCst) {
@@ -107,6 +121,7 @@ pub fn init() {
     list.push((String::from("memset"), memset as usize));
     list.push((String::from("memcpy"), memcpy as usize));
     list.push((String::from("memmove"), memmove as usize));
+    list.push((String::from("memcmp"), memcmp as usize));
 
     *symbols = Some(list);
 

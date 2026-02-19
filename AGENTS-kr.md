@@ -61,13 +61,16 @@ kerners/
 │   │   ├── mod.rs           # VFS 추상화 (VNode, FileSystem trait)
 │   │   ├── path.rs          # 경로 파싱 및 정규화
 │   │   ├── fd.rs            # 파일 디스크립터 테이블
+│   │   ├── pipe.rs          # 익명 파이프 VNode 백엔드
 │   │   ├── ramfs/           # 메모리 기반 파일시스템
 │   │   ├── devfs/           # 장치 파일시스템 (/dev)
-│   │   └── fat32/           # FAT32 파일시스템
-│   │       ├── mod.rs       # FAT32 구현
-│   │       ├── boot.rs      # 부트 섹터 파싱
-│   │       ├── fat.rs       # FAT 테이블 처리
-│   │       └── dir.rs       # 디렉토리 엔트리
+│   │   ├── fat32/           # FAT32 파일시스템
+│   │   │   ├── mod.rs       # FAT32 구현
+│   │   │   ├── boot.rs      # 부트 섹터 파싱
+│   │   │   ├── fat.rs       # FAT 테이블 처리
+│   │   │   └── dir.rs       # 디렉토리 엔트리
+│   │   └── procfs/          # ProcFS (/proc) 가상 파일시스템
+│   │       └── mod.rs       # procfs 노드 및 출력 렌더링
 │   ├── block/               # 블록 디바이스 추상화
 │   │   ├── mod.rs           # BlockDevice trait
 │   │   ├── ramdisk.rs       # RAM 디스크
@@ -100,6 +103,7 @@ kerners/
 ├── modules/test_mmap/       # mmap/munmap/mprotect 회귀 테스트 모듈
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
 ├── modules/test_signal/     # signal syscall 회귀 테스트 모듈
+├── modules/test_procfs/     # procfs + phase14 fs syscall 회귀 테스트 모듈
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일

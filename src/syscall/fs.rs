@@ -4,6 +4,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use crate::console;
 use crate::fs::{self, VfsError, VNodeType, FileMode};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
@@ -43,6 +44,7 @@ const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
+const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -89,6 +91,32 @@ struct LinuxWinSize {
     ws_xpixel: u16,
     ws_ypixel: u16,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxStatFs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+const DT_UNKNOWN: u8 = 0;
+const DT_FIFO: u8 = 1;
+const DT_CHR: u8 = 2;
+const DT_DIR: u8 = 4;
+const DT_BLK: u8 = 6;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+const DT_SOCK: u8 = 12;
 
 fn read_c_path(path: *const u8) -> Result<String, isize> {
     if path.is_null() {
@@ -150,6 +178,39 @@ fn linux_mode_bits(node_type: VNodeType) -> u32 {
         VNodeType::Symlink => 0o120000,
         VNodeType::Fifo => 0o010000,
         VNodeType::Socket => 0o140000,
+    }
+}
+
+fn linux_d_type(node_type: VNodeType) -> u8 {
+    match node_type {
+        VNodeType::File => DT_REG,
+        VNodeType::Directory => DT_DIR,
+        VNodeType::Symlink => DT_LNK,
+        VNodeType::BlockDevice => DT_BLK,
+        VNodeType::CharDevice => DT_CHR,
+        VNodeType::Fifo => DT_FIFO,
+        VNodeType::Socket => DT_SOCK,
+    }
+}
+
+#[inline]
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+fn fs_magic(fs_type: &str) -> i64 {
+    match fs_type {
+        "ramfs" => 0x8584_58f6,
+        "fat32" => 0x4d44,
+        "devfs" => 0x1373,
+        "procfs" => 0x9fa0,
+        _ => {
+            let mut hash = 0u32;
+            for b in fs_type.as_bytes() {
+                hash = hash.wrapping_mul(33).wrapping_add(*b as u32);
+            }
+            hash as i64
+        }
     }
 }
 
@@ -635,6 +696,213 @@ pub fn sys_fstat(fd: i32, stat_buf: *mut u8) -> isize {
         }
         Err(e) => vfs_error_to_errno(e),
     }
+}
+
+/// sys_getdents64 - 디렉토리 엔트리 읽기
+pub fn sys_getdents64(fd_num: i32, dirp: *mut u8, count: usize) -> isize {
+    if dirp.is_null() {
+        return errno::EFAULT;
+    }
+    if count < 24 {
+        return errno::EINVAL;
+    }
+
+    let table = match fd::kernel_fd_table() {
+        Ok(t) => t,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+    let file = match table.get(fd_num) {
+        Ok(f) => f,
+        Err(_) => return errno::EBADF,
+    };
+    if file.vnode.node_type() != VNodeType::Directory {
+        return errno::ENOTDIR;
+    }
+
+    let entries = match file.vnode.readdir() {
+        Ok(v) => v,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let mut cursor = file.offset.write();
+    if *cursor > entries.len() {
+        *cursor = entries.len();
+    }
+
+    let mut written = 0usize;
+    let mut idx = *cursor;
+
+    while idx < entries.len() {
+        let entry = &entries[idx];
+        let name = entry.name.as_bytes();
+        let reclen = align_up(19 + name.len() + 1, 8);
+        if reclen > u16::MAX as usize {
+            return errno::EINVAL;
+        }
+        if written + reclen > count {
+            break;
+        }
+
+        let ino = match file.vnode.lookup(&entry.name) {
+            Ok(node) => node.stable_id(),
+            Err(_) => 0,
+        };
+        let d_off = (idx + 1) as i64;
+        let d_type = linux_d_type(entry.node_type);
+
+        unsafe {
+            // SAFETY: dirp와 count는 호출자가 제공한 유효 사용자 버퍼를 가정하고,
+            // 범위 체크(written + reclen <= count) 후에만 기록한다.
+            let rec = dirp.add(written);
+            let mut header = [0u8; 19];
+            header[0..8].copy_from_slice(&ino.to_le_bytes());
+            header[8..16].copy_from_slice(&d_off.to_le_bytes());
+            header[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+            header[18] = d_type;
+            core::ptr::copy_nonoverlapping(header.as_ptr(), rec, header.len());
+            core::ptr::copy_nonoverlapping(name.as_ptr(), rec.add(19), name.len());
+            *rec.add(19 + name.len()) = 0;
+            for pad in (19 + name.len() + 1)..reclen {
+                *rec.add(pad) = 0;
+            }
+        }
+
+        written += reclen;
+        idx += 1;
+    }
+
+    *cursor = idx;
+    written as isize
+}
+
+/// sys_pipe2 - 익명 파이프 생성
+pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> isize {
+    if pipefd.is_null() {
+        return errno::EFAULT;
+    }
+    if flags & !PIPE_ALLOWED_FLAGS != 0 {
+        return errno::EINVAL;
+    }
+
+    let table = match fd::kernel_fd_table() {
+        Ok(t) => t,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let (read_vnode, write_vnode) = fs::pipe::create_pipe_pair();
+    let read_open = Arc::new(fd::OpenFile::new(
+        read_vnode,
+        OpenFlags::new((flags & PIPE_ALLOWED_FLAGS) | OpenFlags::O_RDONLY),
+    ));
+    let write_open = Arc::new(fd::OpenFile::new(
+        write_vnode,
+        OpenFlags::new((flags & PIPE_ALLOWED_FLAGS) | OpenFlags::O_WRONLY),
+    ));
+
+    let read_fd = match table.insert(read_open) {
+        Ok(fd_num) => fd_num,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+    let write_fd = match table.insert(write_open) {
+        Ok(fd_num) => fd_num,
+        Err(e) => {
+            let _ = table.close(read_fd);
+            return vfs_error_to_errno(e);
+        }
+    };
+
+    unsafe {
+        // SAFETY: 사용자 포인터가 유효하다는 syscall 계약 하에서 두 i32 값을 기록한다.
+        core::ptr::write_unaligned(pipefd, read_fd);
+        core::ptr::write_unaligned(pipefd.add(1), write_fd);
+    }
+
+    0
+}
+
+/// sys_readlinkat - 심볼릭 링크 대상 읽기
+///
+/// baseline: dirfd는 무시하고 경로 기준으로 처리한다.
+pub fn sys_readlinkat(_dirfd: i32, path: *const u8, buf: *mut u8, bufsiz: usize) -> isize {
+    if buf.is_null() {
+        return errno::EFAULT;
+    }
+    if bufsiz == 0 {
+        return errno::EINVAL;
+    }
+
+    let path_owned = match read_c_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_norm = match normalize_user_path(&path_owned) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let vnode = match fs::lookup_path(&path_norm) {
+        Ok(v) => v,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+    let target = match vnode.readlink() {
+        Ok(s) => s,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let bytes = target.as_bytes();
+    let to_copy = core::cmp::min(bytes.len(), bufsiz);
+    unsafe {
+        // SAFETY: bufsiz 경계 내에서만 복사하며, 입력 문자열은 불변 메모리다.
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+    }
+    to_copy as isize
+}
+
+/// sys_statfs - 파일시스템 통계 조회
+pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
+    if buf.is_null() {
+        return errno::EFAULT;
+    }
+
+    let path_owned = match read_c_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_norm = match normalize_user_path(&path_owned) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let (mount_fs, _) = match fs::find_mount(&path_norm) {
+        Some(found) => found,
+        None => return errno::ENOENT,
+    };
+
+    let stats = match mount_fs.statfs() {
+        Ok(s) => s,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let linux = LinuxStatFs {
+        f_type: fs_magic(&stats.fs_type),
+        f_bsize: stats.block_size as i64,
+        f_blocks: stats.total_blocks,
+        f_bfree: stats.free_blocks,
+        f_bavail: stats.free_blocks,
+        f_files: stats.total_inodes,
+        f_ffree: stats.free_inodes,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: stats.block_size as i64,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+
+    unsafe {
+        // SAFETY: 사용자 버퍼에 Linux statfs 호환 구조체를 기록한다.
+        core::ptr::write_unaligned(buf as *mut LinuxStatFs, linux);
+    }
+    0
 }
 
 /// sys_mkdir - 디렉토리 생성

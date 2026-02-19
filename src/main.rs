@@ -1198,6 +1198,17 @@ fn init_vfs() {
         kprintln!("[vfs] DevFS mounted at /dev");
     }
 
+    // ProcFS를 /proc에 마운트
+    let procfs = fs::procfs::create_procfs();
+    if let Ok(root) = fs::lookup_path("/") {
+        let _ = root.create("proc", fs::VNodeType::Directory, fs::FileMode::default_dir());
+    }
+    if let Err(e) = fs::mount("/proc", procfs) {
+        kprintln!("[vfs] Warning: Failed to mount /proc: {:?}", e);
+    } else {
+        kprintln!("[vfs] ProcFS mounted at /proc");
+    }
+
     // /modules 디렉토리 생성 및 내장 모듈 복사
     if let Ok(root) = fs::lookup_path("/") {
         if root.create("modules", fs::VNodeType::Directory, fs::FileMode::default_dir()).is_ok() {

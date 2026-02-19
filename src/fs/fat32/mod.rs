@@ -221,11 +221,18 @@ impl Fat32Dir {
     /// 디렉토리 엔트리 파싱 (LFN 포함)
     fn parse_entries(&self) -> VfsResult<Vec<(String, dir::DirEntry)>> {
         self.parse_entries_with_offsets()
-            .map(|entries| entries.into_iter().map(|(name, entry, _)| (name, entry)).collect())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(name, entry, _, _)| (name, entry))
+                    .collect()
+            })
     }
 
-    /// 디렉토리 엔트리 파싱 (오프셋 포함)
-    fn parse_entries_with_offsets(&self) -> VfsResult<Vec<(String, dir::DirEntry, usize)>> {
+    /// 디렉토리 엔트리 파싱 (오프셋 + LFN 길이 포함)
+    fn parse_entries_with_offsets(
+        &self,
+    ) -> VfsResult<Vec<(String, dir::DirEntry, usize, usize)>> {
         let data = self.read_all_cluster_data()?;
         let mut entries = Vec::new();
         let mut lfn_parts: Vec<dir::LfnEntry> = Vec::new();
@@ -235,6 +242,7 @@ impl Fat32Dir {
                 break; // 엔트리 끝
             }
             if chunk[0] == 0xE5 {
+                lfn_parts.clear();
                 continue; // 삭제된 엔트리
             }
 
@@ -256,19 +264,21 @@ impl Fat32Dir {
                 // 이름 결정 (LFN이 있으면 사용, 없으면 8.3)
                 let name = if !lfn_parts.is_empty() {
                     let long_name = dir::extract_lfn_name(&lfn_parts);
+                    let lfn_count = lfn_parts.len();
                     lfn_parts.clear();
-                    long_name
+                    (long_name, lfn_count)
                 } else {
-                    entry.short_name()
+                    (entry.short_name(), 0usize)
                 };
 
                 // . 및 .. 건너뛰기
-                if name == "." || name == ".." {
+                if name.0 == "." || name.0 == ".." {
+                    lfn_parts.clear();
                     continue;
                 }
 
                 let offset = idx * 32;
-                entries.push((name, entry, offset));
+                entries.push((name.0, entry, offset, name.1));
             } else {
                 lfn_parts.clear();
             }
@@ -277,14 +287,27 @@ impl Fat32Dir {
         Ok(entries)
     }
 
-    /// 빈 디렉토리 엔트리 슬롯 찾기
-    fn find_free_entry_slot(&self) -> VfsResult<usize> {
+    /// 연속된 빈 디렉토리 엔트리 슬롯 찾기
+    fn find_free_entry_slots(&self, count: usize) -> VfsResult<usize> {
+        if count == 0 {
+            return Err(VfsError::InvalidArgument);
+        }
         let data = self.read_all_cluster_data()?;
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
 
         for (idx, chunk) in data.chunks(32).enumerate() {
             // 빈 슬롯 (0x00) 또는 삭제된 슬롯 (0xE5)
             if chunk[0] == 0x00 || chunk[0] == 0xE5 {
-                return Ok(idx * 32);
+                if run_len == 0 {
+                    run_start = idx;
+                }
+                run_len += 1;
+                if run_len >= count {
+                    return Ok(run_start * 32);
+                }
+            } else {
+                run_len = 0;
             }
         }
 
@@ -294,6 +317,11 @@ impl Fat32Dir {
 
     /// 디렉토리 엔트리 쓰기
     fn write_dir_entry(&self, offset: usize, entry: &dir::DirEntry) -> VfsResult<()> {
+        self.write_raw_entry(offset, &entry.to_bytes())
+    }
+
+    /// 32바이트 raw 엔트리를 디렉토리에 기록
+    fn write_raw_entry(&self, offset: usize, raw: &[u8; 32]) -> VfsResult<()> {
         let fat = fat::FatTable::new(self.device.clone(), &self.boot);
         let chain = fat.read_chain(self.cluster).map_err(|_| VfsError::IoError)?;
 
@@ -312,8 +340,7 @@ impl Fat32Dir {
         let mut data = self.read_cluster_data_for(cluster)?;
 
         // 엔트리 쓰기
-        let entry_bytes = entry.to_bytes();
-        data[offset_in_cluster..offset_in_cluster + 32].copy_from_slice(&entry_bytes);
+        data[offset_in_cluster..offset_in_cluster + 32].copy_from_slice(raw);
 
         // 클러스터 쓰기
         self.write_cluster_data(cluster, &data)?;
@@ -367,16 +394,86 @@ impl Fat32Dir {
         Ok(())
     }
 
+    /// 엔트리 첫 바이트를 삭제 마커(0xE5)로 설정
+    fn mark_entry_deleted(&self, offset: usize) -> VfsResult<()> {
+        let fat = fat::FatTable::new(self.device.clone(), &self.boot);
+        let chain = fat.read_chain(self.cluster).map_err(|_| VfsError::IoError)?;
+
+        let cluster_size = self.boot.sectors_per_cluster as usize
+            * self.boot.bytes_per_sector as usize;
+        let cluster_idx = offset / cluster_size;
+        let offset_in_cluster = offset % cluster_size;
+        if cluster_idx >= chain.len() {
+            return Err(VfsError::IoError);
+        }
+
+        let cluster = chain[cluster_idx];
+        let mut data = self.read_cluster_data_for(cluster)?;
+        data[offset_in_cluster] = 0xE5;
+        self.write_cluster_data(cluster, &data)?;
+        Ok(())
+    }
+
+    /// short 엔트리와 연결된 LFN 엔트리들을 삭제 처리
+    fn mark_entry_chain_deleted(&self, short_offset: usize, lfn_count: usize) -> VfsResult<()> {
+        self.mark_entry_deleted(short_offset)?;
+        for idx in 1..=lfn_count {
+            let Some(lfn_offset) = short_offset.checked_sub(idx * dir::DirEntry::SIZE) else {
+                break;
+            };
+            self.mark_entry_deleted(lfn_offset)?;
+        }
+        Ok(())
+    }
+
+    /// 디렉토리 하위 엔트리를 재귀적으로 제거한다.
+    fn remove_contents_recursive(&self) -> VfsResult<()> {
+        let entries = self.parse_entries_with_offsets()?;
+        let fat = fat::FatTable::new(self.device.clone(), &self.boot);
+
+        for (name, entry, offset, lfn_count) in entries {
+            if entry.is_dir() {
+                let child = Fat32Dir::new(
+                    self.device.clone(),
+                    self.boot,
+                    entry.cluster(),
+                    name,
+                );
+                child.remove_contents_recursive()?;
+                if entry.cluster() >= 2 {
+                    fat.free_chain(entry.cluster()).map_err(|_| VfsError::IoError)?;
+                }
+            } else if entry.cluster() >= 2 {
+                fat.free_chain(entry.cluster()).map_err(|_| VfsError::IoError)?;
+            }
+
+            self.mark_entry_chain_deleted(offset, lfn_count)?;
+        }
+
+        Ok(())
+    }
+
     /// 빈 파일 생성
     fn create_file(&self, name: &str) -> VfsResult<Arc<dyn VNode>> {
         // 디렉토리 엔트리 생성 (클러스터 없음, 크기 0)
-        let entry = dir::DirEntry::new_file(name, 0, 0);
+        let mut entry = dir::DirEntry::new_file(name, 0, 0);
+        let lfn_entries = if dir::needs_lfn(name) {
+            let short = entry.short_name_raw();
+            dir::build_lfn_entries(name, &short)
+        } else {
+            Vec::new()
+        };
 
         // 빈 슬롯 찾기
-        let offset = self.find_free_entry_slot()?;
+        let slot_count = lfn_entries.len() + 1;
+        let offset = self.find_free_entry_slots(slot_count)?;
 
-        // 엔트리 쓰기
-        self.write_dir_entry(offset, &entry)?;
+        for (idx, lfn) in lfn_entries.iter().enumerate() {
+            self.write_raw_entry(offset + idx * dir::DirEntry::SIZE, &lfn.to_bytes())?;
+        }
+        let short_offset = offset + lfn_entries.len() * dir::DirEntry::SIZE;
+        entry.touch_created_now();
+        self.write_dir_entry(short_offset, &entry)?;
 
         // Fat32File 반환
         Ok(Arc::new(Fat32File::new(
@@ -386,7 +483,7 @@ impl Fat32Dir {
             0,
             String::from(name),
             self.cluster,
-            offset,
+            short_offset,
         )))
     }
 
@@ -414,9 +511,21 @@ impl Fat32Dir {
         self.write_cluster_data(cluster, &data)?;
 
         // 부모 디렉토리에 엔트리 추가
-        let entry = dir::DirEntry::new_dir(name, cluster);
-        let offset = self.find_free_entry_slot()?;
-        self.write_dir_entry(offset, &entry)?;
+        let mut entry = dir::DirEntry::new_dir(name, cluster);
+        let lfn_entries = if dir::needs_lfn(name) {
+            let short = entry.short_name_raw();
+            dir::build_lfn_entries(name, &short)
+        } else {
+            Vec::new()
+        };
+        let slot_count = lfn_entries.len() + 1;
+        let offset = self.find_free_entry_slots(slot_count)?;
+        for (idx, lfn) in lfn_entries.iter().enumerate() {
+            self.write_raw_entry(offset + idx * dir::DirEntry::SIZE, &lfn.to_bytes())?;
+        }
+        let short_offset = offset + lfn_entries.len() * dir::DirEntry::SIZE;
+        entry.touch_created_now();
+        self.write_dir_entry(short_offset, &entry)?;
 
         // Fat32Dir 반환
         Ok(Arc::new(Fat32Dir::new(
@@ -436,7 +545,7 @@ impl VNode for Fat32Dir {
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VNode>> {
         let entries = self.parse_entries_with_offsets()?;
 
-        for (entry_name, entry, offset) in entries {
+        for (entry_name, entry, offset, _) in entries {
             // 대소문자 무시 비교
             if entry_name.eq_ignore_ascii_case(name) {
                 if entry.is_dir() {
@@ -511,10 +620,10 @@ impl VNode for Fat32Dir {
         // 엔트리 찾기
         let entries = self.parse_entries_with_offsets()?;
 
-        let (offset, entry) = entries
+        let (offset, lfn_count, entry) = entries
             .iter()
-            .find(|(entry_name, _, _)| entry_name.eq_ignore_ascii_case(name))
-            .map(|(_, entry, offset)| (*offset, *entry))
+            .find(|(entry_name, _, _, _)| entry_name.eq_ignore_ascii_case(name))
+            .map(|(_, entry, offset, lfn_count)| (*offset, *lfn_count, *entry))
             .ok_or(VfsError::NotFound)?;
 
         // 디렉토리면 에러
@@ -529,10 +638,8 @@ impl VNode for Fat32Dir {
             fat.free_chain(entry.cluster()).map_err(|_| VfsError::IoError)?;
         }
 
-        // 디렉토리 엔트리 삭제 마킹
-        let mut deleted_entry = entry;
-        deleted_entry.mark_deleted();
-        self.write_dir_entry(offset, &deleted_entry)?;
+        // 디렉토리 엔트리 + 연결된 LFN 엔트리 삭제 마킹
+        self.mark_entry_chain_deleted(offset, lfn_count)?;
 
         Ok(())
     }
@@ -541,10 +648,10 @@ impl VNode for Fat32Dir {
         // 엔트리 찾기
         let entries = self.parse_entries_with_offsets()?;
 
-        let (offset, entry) = entries
+        let (offset, lfn_count, entry) = entries
             .iter()
-            .find(|(entry_name, _, _)| entry_name.eq_ignore_ascii_case(name))
-            .map(|(_, entry, offset)| (*offset, *entry))
+            .find(|(entry_name, _, _, _)| entry_name.eq_ignore_ascii_case(name))
+            .map(|(_, entry, offset, lfn_count)| (*offset, *lfn_count, *entry))
             .ok_or(VfsError::NotFound)?;
 
         // 파일이면 에러
@@ -552,28 +659,24 @@ impl VNode for Fat32Dir {
             return Err(VfsError::NotADirectory);
         }
 
-        // 디렉토리가 비어있는지 확인
+        // 디렉토리 하위 엔트리를 재귀적으로 제거
         let subdir = Fat32Dir::new(
             self.device.clone(),
             self.boot,
             entry.cluster(),
             String::from(name),
         );
-
-        let subdir_entries = subdir.readdir()?;
-        if !subdir_entries.is_empty() {
-            return Err(VfsError::DirectoryNotEmpty);
-        }
+        subdir.remove_contents_recursive()?;
 
         let fat = fat::FatTable::new(self.device.clone(), &self.boot);
 
         // 클러스터 해제
-        fat.free_chain(entry.cluster()).map_err(|_| VfsError::IoError)?;
+        if entry.cluster() >= 2 {
+            fat.free_chain(entry.cluster()).map_err(|_| VfsError::IoError)?;
+        }
 
-        // 디렉토리 엔트리 삭제 마킹
-        let mut deleted_entry = entry;
-        deleted_entry.mark_deleted();
-        self.write_dir_entry(offset, &deleted_entry)?;
+        // 디렉토리 엔트리 + 연결된 LFN 엔트리 삭제 마킹
+        self.mark_entry_chain_deleted(offset, lfn_count)?;
 
         Ok(())
     }
@@ -741,6 +844,7 @@ impl Fat32File {
         if let Some(mut entry) = dir::DirEntry::from_bytes(&data[offset_in_cluster..]) {
             entry.set_cluster(new_cluster);
             entry.file_size = new_size;
+            entry.touch_write_now();
             let entry_bytes = entry.to_bytes();
             data[offset_in_cluster..offset_in_cluster + 32].copy_from_slice(&entry_bytes);
 

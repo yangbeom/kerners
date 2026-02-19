@@ -452,6 +452,65 @@ pub extern "C" fn kernel_sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     ) as i64
 }
 
+/// read syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_READ,
+        [fd as usize, buf as usize, count, 0, 0, 0],
+    ) as i64
+}
+
+/// write syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_WRITE,
+        [fd as usize, buf as usize, count, 0, 0, 0],
+    ) as i64
+}
+
+/// getdents64 syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_GETDENTS64,
+        [fd as usize, dirp as usize, count, 0, 0, 0],
+    ) as i64
+}
+
+/// pipe2 syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_pipe2(pipefd: *mut i32, flags: u32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_PIPE2,
+        [pipefd as usize, flags as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// readlinkat syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_readlinkat(
+    dirfd: i32,
+    path: *const u8,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_READLINKAT,
+        [dirfd as usize, path as usize, buf as usize, bufsiz, 0, 0],
+    ) as i64
+}
+
+/// statfs syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_statfs(path: *const u8, statfs_buf: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_STATFS,
+        [path as usize, statfs_buf as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
 /// clock_gettime syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_clock_gettime(clock_id: i32, tp: *mut u8) -> i64 {
@@ -737,6 +796,12 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_open", kernel_sys_open as usize);
     register_symbol("kernel_sys_close", kernel_sys_close as usize);
     register_symbol("kernel_sys_lseek", kernel_sys_lseek as usize);
+    register_symbol("kernel_sys_read", kernel_sys_read as usize);
+    register_symbol("kernel_sys_write", kernel_sys_write as usize);
+    register_symbol("kernel_sys_getdents64", kernel_sys_getdents64 as usize);
+    register_symbol("kernel_sys_pipe2", kernel_sys_pipe2 as usize);
+    register_symbol("kernel_sys_readlinkat", kernel_sys_readlinkat as usize);
+    register_symbol("kernel_sys_statfs", kernel_sys_statfs as usize);
     register_symbol("kernel_sys_clock_gettime", kernel_sys_clock_gettime as usize);
     register_symbol("kernel_sys_clock_getres", kernel_sys_clock_getres as usize);
     register_symbol("kernel_sys_gettimeofday", kernel_sys_gettimeofday as usize);
@@ -770,5 +835,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 49);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 55);
 }

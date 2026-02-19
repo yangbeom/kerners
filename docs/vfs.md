@@ -15,9 +15,9 @@
 │           System Calls (syscall/fs.rs)   │
 ├─────────────────────────────────────────┤
 │              VFS Layer (fs/mod.rs)       │
-├──────────┬──────────┬───────────────────┤
-│  RamFS   │  DevFS   │      FAT32        │
-├──────────┴──────────┴───────────────────┤
+├──────────┬──────────┬──────────┬────────┤
+│  RamFS   │  DevFS   │  FAT32   │ ProcFS │
+├──────────┴──────────┴──────────┴────────┤
 │            Block Device Layer            │
 └─────────────────────────────────────────┘
 ```
@@ -120,6 +120,34 @@ if let Some(device) = get_device("vda") {
 - 영구 저장소 지원
 - 호환성 높음
 - 읽기/쓰기 지원
+- LFN(Long File Name) 쓰기 지원
+- unlink/rmdir(재귀)/truncate 지원
+
+### ProcFS
+
+프로세스/시스템 정보를 제공하는 가상 파일시스템. `/proc`에 마운트.
+
+```rust
+let procfs = fs::procfs::create_procfs();
+fs::mount("/proc", procfs)?;
+```
+
+**주요 경로:**
+- `/proc/self/`
+- `/proc/[pid]/status`
+- `/proc/[pid]/maps`
+- `/proc/meminfo`
+- `/proc/cpuinfo`
+- `/proc/uptime`
+
+### Pipe VNode
+
+`pipe2` syscall은 `src/fs/pipe.rs`의 FIFO VNode 쌍을 생성해 FD 테이블에 등록한다.
+
+**특징:**
+- 읽기/쓰기 엔드포인트 분리 (`VNodeType::Fifo`)
+- 공유 ring buffer 기반 데이터 전달
+- baseline 구현: 블로킹/`PIPE_BUF` 원자성은 미구현 (향후 Phase 16 범위)
 
 ## Mount System
 

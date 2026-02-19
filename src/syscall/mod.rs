@@ -20,6 +20,18 @@ static USER_SYSCALL_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// openat(dirfd, path, flags, mode) -> fd
 pub const SYS_OPENAT: usize = 56;
 
+/// statfs(path, buf) -> int
+pub const SYS_STATFS: usize = 43;
+
+/// pipe2(pipefd, flags) -> int
+pub const SYS_PIPE2: usize = 59;
+
+/// getdents64(fd, dirp, count) -> int
+pub const SYS_GETDENTS64: usize = 61;
+
+/// readlinkat(dirfd, path, buf, bufsiz) -> ssize_t
+pub const SYS_READLINKAT: usize = 78;
+
 /// dup(oldfd) -> newfd
 pub const SYS_DUP: usize = 23;
 
@@ -209,6 +221,15 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as u32,
             args[3] as u32,
+        ),
+        SYS_STATFS => fs::sys_statfs(args[0] as *const u8, args[1] as *mut u8),
+        SYS_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1] as u32),
+        SYS_GETDENTS64 => fs::sys_getdents64(args[0] as i32, args[1] as *mut u8, args[2]),
+        SYS_READLINKAT => fs::sys_readlinkat(
+            args[0] as i32,
+            args[1] as *const u8,
+            args[2] as *mut u8,
+            args[3],
         ),
         SYS_GETCWD => fs::sys_getcwd(args[0] as *mut u8, args[1]),
         SYS_CHDIR => fs::sys_chdir(args[0] as *const u8),
@@ -402,6 +423,22 @@ pub(crate) fn in_user_syscall_context() -> bool {
 /// 현재 스레드의 pending exec 전이 정보를 가져온다.
 pub fn take_exec_transition_for_current() -> Option<process::ExecTransition> {
     process::take_exec_transition_for_current()
+}
+
+/// `/proc/[pid]/status` 조회용 프로세스 스냅샷
+pub type ProcStatusSnapshot = process::ProcStatusSnapshot;
+
+/// `/proc/[pid]/maps` 조회용 매핑 스냅샷
+pub type ProcMapSnapshot = process::ProcMapSnapshot;
+
+/// tid의 프로세스 상태 스냅샷을 가져온다.
+pub fn proc_status_snapshot(tid: crate::proc::Tid) -> Option<ProcStatusSnapshot> {
+    process::proc_status_snapshot(tid)
+}
+
+/// tid의 가상 메모리 매핑 스냅샷 목록을 가져온다.
+pub fn proc_maps_snapshot(tid: crate::proc::Tid) -> alloc::vec::Vec<ProcMapSnapshot> {
+    process::proc_maps_snapshot(tid)
 }
 
 /// 테스트 모듈용: fork 래퍼

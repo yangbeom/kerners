@@ -73,14 +73,18 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_dup3` | 24 | `dup3(oldfd, newfd, flags)` | baseline (`O_CLOEXEC` no-op) |
 | `sys_fcntl` | 25 | `fcntl(fd, cmd, arg)` | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
 | `sys_ioctl` | 29 | `ioctl(fd, req, arg)` | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
+| `sys_statfs` | 43 | `statfs(path, buf)` | 마운트 기준 파일시스템 통계 조회 |
 | `sys_faccessat` | 48 | `faccessat(dirfd, path, mode, flags)` | baseline 경로 존재 확인 |
 | `sys_getcwd` | 17 | `getcwd(buf, size) -> len` | baseline 전역 cwd 반환 (NUL 포함 길이, 버퍼 부족 시 `ERANGE`) |
 | `sys_openat` | 56 | `openat(dirfd, path, flags, mode) -> fd` | 파일 열기 |
 | `sys_close` | 57 | `close(fd)` | 파일 닫기 |
+| `sys_pipe2` | 59 | `pipe2(pipefd, flags)` | baseline 익명 파이프 생성 |
+| `sys_getdents64` | 61 | `getdents64(fd, dirp, count)` | Linux `linux_dirent64` 포맷 디렉토리 엔트리 조회 |
 | `sys_chdir` | 49 | `chdir(path)` | baseline 디렉토리 검증 + 전역 cwd 갱신 |
 | `sys_lseek` | 62 | `lseek(fd, offset, whence) -> off` | 오프셋 이동 |
 | `sys_read` | 63 | `read(fd, buf, count) -> n` | 파일 읽기 |
 | `sys_write` | 64 | `write(fd, buf, count) -> n` | 파일 쓰기 |
+| `sys_readlinkat` | 78 | `readlinkat(dirfd, path, buf, bufsiz)` | baseline 심볼릭 링크 대상 읽기 |
 | `sys_newfstatat` | 79 | `newfstatat(dirfd, path, stat, flags)` | baseline 경로 stat |
 | `sys_fstat` | 80 | `fstat(fd, statbuf)` | 파일 상태 조회 |
 | `sys_mkdirat` | 34 | `mkdirat(dirfd, path, mode)` | 디렉토리 생성 |
@@ -90,6 +94,8 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 - `openat`, `mkdirat`, `unlinkat`의 `dirfd` 인자는 현재 무시됩니다.
 - 상대 경로는 baseline 전역 cwd 기준으로 정규화됩니다.
 - `getcwd`는 NUL 종료 문자열 길이를 반환하며, 버퍼 부족 시 `ERANGE`를 반환합니다.
+- `readlinkat`는 baseline에서 `dirfd`를 무시하고 경로 기반으로 동작합니다.
+- `pipe2`는 ring buffer 기반 baseline 구현이며, 블로킹/`PIPE_BUF` 원자성은 아직 범위 밖입니다.
 
 ## 파일 구조
 

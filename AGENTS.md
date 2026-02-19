@@ -401,13 +401,16 @@ kerners/
 │   │   ├── mod.rs           # VFS abstraction (VNode, FileSystem trait)
 │   │   ├── path.rs          # Path parsing and normalization
 │   │   ├── fd.rs            # File descriptor table
+│   │   ├── pipe.rs          # Anonymous pipe VNode backend
 │   │   ├── ramfs/           # Memory-based filesystem
 │   │   ├── devfs/           # Device filesystem (/dev)
-│   │   └── fat32/           # FAT32 filesystem
-│   │       ├── mod.rs       # FAT32 implementation
-│   │       ├── boot.rs      # Boot sector parsing
-│   │       ├── fat.rs       # FAT table handling
-│   │       └── dir.rs       # Directory entries
+│   │   ├── fat32/           # FAT32 filesystem
+│   │   │   ├── mod.rs       # FAT32 implementation
+│   │   │   ├── boot.rs      # Boot sector parsing
+│   │   │   ├── fat.rs       # FAT table handling
+│   │   │   └── dir.rs       # Directory entries
+│   │   └── procfs/          # ProcFS (/proc) virtual filesystem
+│   │       └── mod.rs       # procfs nodes and rendering
 │   ├── block/               # Block device abstraction
 │   │   ├── mod.rs           # BlockDevice trait
 │   │   ├── ramdisk.rs       # RAM disk
@@ -440,6 +443,7 @@ kerners/
 ├── modules/test_mmap/       # mmap/munmap/mprotect regression test module
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep regression test module
 ├── modules/test_signal/     # signal syscall regression test module
+├── modules/test_procfs/     # procfs + phase14 fs syscall regression test module
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files

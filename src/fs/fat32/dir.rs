@@ -78,6 +78,7 @@ impl DirEntry {
         entry.set_cluster(cluster);
         entry.file_size = size;
         entry.attr = attr::ARCHIVE;
+        entry.touch_created_now();
         entry
     }
 
@@ -87,6 +88,7 @@ impl DirEntry {
         entry.set_name(name);
         entry.set_cluster(cluster);
         entry.attr = attr::DIRECTORY;
+        entry.touch_created_now();
         entry
     }
 
@@ -173,6 +175,14 @@ impl DirEntry {
         }
     }
 
+    /// 8.3 short name raw 11-byte 형태로 반환
+    pub fn short_name_raw(&self) -> [u8; 11] {
+        let mut out = [0u8; 11];
+        out[0..8].copy_from_slice(&self.name);
+        out[8..11].copy_from_slice(&self.ext);
+        out
+    }
+
     /// "." 엔트리인지 확인
     pub fn is_dot(&self) -> bool {
         self.name[0] == b'.' && self.name[1] == b' '
@@ -193,6 +203,7 @@ impl DirEntry {
         entry.ext = [b' '; 3];
         entry.attr = attr::DIRECTORY;
         entry.set_cluster(cluster);
+        entry.touch_created_now();
         entry
     }
 
@@ -207,6 +218,7 @@ impl DirEntry {
         entry.ext = [b' '; 3];
         entry.attr = attr::DIRECTORY;
         entry.set_cluster(parent_cluster);
+        entry.touch_created_now();
         entry
     }
 
@@ -232,6 +244,25 @@ impl DirEntry {
         buf[26..28].copy_from_slice(&self.fst_clus_lo.to_le_bytes());
         buf[28..32].copy_from_slice(&self.file_size.to_le_bytes());
         buf
+    }
+
+    /// 생성/수정/접근 타임스탬프를 현재 시각으로 채운다.
+    pub fn touch_created_now(&mut self) {
+        let (date, time, tenth) = fat_now_date_time();
+        self.crt_date = date;
+        self.crt_time = time;
+        self.crt_time_tenth = tenth;
+        self.lst_acc_date = date;
+        self.wrt_date = date;
+        self.wrt_time = time;
+    }
+
+    /// 수정/접근 타임스탬프를 현재 시각으로 갱신한다.
+    pub fn touch_write_now(&mut self) {
+        let (date, time, _) = fat_now_date_time();
+        self.lst_acc_date = date;
+        self.wrt_date = date;
+        self.wrt_time = time;
     }
 
     /// 바이트 배열에서 읽기
@@ -334,6 +365,26 @@ impl LfnEntry {
         })
     }
 
+    /// 바이트 배열로 변환
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0] = self.order;
+        for (i, ch) in self.name1.iter().enumerate() {
+            out[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        out[11] = self.attr;
+        out[12] = self.entry_type;
+        out[13] = self.checksum;
+        for (i, ch) in self.name2.iter().enumerate() {
+            out[14 + i * 2..14 + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        out[26..28].copy_from_slice(&self.fst_clus_lo.to_le_bytes());
+        for (i, ch) in self.name3.iter().enumerate() {
+            out[28 + i * 2..28 + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        out
+    }
+
     /// 8.3 이름의 체크섬 계산
     pub fn checksum(short_name: &[u8; 11]) -> u8 {
         let mut sum: u8 = 0;
@@ -380,6 +431,79 @@ impl LfnEntry {
     }
 }
 
+/// LFN 필요 여부 (8.3 규칙에서 벗어난 이름)
+pub fn needs_lfn(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.len() != name.len() {
+        return true;
+    }
+    let (base, ext) = if let Some(pos) = upper.rfind('.') {
+        (&upper[..pos], &upper[pos + 1..])
+    } else {
+        (&upper[..], "")
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return true;
+    }
+    !upper
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// long name + short name에서 on-disk 순서(LAST..1) LFN 엔트리 생성
+pub fn build_lfn_entries(long_name: &str, short_name: &[u8; 11]) -> Vec<LfnEntry> {
+    let utf16: Vec<u16> = long_name.encode_utf16().collect();
+    if utf16.is_empty() {
+        return Vec::new();
+    }
+
+    let total = (utf16.len() + 12) / 13;
+    let checksum = LfnEntry::checksum(short_name);
+    let mut entries = Vec::with_capacity(total);
+
+    for seq in (1..=total).rev() {
+        let start = (seq - 1) * 13;
+        let end = core::cmp::min(start + 13, utf16.len());
+        let chunk = &utf16[start..end];
+
+        let mut units = [0xFFFFu16; 13];
+        for (i, ch) in chunk.iter().enumerate() {
+            units[i] = *ch;
+        }
+        if chunk.len() < 13 {
+            units[chunk.len()] = 0;
+            for item in units.iter_mut().skip(chunk.len() + 1) {
+                *item = 0xFFFF;
+            }
+        }
+
+        let mut name1 = [0u16; 5];
+        let mut name2 = [0u16; 6];
+        let mut name3 = [0u16; 2];
+        name1.copy_from_slice(&units[0..5]);
+        name2.copy_from_slice(&units[5..11]);
+        name3.copy_from_slice(&units[11..13]);
+
+        let mut order = seq as u8;
+        if seq == total {
+            order |= LfnEntry::LAST_ENTRY;
+        }
+
+        entries.push(LfnEntry {
+            order,
+            name1,
+            attr: attr::LONG_NAME,
+            entry_type: 0,
+            checksum,
+            name2,
+            fst_clus_lo: 0,
+            name3,
+        });
+    }
+
+    entries
+}
+
 /// LFN 엔트리들에서 전체 이름 추출
 pub fn extract_lfn_name(lfn_entries: &[LfnEntry]) -> String {
     let mut parts: Vec<(u8, String)> = Vec::new();
@@ -400,4 +524,42 @@ pub fn extract_lfn_name(lfn_entries: &[LfnEntry]) -> String {
     }
 
     result
+}
+
+fn fat_now_date_time() -> (u16, u16, u8) {
+    let now_ns = crate::time::realtime_now_ns();
+    let secs = now_ns / 1_000_000_000;
+    let (year, month, day, hour, minute, second) = unix_to_ymdhms(secs);
+
+    let y = if year < 1980 { 1980 } else { year };
+    let fat_date = (((y - 1980) as u16) << 9) | ((month as u16) << 5) | day as u16;
+    let fat_time = ((hour as u16) << 11) | ((minute as u16) << 5) | ((second as u16) / 2);
+    let tenth = 0u8;
+    (fat_date, fat_time, tenth)
+}
+
+fn unix_to_ymdhms(mut unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let sec_in_day = 86_400u64;
+    let days = (unix_secs / sec_in_day) as i64;
+    unix_secs %= sec_in_day;
+
+    let hour = (unix_secs / 3600) as u32;
+    unix_secs %= 3600;
+    let minute = (unix_secs / 60) as u32;
+    let second = (unix_secs % 60) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe as i32 + (era as i32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (mp + if mp < 10 { 3 } else { -9 }) as u32;
+    if month <= 2 {
+        year += 1;
+    }
+
+    (year, month, day, hour, minute, second)
 }

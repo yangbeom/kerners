@@ -28,7 +28,9 @@ make test
   │     → target/modules/{arch}/test_fork.ko
   │     → target/modules/{arch}/test_brk.ko
   │     → target/modules/{arch}/test_mmap.ko
+  │     → target/modules/{arch}/test_timer.ko
   │     → target/modules/{arch}/test_signal.ko
+  │     → target/modules/{arch}/test_procfs.ko
   │
   ├─ 2) FAT32 디스크 이미지 생성 + .ko 파일 복사
   │     → disk.img (mcopy로 .ko를 FAT32에 넣음, `KERNERS_DISK_IMG`로 경로 override 가능)
@@ -69,7 +71,7 @@ $ make test ARCH=aarch64
 
 === KERNERS TEST SUITE START ===
 
-[test] Found 12 test module(s)
+[test] Found 14 test module(s)
 
 [test] Loading /mnt/TEST_IPC.KO ...     (FAT32 8.3 대문자)
 [test_ipc] mq create .................. PASS
@@ -117,13 +119,20 @@ $ make test ARCH=aarch64
 [test_mmap] anonymous map/mprotect .... PASS
 [test_mmap] MAP_FIXED replace ......... PASS
 
+[test] Loading /mnt/test_timer.ko ...
+[test_timer] clock_gettime/gettimeofday PASS
+[test_timer] nanosleep baseline ........ PASS
+
 [test] Loading /mnt/test_signal.ko ...
 [test_signal] rt_sigtimedwait poll ..... PASS
 [test_signal] masked signal wake ....... PASS
 [test_signal] EINTR path ............... PASS
 
+[test] Loading /mnt/test_procfs.ko ...
+[test_procfs] /proc + fs syscall suite . PASS
+
 === KERNERS TEST SUITE END ===
-RESULT: 12 passed, 0 failed
+RESULT: 14 passed, 0 failed
 TEST_STATUS: PASS
 
 → qemu_exit(0)
@@ -317,6 +326,27 @@ make test-all
 | unmaskable check | `SIGKILL`/`SIGSTOP` bit가 `rt_sigprocmask`에서 적용되지 않는지 검증 |
 | sigaction restrictions | `SIGKILL`/`SIGSTOP`에 대한 `rt_sigaction`이 `EINVAL`인지 검증 |
 
+### modules/test_timer — time syscall
+
+| 테스트 | 설명 |
+|--------|------|
+| `clock_gettime` | `CLOCK_MONOTONIC/CLOCK_REALTIME` 값 조회 검증 |
+| `clock_getres` | 해상도 조회 및 기본 범위 검증 |
+| `gettimeofday` | realtime 기반 `timeval` 반환 검증 |
+| `nanosleep` | 유효 인자 sleep + invalid 인자 에러 경로 검증 |
+
+### modules/test_procfs — procfs + fs syscall
+
+| 테스트 | 설명 |
+|--------|------|
+| `/proc/meminfo` | `MemTotal` 키 존재 확인 |
+| `getdents64(/proc)` | `self`, `meminfo`, `cpuinfo`, `uptime` 엔트리 확인 |
+| `/proc/self/status` | `Pid/Name` 필드 출력 확인 |
+| `/proc/self/maps` | maps 읽기 경로 검증 |
+| `statfs(/proc)` | procfs magic (`0x9fa0`) 확인 |
+| `pipe2` | pipe read/write roundtrip 검증 |
+| `readlinkat` | non-symlink 경로에 대한 `EINVAL` 경로 검증 |
+
 ## 커널 심볼 익스포트
 
 테스트 모듈은 `extern "C"` 함수만 호출할 수 있다. 커널 내부 API를 C-compatible 래퍼로 감싸 심볼 테이블에 등록한다.
@@ -333,8 +363,9 @@ make test-all
 | `memset` | `(dest: *mut u8, val: i32, count: usize) -> *mut u8` | 컴파일러 intrinsic |
 | `memcpy` | `(dest: *mut u8, src: *const u8, count: usize) -> *mut u8` | 컴파일러 intrinsic |
 | `memmove` | `(dest: *mut u8, src: *const u8, count: usize) -> *mut u8` | 컴파일러 intrinsic |
+| `memcmp` | `(a: *const u8, b: *const u8, count: usize) -> i32` | 컴파일러 intrinsic |
 
-> `memset`/`memcpy`/`memmove`는 `volatile` 연산으로 구현되어 있습니다.
+> `memset`/`memcpy`/`memmove`/`memcmp`는 `volatile` 연산으로 구현되어 있습니다.
 > 일반 루프로 작성하면 컴파일러가 release 빌드에서 자기 자신을 호출하는 무한 재귀로 최적화합니다.
 
 ### MM (test_symbols.rs 등록)
@@ -390,6 +421,12 @@ make test-all
 | `kernel_sys_open` | `(path: *const u8, flags: u32, mode: u32) -> i64` |
 | `kernel_sys_close` | `(fd: i32) -> i64` |
 | `kernel_sys_lseek` | `(fd: i32, offset: i64, whence: i32) -> i64` |
+| `kernel_sys_read` | `(fd: i32, buf: *mut u8, count: usize) -> i64` |
+| `kernel_sys_write` | `(fd: i32, buf: *const u8, count: usize) -> i64` |
+| `kernel_sys_getdents64` | `(fd: i32, dirp: *mut u8, count: usize) -> i64` |
+| `kernel_sys_pipe2` | `(pipefd: *mut i32, flags: u32) -> i64` |
+| `kernel_sys_readlinkat` | `(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz: usize) -> i64` |
+| `kernel_sys_statfs` | `(path: *const u8, statfs_buf: *mut u8) -> i64` |
 
 ### Thread
 
@@ -480,6 +517,6 @@ fn panic(_info: &PanicInfo) -> ! {
 | 파일 | 설명 |
 |------|------|
 | `src/test_runner.rs` | QEMU 내 테스트 러너 (FAT32 마운트 → 모듈 로드 → 실행 → 결과 집계) |
-| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (38개 심볼) |
+| `src/module/test_symbols.rs` | C-compatible 커널 심볼 래퍼 함수 (55개 심볼) |
 | `src/module/symbol.rs` | 커널 심볼 테이블 + 컴파일러 intrinsic (memset/memcpy/memmove) |
 | `Cargo.toml` | `test_runner` feature 정의 |

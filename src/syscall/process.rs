@@ -182,6 +182,28 @@ pub struct ExecTransition {
     pub user_stack: Vec<u8>,
 }
 
+/// `/proc/[pid]/status`용 상태 스냅샷
+#[derive(Clone)]
+pub struct ProcStatusSnapshot {
+    pub tid: proc::Tid,
+    pub parent_tid: proc::Tid,
+    pub pgid: proc::Tid,
+    pub sid: proc::Tid,
+    pub vm_group: u64,
+    pub signal_mask: u64,
+    pub pending_signals: Vec<u32>,
+}
+
+/// `/proc/[pid]/maps`용 매핑 스냅샷
+#[derive(Clone, Copy)]
+pub struct ProcMapSnapshot {
+    pub start: usize,
+    pub end: usize,
+    pub prot: usize,
+    pub shared: bool,
+    pub file_backed: bool,
+}
+
 /// 스레드별 pending exec 리스트
 static PENDING_EXECS: Mutex<Vec<PendingExec>> = Mutex::new(Vec::new());
 static BRK_REGIONS: Mutex<Vec<BrkRegion>> = Mutex::new(Vec::new());
@@ -635,6 +657,68 @@ fn vm_group_for_tid(tid: proc::Tid) -> u64 {
 
 fn current_vm_group() -> u64 {
     vm_group_for_tid(current_tid_or_zero())
+}
+
+/// tid에 해당하는 프로세스 상태 스냅샷을 반환한다.
+pub fn proc_status_snapshot(tid: proc::Tid) -> Option<ProcStatusSnapshot> {
+    let processes = PROCESS_INFOS.lock();
+    let idx = processes.iter().position(|p| p.tid == tid)?;
+    Some(ProcStatusSnapshot {
+        tid: processes[idx].tid,
+        parent_tid: processes[idx].parent_tid,
+        pgid: processes[idx].pgid,
+        sid: processes[idx].sid,
+        vm_group: processes[idx].vm_group,
+        signal_mask: processes[idx].signal_mask,
+        pending_signals: processes[idx].pending_signals.clone(),
+    })
+}
+
+/// tid에 해당하는 프로세스 가상 메모리 매핑 스냅샷을 반환한다.
+pub fn proc_maps_snapshot(tid: proc::Tid) -> Vec<ProcMapSnapshot> {
+    let vm_group = {
+        let processes = PROCESS_INFOS.lock();
+        let Some(idx) = processes.iter().position(|p| p.tid == tid) else {
+            return Vec::new();
+        };
+        processes[idx].vm_group
+    };
+
+    let mut maps = Vec::new();
+
+    {
+        let brk_regions = BRK_REGIONS.lock();
+        for region in brk_regions.iter() {
+            if region.vm_group == vm_group && region.current > region.base {
+                maps.push(ProcMapSnapshot {
+                    start: region.base,
+                    end: region.current,
+                    prot: PROT_READ | PROT_WRITE,
+                    shared: false,
+                    file_backed: false,
+                });
+            }
+        }
+    }
+
+    {
+        let mmap_regions = MMAP_REGIONS.lock();
+        for region in mmap_regions.iter() {
+            if region.vm_group != vm_group {
+                continue;
+            }
+            maps.push(ProcMapSnapshot {
+                start: region.base,
+                end: region.base.saturating_add(region.len),
+                prot: region.prot,
+                shared: region.flags & MAP_SHARED != 0,
+                file_backed: matches!(region.backing, MmapBacking::File(_)),
+            });
+        }
+    }
+
+    maps.sort_by_key(|m| m.start);
+    maps
 }
 
 fn process_count_in_vm_group(vm_group: u64) -> usize {

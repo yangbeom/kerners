@@ -17,10 +17,11 @@
 | Phase 11: 메모리 관리 syscall | ✅ 완료 | brk/mmap/munmap/mprotect, fork COW, fault COW |
 | Phase 12: 시간/타이머 syscall | 🟡 대부분 완료 | core 완료, 12-A BusyBox smoke 회귀만 잔여 |
 | Phase 13: 시그널 처리 | ✅ 완료 | `rt_sigtimedwait` 완성, 기본 시그널 동작, `test_signal` |
+| Phase 14: 파일시스템 확장 | ✅ 완료 | `getdents64/pipe2/readlinkat/statfs`, FAT32 개선, ProcFS, `test_procfs` |
 
 ---
 
-## 완료 리스트 정리 (2026-02-15)
+## 완료 리스트 정리 (2026-02-19)
 
 ### 100% 완료된 체크리스트 블록
 
@@ -29,6 +30,7 @@
 - [x] Phase 11 (11-1, 11-2, 11-3)
 - [x] Phase 12 core (`nanosleep`, `clock_gettime/getres`, `gettimeofday`, `test_timer`)
 - [x] Phase 13 (`rt_sigtimedwait` 완성, 기본 시그널 동작, `test_signal`)
+- [x] Phase 14 (`getdents64/pipe2/readlinkat/statfs`, FAT32 LFN/삭제/truncate, ProcFS, `test_procfs`)
 
 ### 완료에 근접한 블록 (잔여만 추적)
 
@@ -119,13 +121,17 @@
 | 29 | `ioctl` | ✅ 구현 | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
 | 34 | `mkdirat` | ✅ 구현 | dirfd 무시, path만 사용 |
 | 35 | `unlinkat` | ✅ 구현 | dirfd/flags 무시 |
+| 43 | `statfs` | ✅ 구현 | mount 기준 `FsStats` 반환 (`procfs` magic 포함) |
 | 48 | `faccessat` | ✅ 구현 | baseline 경로 존재 확인 |
 | 49 | `chdir` | ✅ 구현 | baseline 디렉토리 검증 + 전역 cwd 갱신 |
 | 56 | `openat` | ✅ 구현 | O_CREAT, O_TRUNC 지원 |
 | 57 | `close` | ✅ 구현 | |
+| 59 | `pipe2` | ✅ 구현 | baseline 익명 파이프 (링 버퍼, 블로킹/`PIPE_BUF` 보장은 Phase 16) |
+| 61 | `getdents64` | ✅ 구현 | Linux `linux_dirent64` 포맷 + FD offset cursor |
 | 62 | `lseek` | ✅ 구현 | SEEK_SET/CUR/END |
 | 63 | `read` | ✅ 구현 | VFS + stdin 폴백 |
 | 64 | `write` | ✅ 구현 | VFS + stdout/stderr 폴백 |
+| 78 | `readlinkat` | ✅ 구현 | baseline: dirfd 무시, 경로 기반 symlink 대상 복사 |
 | 79 | `newfstatat` | ✅ 구현 | baseline 경로 stat (dirfd/flags 제한적) |
 | 80 | `fstat` | ✅ 구현 | Linux 호환 `struct stat` baseline |
 | 93 | `exit` | ✅ 구현 | |
@@ -444,8 +450,8 @@
 ### Phase 14: 파일시스템 확장 (중기)
 
 #### 14-1. 추가 파일 시스템 콜
-- [ ] `sys_getdents64` (NR 61) — 디렉토리 엔트리 읽기
-  - [ ] struct linux_dirent64 포맷 호환
+- [x] `sys_getdents64` (NR 61) — 디렉토리 엔트리 읽기
+  - [x] struct linux_dirent64 포맷 호환
 - [x] `sys_dup` (NR 23) / `sys_dup3` (NR 24) baseline
   - [x] FD 복제 (stdout 리다이렉션 등)
 - [x] `sys_fcntl` (NR 25) baseline — FD 플래그 조작
@@ -454,10 +460,10 @@
   - [x] TIOCGWINSZ (터미널 크기)
   - [x] TCGETS/TCSETS (터미널 속성)
   - [x] TIOCSCTTY (제어 터미널 설정)
-- [ ] `sys_pipe2` (NR 59) — 파이프 생성
-- [ ] `sys_readlinkat` (NR 78)
+- [x] `sys_pipe2` (NR 59) — 파이프 생성
+- [x] `sys_readlinkat` (NR 78)
 - [x] `sys_fstatat` (NR 79, `newfstatat`) baseline — 경로 기반 stat
-- [ ] `sys_statfs` (NR 43) — 파일시스템 정보
+- [x] `sys_statfs` (NR 43) — 파일시스템 정보
 - [x] `sys_getcwd` (NR 17) — 전역 cwd baseline 반환(`ERANGE` 포함)
 - [x] `sys_chdir` (NR 49) baseline
 
@@ -468,20 +474,20 @@
   - [x] st_atime, st_mtime, st_ctime (timespec, nsec=0 baseline)
 
 #### 14-3. FAT32 개선
-- [ ] LFN (Long File Name) 쓰기 지원
-- [ ] 파일 삭제 (클러스터 체인 해제)
-- [ ] 디렉토리 삭제 (재귀)
-- [ ] 파일 크기 변경 (truncate)
-- [ ] 타임스탬프 업데이트
+- [x] LFN (Long File Name) 쓰기 지원
+- [x] 파일 삭제 (클러스터 체인 해제)
+- [x] 디렉토리 삭제 (재귀)
+- [x] 파일 크기 변경 (truncate)
+- [x] 타임스탬프 업데이트
 
 #### 14-4. ProcFS
-- [ ] `/proc/self/` — 현재 프로세스 정보
-- [ ] `/proc/[pid]/status` — 프로세스 상태
-- [ ] `/proc/[pid]/maps` — 메모리 매핑 정보
-- [ ] `/proc/meminfo` — 시스템 메모리 정보
-- [ ] `/proc/cpuinfo` — CPU 정보
-- [ ] `/proc/uptime` — 부팅 시간
-- [ ] 테스트: `modules/test_procfs`
+- [x] `/proc/self/` — 현재 프로세스 정보
+- [x] `/proc/[pid]/status` — 프로세스 상태
+- [x] `/proc/[pid]/maps` — 메모리 매핑 정보
+- [x] `/proc/meminfo` — 시스템 메모리 정보
+- [x] `/proc/cpuinfo` — CPU 정보
+- [x] `/proc/uptime` — 부팅 시간
+- [x] 테스트: `modules/test_procfs`
 
 ### Phase 15: 유저스페이스 분리 (중기)
 

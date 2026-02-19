@@ -42,7 +42,7 @@ kerners 커널의 서브시스템별 설계 및 구현 문서입니다.
 
 - 메모리: 비트맵 페이지 할당자 + `linked_list_allocator` 기반 힙
 - 프로세스/스레드: 커널 스레드, 선점형 스케줄러, 유저 모드 진입
-- 파일시스템: VFS + RamFS/DevFS/FAT32 + FD 테이블
+- 파일시스템: VFS + RamFS/DevFS/FAT32/ProcFS + FD 테이블 + pipe2 backend
 - 블록/디바이스: VirtIO 블록 디바이스 및 `/dev/vda` 연동
 - 모듈: ELF64 `ET_REL` 로더, 심볼 해석, PLT
 - 시스템 콜: 파일 I/O + process syscall(`execve`, `brk`, `mmap/munmap` baseline)
