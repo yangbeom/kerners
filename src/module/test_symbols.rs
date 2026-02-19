@@ -569,6 +569,15 @@ pub extern "C" fn kernel_sys_nanosleep(req: *const u8, rem: *mut u8) -> i64 {
     ) as i64
 }
 
+/// sigaltstack syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_SIGALTSTACK,
+        [ss as usize, old_ss as usize, 0, 0, 0, 0],
+    ) as i64
+}
+
 /// rt_sigaction syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_rt_sigaction(
@@ -856,6 +865,7 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_clock_getres", kernel_sys_clock_getres as usize);
     register_symbol("kernel_sys_gettimeofday", kernel_sys_gettimeofday as usize);
     register_symbol("kernel_sys_nanosleep", kernel_sys_nanosleep as usize);
+    register_symbol("kernel_sys_sigaltstack", kernel_sys_sigaltstack as usize);
     register_symbol("kernel_sys_rt_sigaction", kernel_sys_rt_sigaction as usize);
     register_symbol(
         "kernel_sys_rt_sigprocmask",
@@ -889,5 +899,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 57);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 58);
 }

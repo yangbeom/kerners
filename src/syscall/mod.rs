@@ -134,6 +134,9 @@ pub const SYS_NANOSLEEP: usize = 101;
 /// set_tid_address(tidptr) -> pid_t
 pub const SYS_SET_TID_ADDRESS: usize = 96;
 
+/// sigaltstack(ss, old_ss) -> int
+pub const SYS_SIGALTSTACK: usize = 132;
+
 /// rt_sigaction(signum, act, oldact, sigsetsize) -> int
 pub const SYS_RT_SIGACTION: usize = 134;
 
@@ -283,6 +286,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         SYS_GETTID => process::sys_gettid(),
         SYS_SET_TID_ADDRESS => process::sys_set_tid_address(args[0] as *mut i32),
         SYS_NANOSLEEP => process::sys_nanosleep(args[0] as *const u8, args[1] as *mut u8),
+        SYS_SIGALTSTACK => process::sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
         SYS_RT_SIGACTION => process::sys_rt_sigaction(
             args[0] as i32,
             args[1] as *const u8,

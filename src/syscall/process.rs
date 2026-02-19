@@ -111,6 +111,10 @@ struct ProcessInfo {
     signal_mask: u64,
     sigtimedwait_mask: u64,
     pending_signals: Vec<u32>,
+    sigaltstack_sp: usize,
+    sigaltstack_size: usize,
+    sigaltstack_flags: i32,
+    sigaltstack_enabled: bool,
     exit_signal: u32,
 }
 
@@ -274,6 +278,10 @@ const SIG_IGN: u64 = 1;
 const SA_SIGINFO: u64 = 0x0000_0004;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESTART: u64 = 0x1000_0000;
+const SS_ONSTACK: i32 = 0x1;
+const SS_DISABLE: i32 = 0x2;
+const SS_AUTODISARM: i32 = i32::from_ne_bytes(0x8000_0000u32.to_ne_bytes());
+const SIGALTSTACK_MIN_SIZE: usize = 2048;
 const SIGFRAME_MAGIC: u64 = 0x5349_4746_5241_4d45;
 
 const CLOCK_REALTIME: i32 = 0;
@@ -354,6 +362,15 @@ impl LinuxSigAction {
             sa_mask: 0,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSigAltStack {
+    ss_sp: usize,
+    ss_flags: i32,
+    _pad: i32,
+    ss_size: usize,
 }
 
 #[repr(C)]
@@ -631,6 +648,10 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         signal_mask: 0,
         sigtimedwait_mask: 0,
         pending_signals: Vec::new(),
+        sigaltstack_sp: 0,
+        sigaltstack_size: 0,
+        sigaltstack_flags: 0,
+        sigaltstack_enabled: false,
         exit_signal: 0,
     });
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1139,6 +1160,191 @@ fn setup_cow_pair(
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn clone_brk_regions_for_fork(
+    parent_vm_group: u64,
+    child_vm_group: u64,
+    parent_root: usize,
+    child_root: usize,
+) -> Result<bool, isize> {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let mut needs_tlb_flush = false;
+
+    let mut brk_regions = BRK_REGIONS.lock();
+    let mut child_regions: Vec<BrkRegion> = Vec::new();
+    for region in brk_regions
+        .iter()
+        .filter(|region| region.vm_group == parent_vm_group)
+    {
+        let mut cloned = region.clone();
+        cloned.vm_group = child_vm_group;
+        for (idx, frame_opt) in region.pages.iter().enumerate() {
+            let Some(frame) = *frame_opt else {
+                continue;
+            };
+            let _ = crate::mm::page::retain_frame(frame);
+            if !region.direct_phys {
+                let va = region.base + idx * page_size;
+                setup_cow_pair(
+                    parent_vm_group,
+                    child_vm_group,
+                    parent_root,
+                    child_root,
+                    va,
+                    frame,
+                    false,
+                )?;
+                needs_tlb_flush = true;
+            }
+        }
+        child_regions.push(cloned);
+    }
+    if !child_regions.is_empty() {
+        brk_regions.extend(child_regions);
+    }
+
+    Ok(needs_tlb_flush)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn clone_mmap_regions_for_fork(
+    parent_vm_group: u64,
+    child_vm_group: u64,
+    parent_root: usize,
+    child_root: usize,
+) -> Result<bool, isize> {
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let mut needs_tlb_flush = false;
+
+    let mut mmap_regions = MMAP_REGIONS.lock();
+    let mut child_regions: Vec<MmapRegion> = Vec::new();
+    for region in mmap_regions
+        .iter()
+        .filter(|region| region.vm_group == parent_vm_group)
+    {
+        let mut cloned = region.clone();
+        cloned.vm_group = child_vm_group;
+        child_regions.push(cloned);
+
+        let private_mapping = (region.flags & MAP_TYPE_MASK) == MAP_PRIVATE;
+        let writable = (region.prot & PROT_WRITE) != 0;
+        let execute = (region.prot & PROT_EXEC) != 0;
+
+        for (idx, frame) in region.pages.iter().copied().enumerate() {
+            let _ = crate::mm::page::retain_frame(frame);
+            if !region.direct_phys && private_mapping && writable {
+                let va = region.base + idx * page_size;
+                setup_cow_pair(
+                    parent_vm_group,
+                    child_vm_group,
+                    parent_root,
+                    child_root,
+                    va,
+                    frame,
+                    execute,
+                )?;
+                needs_tlb_flush = true;
+            }
+        }
+    }
+    if !child_regions.is_empty() {
+        mmap_regions.extend(child_regions);
+    }
+
+    Ok(needs_tlb_flush)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn collect_vm_group_mapped_ranges(vm_group: u64) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    {
+        let brk_regions = BRK_REGIONS.lock();
+        for region in brk_regions.iter().filter(|region| region.vm_group == vm_group) {
+            ranges.push((region.base, region.limit));
+        }
+    }
+    {
+        let mmap_regions = MMAP_REGIONS.lock();
+        for region in mmap_regions
+            .iter()
+            .filter(|region| region.vm_group == vm_group)
+        {
+            ranges.push((region.base, mmap_region_end(region)));
+        }
+    }
+    ranges
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[inline]
+fn va_in_ranges(va: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| *start <= va && va < *end)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn clone_untracked_writable_user_pages_for_fork(
+    parent_vm_group: u64,
+    child_vm_group: u64,
+    parent_root: usize,
+    child_root: usize,
+) -> Result<bool, isize> {
+    let mappings = crate::arch::mmu::collect_user_page_mappings_for_root(parent_root)
+        .map_err(|_| errno::EINVAL)?;
+    let tracked_ranges = collect_vm_group_mapped_ranges(parent_vm_group);
+    let mut needs_tlb_flush = false;
+
+    for mapping in mappings {
+        if !mapping.writable || mapping.phys_addr == 0 {
+            continue;
+        }
+        if va_in_ranges(mapping.virt_addr, &tracked_ranges) {
+            continue;
+        }
+
+        let _ = crate::mm::page::retain_frame(mapping.phys_addr);
+        setup_cow_pair(
+            parent_vm_group,
+            child_vm_group,
+            parent_root,
+            child_root,
+            mapping.virt_addr,
+            mapping.phys_addr,
+            mapping.executable,
+        )?;
+        needs_tlb_flush = true;
+    }
+
+    Ok(needs_tlb_flush)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn clone_private_vm_for_fork(
+    parent_vm_group: u64,
+    child_vm_group: u64,
+    parent_root: usize,
+    child_root: usize,
+) -> Result<(), isize> {
+    let mut needs_tlb_flush = false;
+    needs_tlb_flush |=
+        clone_brk_regions_for_fork(parent_vm_group, child_vm_group, parent_root, child_root)?;
+    needs_tlb_flush |=
+        clone_mmap_regions_for_fork(parent_vm_group, child_vm_group, parent_root, child_root)?;
+    needs_tlb_flush |= clone_untracked_writable_user_pages_for_fork(
+        parent_vm_group,
+        child_vm_group,
+        parent_root,
+        child_root,
+    )?;
+
+    if needs_tlb_flush {
+        flush_user_tlb();
+    }
+
+    Ok(())
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn handle_user_page_fault_write(far: usize) -> bool {
     let page_size = crate::mm::page::PAGE_SIZE;
     let va = far & !(page_size - 1);
@@ -1398,6 +1604,15 @@ fn set_signal_mask_for_tid(tid: proc::Tid, mask: u64) {
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
     let unmaskable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
     processes[idx].signal_mask = mask & !unmaskable;
+}
+
+fn reset_sigaltstack_for_tid(tid: proc::Tid) {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].sigaltstack_sp = 0;
+    processes[idx].sigaltstack_size = 0;
+    processes[idx].sigaltstack_flags = 0;
+    processes[idx].sigaltstack_enabled = false;
 }
 
 fn prepare_pending_signal_delivery(tid: proc::Tid) -> Option<(u32, LinuxSigAction, u64)> {
@@ -2050,6 +2265,84 @@ pub fn sys_set_tid_address(_tidptr: *mut i32) -> isize {
     proc::current_tid().unwrap_or(0) as isize
 }
 
+/// sys_sigaltstack - alternate signal stack 설정/조회
+pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
+    if !old_ss.is_null()
+        && validate_user_pointer(old_ss as usize, core::mem::size_of::<LinuxSigAltStack>()).is_err()
+    {
+        return errno::EFAULT;
+    }
+    if !ss.is_null()
+        && validate_user_pointer(ss as usize, core::mem::size_of::<LinuxSigAltStack>()).is_err()
+    {
+        return errno::EFAULT;
+    }
+
+    let tid = current_tid_or_zero();
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+
+    if !old_ss.is_null() {
+        let old = if processes[idx].sigaltstack_enabled {
+            LinuxSigAltStack {
+                ss_sp: processes[idx].sigaltstack_sp,
+                ss_flags: processes[idx].sigaltstack_flags,
+                _pad: 0,
+                ss_size: processes[idx].sigaltstack_size,
+            }
+        } else {
+            LinuxSigAltStack {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE,
+                _pad: 0,
+                ss_size: 0,
+            }
+        };
+
+        unsafe {
+            // SAFETY: 사용자 포인터 범위를 검증한 뒤 stack_t 구조체를 기록한다.
+            core::ptr::write_unaligned(old_ss as *mut LinuxSigAltStack, old);
+        }
+    }
+
+    if ss.is_null() {
+        return 0;
+    }
+
+    let next = unsafe {
+        // SAFETY: 사용자 포인터 범위를 검증한 뒤 stack_t 구조체를 읽는다.
+        core::ptr::read_unaligned(ss as *const LinuxSigAltStack)
+    };
+    let allowed_flags = SS_DISABLE | SS_AUTODISARM;
+    if (next.ss_flags & !allowed_flags) != 0 {
+        return errno::EINVAL;
+    }
+    if (next.ss_flags & SS_ONSTACK) != 0 {
+        return errno::EINVAL;
+    }
+
+    if (next.ss_flags & SS_DISABLE) != 0 {
+        processes[idx].sigaltstack_sp = 0;
+        processes[idx].sigaltstack_size = 0;
+        processes[idx].sigaltstack_flags = 0;
+        processes[idx].sigaltstack_enabled = false;
+        return 0;
+    }
+
+    if next.ss_sp == 0 {
+        return errno::EINVAL;
+    }
+    if next.ss_size < SIGALTSTACK_MIN_SIZE {
+        return errno::ENOMEM;
+    }
+
+    processes[idx].sigaltstack_sp = next.ss_sp;
+    processes[idx].sigaltstack_size = next.ss_size;
+    processes[idx].sigaltstack_flags = next.ss_flags & SS_AUTODISARM;
+    processes[idx].sigaltstack_enabled = true;
+    0
+}
+
 /// sys_rt_sigaction - 시그널 액션 설정
 ///
 /// sighand_group 단위로 시그널 핸들러를 등록/조회한다.
@@ -2572,6 +2865,10 @@ pub fn sys_clone(
         let parent_pgid = processes[parent_idx].pgid;
         let parent_sid = processes[parent_idx].sid;
         let parent_mask = processes[parent_idx].signal_mask;
+        let parent_sigaltstack_sp = processes[parent_idx].sigaltstack_sp;
+        let parent_sigaltstack_size = processes[parent_idx].sigaltstack_size;
+        let parent_sigaltstack_flags = processes[parent_idx].sigaltstack_flags;
+        let parent_sigaltstack_enabled = processes[parent_idx].sigaltstack_enabled;
         let parent_vm_group = processes[parent_idx].vm_group;
         let parent_fs_group = processes[parent_idx].fs_group;
         let parent_files_group = processes[parent_idx].files_group;
@@ -2600,6 +2897,10 @@ pub fn sys_clone(
             signal_mask: parent_mask,
             sigtimedwait_mask: 0,
             pending_signals: Vec::new(),
+            sigaltstack_sp: parent_sigaltstack_sp,
+            sigaltstack_size: parent_sigaltstack_size,
+            sigaltstack_flags: parent_sigaltstack_flags,
+            sigaltstack_enabled: parent_sigaltstack_enabled,
             exit_signal,
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
@@ -2661,6 +2962,10 @@ fn finalize_clone_with_vm_setup(
         let parent_pgid = processes[parent_idx].pgid;
         let parent_sid = processes[parent_idx].sid;
         let parent_mask = processes[parent_idx].signal_mask;
+        let parent_sigaltstack_sp = processes[parent_idx].sigaltstack_sp;
+        let parent_sigaltstack_size = processes[parent_idx].sigaltstack_size;
+        let parent_sigaltstack_flags = processes[parent_idx].sigaltstack_flags;
+        let parent_sigaltstack_enabled = processes[parent_idx].sigaltstack_enabled;
         let parent_vm_group = processes[parent_idx].vm_group;
         let parent_fs_group = processes[parent_idx].fs_group;
         let parent_files_group = processes[parent_idx].files_group;
@@ -2689,6 +2994,10 @@ fn finalize_clone_with_vm_setup(
             signal_mask: parent_mask,
             sigtimedwait_mask: 0,
             pending_signals: Vec::new(),
+            sigaltstack_sp: parent_sigaltstack_sp,
+            sigaltstack_size: parent_sigaltstack_size,
+            sigaltstack_flags: parent_sigaltstack_flags,
+            sigaltstack_enabled: parent_sigaltstack_enabled,
             exit_signal,
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
@@ -2708,92 +3017,10 @@ fn finalize_clone_with_vm_setup(
         };
         set_vm_root_for_group(child_vm_group, child_root);
         let _ = proc::set_thread_user_root_table(child_tid, child_root);
-
-        let page_size = crate::mm::page::PAGE_SIZE;
-        let mut needs_tlb_flush = false;
-
+        if let Err(err) =
+            clone_private_vm_for_fork(parent_vm_group, child_vm_group, parent_root, child_root)
         {
-            let mut brk_regions = BRK_REGIONS.lock();
-            let mut child_regions: Vec<BrkRegion> = Vec::new();
-            for region in brk_regions
-                .iter()
-                .filter(|region| region.vm_group == parent_vm_group)
-            {
-                let mut cloned = region.clone();
-                cloned.vm_group = child_vm_group;
-                for (idx, frame_opt) in region.pages.iter().enumerate() {
-                    let Some(frame) = *frame_opt else {
-                        continue;
-                    };
-                    let _ = crate::mm::page::retain_frame(frame);
-                    if !region.direct_phys {
-                        let va = region.base + idx * page_size;
-                        if setup_cow_pair(
-                            parent_vm_group,
-                            child_vm_group,
-                            parent_root,
-                            child_root,
-                            va,
-                            frame,
-                            false,
-                        )
-                        .is_err()
-                        {
-                            return errno::ENOMEM;
-                        }
-                        needs_tlb_flush = true;
-                    }
-                }
-                child_regions.push(cloned);
-            }
-            if !child_regions.is_empty() {
-                brk_regions.extend(child_regions);
-            }
-        }
-
-        {
-            let mut mmap_regions = MMAP_REGIONS.lock();
-            let mut child_regions: Vec<MmapRegion> = Vec::new();
-            for region in mmap_regions
-                .iter()
-                .filter(|region| region.vm_group == parent_vm_group)
-            {
-                let mut cloned = region.clone();
-                cloned.vm_group = child_vm_group;
-                child_regions.push(cloned);
-
-                let private_mapping = (region.flags & MAP_TYPE_MASK) == MAP_PRIVATE;
-                let writable = (region.prot & PROT_WRITE) != 0;
-                let execute = (region.prot & PROT_EXEC) != 0;
-
-                for (idx, frame) in region.pages.iter().copied().enumerate() {
-                    let _ = crate::mm::page::retain_frame(frame);
-                    if !region.direct_phys && private_mapping && writable {
-                        let va = region.base + idx * page_size;
-                        if setup_cow_pair(
-                            parent_vm_group,
-                            child_vm_group,
-                            parent_root,
-                            child_root,
-                            va,
-                            frame,
-                            execute,
-                        )
-                        .is_err()
-                        {
-                            return errno::ENOMEM;
-                        }
-                        needs_tlb_flush = true;
-                    }
-                }
-            }
-            if !child_regions.is_empty() {
-                mmap_regions.extend(child_regions);
-            }
-        }
-
-        if needs_tlb_flush {
-            flush_user_tlb();
+            return err;
         }
     }
 
@@ -2886,164 +3113,7 @@ pub fn sys_clone_with_user_context(
         },
     });
 
-    let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
-    let (parent_vm_group, child_vm_group) = {
-        let mut processes = PROCESS_INFOS.lock();
-        let parent_idx = ensure_process_info_for_tid_locked(&mut processes, parent_tid);
-        let parent_pgid = processes[parent_idx].pgid;
-        let parent_sid = processes[parent_idx].sid;
-        let parent_mask = processes[parent_idx].signal_mask;
-        let parent_vm_group = processes[parent_idx].vm_group;
-        let parent_fs_group = processes[parent_idx].fs_group;
-        let parent_files_group = processes[parent_idx].files_group;
-        let parent_sighand_group = processes[parent_idx].sighand_group;
-        let (child_vm_group, child_fs_group, child_files_group, child_sighand_group) =
-            clone_resource_groups(
-                flags,
-                parent_vm_group,
-                parent_fs_group,
-                parent_files_group,
-                parent_sighand_group,
-            );
-
-        if let Some(pos) = processes.iter().position(|p| p.tid == child_tid) {
-            processes.swap_remove(pos);
-        }
-        processes.push(ProcessInfo {
-            tid: child_tid,
-            parent_tid,
-            pgid: parent_pgid,
-            sid: parent_sid,
-            vm_group: child_vm_group,
-            fs_group: child_fs_group,
-            files_group: child_files_group,
-            sighand_group: child_sighand_group,
-            signal_mask: parent_mask,
-            sigtimedwait_mask: 0,
-            pending_signals: Vec::new(),
-            exit_signal,
-        });
-        clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
-
-        (parent_vm_group, child_vm_group)
-    };
-
-    if flags & CLONE_VM != 0 {
-        let root = vm_root_for_group(parent_vm_group);
-        set_vm_root_for_group(child_vm_group, root);
-        let _ = proc::set_thread_user_root_table(child_tid, root);
-    } else {
-        let parent_root = vm_root_for_group(parent_vm_group);
-        let child_root = match crate::arch::mmu::clone_root_table(parent_root) {
-            Ok(root) => root,
-            Err(_) => return errno::ENOMEM,
-        };
-        set_vm_root_for_group(child_vm_group, child_root);
-        let _ = proc::set_thread_user_root_table(child_tid, child_root);
-
-        let page_size = crate::mm::page::PAGE_SIZE;
-        let mut needs_tlb_flush = false;
-
-        {
-            let mut brk_regions = BRK_REGIONS.lock();
-            let mut child_regions: Vec<BrkRegion> = Vec::new();
-            for region in brk_regions
-                .iter()
-                .filter(|region| region.vm_group == parent_vm_group)
-            {
-                let mut cloned = region.clone();
-                cloned.vm_group = child_vm_group;
-                for (idx, frame_opt) in region.pages.iter().enumerate() {
-                    let Some(frame) = *frame_opt else {
-                        continue;
-                    };
-                    let _ = crate::mm::page::retain_frame(frame);
-                    if !region.direct_phys {
-                        let va = region.base + idx * page_size;
-                        if setup_cow_pair(
-                            parent_vm_group,
-                            child_vm_group,
-                            parent_root,
-                            child_root,
-                            va,
-                            frame,
-                            false,
-                        )
-                        .is_err()
-                        {
-                            return errno::ENOMEM;
-                        }
-                        needs_tlb_flush = true;
-                    }
-                }
-                child_regions.push(cloned);
-            }
-            if !child_regions.is_empty() {
-                brk_regions.extend(child_regions);
-            }
-        }
-
-        {
-            let mut mmap_regions = MMAP_REGIONS.lock();
-            let mut child_regions: Vec<MmapRegion> = Vec::new();
-            for region in mmap_regions
-                .iter()
-                .filter(|region| region.vm_group == parent_vm_group)
-            {
-                let mut cloned = region.clone();
-                cloned.vm_group = child_vm_group;
-                child_regions.push(cloned);
-
-                let private_mapping = (region.flags & MAP_TYPE_MASK) == MAP_PRIVATE;
-                let writable = (region.prot & PROT_WRITE) != 0;
-                let execute = (region.prot & PROT_EXEC) != 0;
-
-                for (idx, frame) in region.pages.iter().copied().enumerate() {
-                    let _ = crate::mm::page::retain_frame(frame);
-                    if !region.direct_phys && private_mapping && writable {
-                        let va = region.base + idx * page_size;
-                        if setup_cow_pair(
-                            parent_vm_group,
-                            child_vm_group,
-                            parent_root,
-                            child_root,
-                            va,
-                            frame,
-                            execute,
-                        )
-                        .is_err()
-                        {
-                            return errno::ENOMEM;
-                        }
-                        needs_tlb_flush = true;
-                    }
-                }
-            }
-            if !child_regions.is_empty() {
-                mmap_regions.extend(child_regions);
-            }
-        }
-
-        if needs_tlb_flush {
-            flush_user_tlb();
-        }
-    }
-
-    if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
-        write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
-    }
-    if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
-        write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
-    }
-
-    mark_pending_fork_child_ready(child_tid);
-
-    if flags & CLONE_VFORK != 0 {
-        add_vfork_wait(parent_tid, child_tid);
-        wait_vfork_release(parent_tid, child_tid);
-    }
-
-    child_tid as isize
+    finalize_clone_with_vm_setup(flags, parent_tid, child_tid, parent_tid_ptr, child_tid_ptr)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -4077,9 +4147,6 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return errno::EINVAL;
     }
-    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
-        return errno::EINVAL;
-    }
 
     let page_size = crate::mm::page::PAGE_SIZE;
     if addr == 0 || addr & (page_size - 1) != 0 {
@@ -4208,6 +4275,7 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         None => return errno::EPERM,
     };
     ensure_process_info_for_tid(tid);
+    reset_sigaltstack_for_tid(tid);
 
     {
         let mut pending = PENDING_EXECS.lock();
