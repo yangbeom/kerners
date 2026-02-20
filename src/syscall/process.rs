@@ -137,6 +137,7 @@ struct ForkChildContext {
     elr: u64,
     spsr: u64,
     sp_el0: u64,
+    tpidr_el0: u64,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -501,9 +502,11 @@ fork_child_enter_user:
     ldr x9, [x30, #248]   // elr
     ldr x10, [x30, #256]  // spsr
     ldr x11, [x30, #264]  // sp_el0
+    ldr x12, [x30, #272]  // tpidr_el0
     msr elr_el1, x9
     msr spsr_el1, x10
     msr sp_el0, x11
+    msr tpidr_el0, x12
 
     // 사용자 GPR 복원
     ldp x0, x1, [x30, #0]
@@ -535,10 +538,14 @@ core::arch::global_asm!(
 fork_child_enter_user:
     // a0 = *ForkChildContext
     mv t6, a0
+    mv t5, sp
 
     // mret 복귀 컨텍스트 복원
     ld t0, 256(t6)   // mstatus
+    li t2, 0x6000    // FS=Dirty (사용자 FP 허용)
+    or t0, t0, t2
     ld t1, 264(t6)   // mepc
+    csrw mscratch, t5
     csrw mstatus, t0
     csrw mepc, t1
 
@@ -1292,15 +1299,34 @@ fn clone_untracked_writable_user_pages_for_fork(
     let mappings = crate::arch::mmu::collect_user_page_mappings_for_root(parent_root)
         .map_err(|_| errno::EINVAL)?;
     let tracked_ranges = collect_vm_group_mapped_ranges(parent_vm_group);
+    let parent_cow_pages: Vec<CowMeta> = {
+        let cows = COW_PAGES.lock();
+        cows.iter()
+            .filter(|item| item.vm_group == parent_vm_group)
+            .copied()
+            .collect()
+    };
     let mut needs_tlb_flush = false;
 
     for mapping in mappings {
-        if !mapping.writable || mapping.phys_addr == 0 {
+        if mapping.phys_addr == 0 {
             continue;
         }
         if va_in_ranges(mapping.virt_addr, &tracked_ranges) {
             continue;
         }
+
+        // 이미 read-only COW 상태인 페이지(이전 fork 결과)도 새 자식에게 COW 메타를 확장해야 한다.
+        let parent_cow = parent_cow_pages
+            .iter()
+            .find(|item| item.addr == mapping.virt_addr)
+            .copied();
+        if !mapping.writable && parent_cow.is_none() {
+            continue;
+        }
+        let execute = parent_cow
+            .map(|item| item.execute)
+            .unwrap_or(mapping.executable);
 
         let _ = crate::mm::page::retain_frame(mapping.phys_addr);
         setup_cow_pair(
@@ -1310,7 +1336,7 @@ fn clone_untracked_writable_user_pages_for_fork(
             child_root,
             mapping.virt_addr,
             mapping.phys_addr,
-            mapping.executable,
+            execute,
         )?;
         needs_tlb_flush = true;
     }
@@ -1353,8 +1379,8 @@ fn handle_user_page_fault_write(far: usize) -> bool {
     }
 
     let current_vm_group = current_vm_group();
-    let active_root =
-        crate::proc::current_user_root_table().unwrap_or(crate::arch::mmu::current_root_table());
+    let active_root = crate::proc::current_user_root_table()
+        .unwrap_or(crate::arch::mmu::current_root_table());
     let (vm_group, cow) = {
         let cows = COW_PAGES.lock();
         if let Some(item) = cows
@@ -3064,11 +3090,18 @@ pub fn sys_clone_with_user_context_riscv(
         gpr[2] = child_stack as u64; // child user sp
     }
     gpr[10] = 0; // child syscall return value (a0)
+    // RISC-V는 trap 진입 시 mepc가 `ecall` 자체를 가리키므로,
+    // 자식은 syscall 다음 명령으로 복귀하도록 +4를 저장해야 한다.
+    let child_mepc = mepc.wrapping_add(4);
 
     PENDING_FORK_CHILDREN.lock().push(PendingForkChild {
         tid: child_tid,
         ready: false,
-        context: ForkChildContext { gpr, mstatus, mepc },
+        context: ForkChildContext {
+            gpr,
+            mstatus,
+            mepc: child_mepc,
+        },
     });
 
     finalize_clone_with_vm_setup(flags, parent_tid, child_tid, parent_tid_ptr, child_tid_ptr)
@@ -3099,6 +3132,18 @@ pub fn sys_clone_with_user_context(
     } else {
         child_stack as u64
     };
+    let child_tpidr_el0 = {
+        let mut tp: u64 = 0;
+        unsafe {
+            // SAFETY: EL1에서 현재 태스크의 TPIDR_EL0 값을 읽어 자식 초기 TLS 기반으로 전달한다.
+            core::arch::asm!(
+                "mrs {tp}, tpidr_el0",
+                tp = out(reg) tp,
+                options(nostack, nomem)
+            );
+        }
+        tp
+    };
 
     gpr[0] = 0; // child의 syscall 반환값
 
@@ -3110,6 +3155,7 @@ pub fn sys_clone_with_user_context(
             elr,
             spsr,
             sp_el0: child_sp,
+            tpidr_el0: child_tpidr_el0,
         },
     });
 

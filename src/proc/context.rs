@@ -35,6 +35,10 @@ pub struct Context {
     pub lr: u64,
     /// Stack pointer
     pub sp: u64,
+    /// User stack pointer register (SP_EL0)
+    pub sp_el0: u64,
+    /// User TLS base register (TPIDR_EL0)
+    pub tpidr_el0: u64,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -55,6 +59,8 @@ impl Context {
             fp: 0,
             lr: 0,
             sp: 0,
+            sp_el0: 0,
+            tpidr_el0: 0,
         }
     }
 
@@ -77,6 +83,8 @@ impl Context {
             fp: 0,
             lr: entry as u64, // 컨텍스트 스위치 후 "ret"이 이 주소로 점프
             sp: stack_top as u64,
+            sp_el0: 0,
+            tpidr_el0: 0,
         }
     }
 }
@@ -180,6 +188,12 @@ context_switch:
     // sp 저장
     mov x9, sp
     str x9, [x0, #96]
+    // sp_el0 저장
+    mrs x9, sp_el0
+    str x9, [x0, #104]
+    // tpidr_el0 저장
+    mrs x9, tpidr_el0
+    str x9, [x0, #112]
 
     // 새 컨텍스트 로드 (x1 = new_ctx)
     // callee-saved 레지스터 x19-x28 복원
@@ -193,6 +207,12 @@ context_switch:
     // sp 복원
     ldr x9, [x1, #96]
     mov sp, x9
+    // sp_el0 복원
+    ldr x9, [x1, #104]
+    msr sp_el0, x9
+    // tpidr_el0 복원
+    ldr x9, [x1, #112]
+    msr tpidr_el0, x9
 
     // lr로 점프 (ret은 x30으로 점프)
     ret
