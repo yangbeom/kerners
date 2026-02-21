@@ -20,6 +20,7 @@ const MAX_EXEC_ENV_COUNT: usize = 128;
 const MAX_EXEC_STR_LEN: usize = 4096;
 const MAX_EXEC_ARG_ENV_TOTAL_BYTES: usize = 32 * 1024;
 const INIT_PROCESS_TID: proc::Tid = 1;
+const DEFAULT_UMASK: u32 = 0o022;
 
 struct PendingExec {
     tid: proc::Tid,
@@ -107,6 +108,7 @@ struct ProcessInfo {
     vm_group: u64,
     fs_group: u64,
     files_group: u64,
+    umask: u32,
     sighand_group: u64,
     signal_mask: u64,
     sigtimedwait_mask: u64,
@@ -651,6 +653,7 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         vm_group: default_group,
         fs_group: default_group,
         files_group: default_group,
+        umask: DEFAULT_UMASK,
         sighand_group: default_group,
         signal_mask: 0,
         sigtimedwait_mask: 0,
@@ -2283,6 +2286,26 @@ pub fn sys_setgid(_gid: u32) -> isize {
     0
 }
 
+/// 현재 스레드에 적용된 umask 값을 반환한다.
+pub fn current_umask() -> u32 {
+    let tid = current_tid_or_zero();
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].umask & 0o777
+}
+
+/// sys_umask - 파일 생성 권한 마스크 설정
+///
+/// Linux와 동일하게 기존 마스크를 반환하고, 새 마스크는 하위 9비트만 반영한다.
+pub fn sys_umask(mask: u32) -> isize {
+    let tid = current_tid_or_zero();
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    let old = processes[idx].umask & 0o777;
+    processes[idx].umask = mask & 0o777;
+    old as isize
+}
+
 /// sys_set_tid_address - clear_child_tid 포인터 등록
 ///
 /// 현재 커널은 clear_child_tid를 추적하지 않으며,
@@ -2898,6 +2921,7 @@ pub fn sys_clone(
         let parent_vm_group = processes[parent_idx].vm_group;
         let parent_fs_group = processes[parent_idx].fs_group;
         let parent_files_group = processes[parent_idx].files_group;
+        let parent_umask = processes[parent_idx].umask;
         let parent_sighand_group = processes[parent_idx].sighand_group;
         let (child_vm_group, child_fs_group, child_files_group, child_sighand_group) =
             clone_resource_groups(
@@ -2919,6 +2943,7 @@ pub fn sys_clone(
             vm_group: child_vm_group,
             fs_group: child_fs_group,
             files_group: child_files_group,
+            umask: parent_umask,
             sighand_group: child_sighand_group,
             signal_mask: parent_mask,
             sigtimedwait_mask: 0,
@@ -2995,6 +3020,7 @@ fn finalize_clone_with_vm_setup(
         let parent_vm_group = processes[parent_idx].vm_group;
         let parent_fs_group = processes[parent_idx].fs_group;
         let parent_files_group = processes[parent_idx].files_group;
+        let parent_umask = processes[parent_idx].umask;
         let parent_sighand_group = processes[parent_idx].sighand_group;
         let (child_vm_group, child_fs_group, child_files_group, child_sighand_group) =
             clone_resource_groups(
@@ -3016,6 +3042,7 @@ fn finalize_clone_with_vm_setup(
             vm_group: child_vm_group,
             fs_group: child_fs_group,
             files_group: child_files_group,
+            umask: parent_umask,
             sighand_group: child_sighand_group,
             signal_mask: parent_mask,
             sigtimedwait_mask: 0,

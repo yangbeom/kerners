@@ -521,8 +521,9 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> isize {
                 Ok(p) => p,
                 Err(e) => return vfs_error_to_errno(e),
             };
+            let create_mode = mode & !super::process::current_umask();
 
-            match parent.create(&name, VNodeType::File, FileMode::new(mode)) {
+            match parent.create(&name, VNodeType::File, FileMode::new(create_mode)) {
                 Ok(v) => v,
                 Err(e) => return vfs_error_to_errno(e),
             }
@@ -1164,7 +1165,8 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
 
     match fs::path::resolve_parent(&root, &path_norm) {
         Ok((parent, name)) => {
-            match parent.create(&name, VNodeType::Directory, FileMode::new(mode)) {
+            let create_mode = mode & !super::process::current_umask();
+            match parent.create(&name, VNodeType::Directory, FileMode::new(create_mode)) {
                 Ok(_) => 0,
                 Err(e) => vfs_error_to_errno(e),
             }

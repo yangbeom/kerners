@@ -170,6 +170,9 @@ pub const SYS_GETSID: usize = 156;
 /// setsid() -> pid_t
 pub const SYS_SETSID: usize = 157;
 
+/// umask(mask) -> old_mask
+pub const SYS_UMASK: usize = 166;
+
 /// uname(buf) -> int
 pub const SYS_UNAME: usize = 160;
 
@@ -321,6 +324,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         SYS_GETPGID => process::sys_getpgid(args[0] as isize),
         SYS_GETSID => process::sys_getsid(args[0] as isize),
         SYS_SETSID => process::sys_setsid(),
+        SYS_UMASK => process::sys_umask(args[0] as u32),
         SYS_UNAME => process::sys_uname(args[0] as *mut u8),
         SYS_REBOOT => process::sys_reboot(args[0], args[1], args[2], args[3]),
         SYS_SOCKET => process::sys_socket(args[0] as i32, args[1] as i32, args[2] as i32),
