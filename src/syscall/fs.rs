@@ -49,6 +49,7 @@ const TCSETSF: usize = 0x5404;
 const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
 const PPOLL_MAX_FDS: usize = 1024;
 const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
+const IOV_MAX: usize = 1024;
 
 const POLLIN: i16 = 0x0001;
 const POLLPRI: i16 = 0x0002;
@@ -133,6 +134,13 @@ struct LinuxPollFd {
 struct LinuxTimespec {
     tv_sec: i64,
     tv_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxIovec {
+    iov_base: usize,
+    iov_len: usize,
 }
 
 const DT_UNKNOWN: u8 = 0;
@@ -316,6 +324,63 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> isize {
             errno::ENOENT
         }
     }
+}
+
+/// sys_writev - scatter/gather 쓰기
+///
+/// iovec 배열을 순회하며 각 버퍼를 기존 sys_write 경로로 전달한다.
+/// 일부 버퍼 기록 이후 오류가 발생하면 Linux와 동일하게 누적 기록량을 우선 반환한다.
+pub fn sys_writev(fd: i32, iov: *const u8, iovcnt: i32) -> isize {
+    if fd < 0 {
+        return errno::EBADF;
+    }
+    if iovcnt < 0 || iovcnt as usize > IOV_MAX {
+        return errno::EINVAL;
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iov.is_null() {
+        return errno::EFAULT;
+    }
+
+    let mut total_written = 0isize;
+    let iov_ptr = iov as *const LinuxIovec;
+    for idx in 0..iovcnt as usize {
+        let entry = unsafe {
+            // SAFETY: iovcnt 범위를 검증했으며, 사용자 메모리에서 iovec 엔트리 하나를 읽는다.
+            core::ptr::read_unaligned(iov_ptr.add(idx))
+        };
+        if entry.iov_len == 0 {
+            continue;
+        }
+        if entry.iov_base == 0 {
+            return if total_written > 0 {
+                total_written
+            } else {
+                errno::EFAULT
+            };
+        }
+
+        let written = sys_write(fd as usize, entry.iov_base as *const u8, entry.iov_len);
+        if written < 0 {
+            return if total_written > 0 {
+                total_written
+            } else {
+                written
+            };
+        }
+        total_written = match total_written.checked_add(written) {
+            Some(v) => v,
+            None => return errno::EINVAL,
+        };
+
+        if written as usize != entry.iov_len {
+            break;
+        }
+    }
+
+    total_written
 }
 
 /// sys_read - 파일 디스크립터에서 읽기
