@@ -81,8 +81,11 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// 스택 크기 (16KB)
-    pub const STACK_SIZE: usize = 16 * 1024;
+    /// 스택 크기 (64KB)
+    ///
+    /// 사용자 syscall 경로(execve + VFS + FAT32 + block I/O)는 호출 깊이가 커서
+    /// 16KB로는 아키텍처/옵티마이저 조합에 따라 커널 스택 여유가 부족해질 수 있다.
+    pub const STACK_SIZE: usize = 64 * 1024;
 
     /// 새 스레드 생성
     pub fn new(name: &str, entry: fn() -> !) -> Self {

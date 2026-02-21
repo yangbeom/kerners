@@ -318,16 +318,18 @@ unsafe fn write_reg(offset: usize, value: u32) {
 4. **Volatile Access Required:** All hardware register access must use `read_volatile`/`write_volatile`
 5. **No Interactive Input in Tests:** QEMU tests require manual command entry in the shell
 6. **No Nightly Rust:** Do NOT use Rust nightly toolchain. Use stable Rust only. This project is designed to build with stable Rust. **Never use `cargo +nightly` commands.**
+7. **Fix Root Causes, Not Minimal Patches:** For failing tests or regressions, identify and fix the structural/root cause first. Do not stop at a narrow workaround unless the user explicitly requests a temporary hotfix.
 
 ## Workflow
 
 1. **Check plan.md first** - Development tasks and roadmap are tracked there
 2. **Read relevant docs** - `docs/mm.md` for memory management, etc.
-3. **Maintain architecture abstraction** - Keep common code separate from arch-specific code
-4. **Test in QEMU** - Always verify changes by running `./run.sh` and using shell commands
-5. **Document unsafe code** - Every unsafe block must explain why it's safe
-6. **Update documentation** - When adding/modifying modules, update corresponding docs in `docs/`
-7. **Keep Project Structure current** - Update AGENTS.md and AGENTS-kr.md when adding new files/directories
+3. **Do root-cause analysis first** - For failures, verify the actual failure path and design a fundamental fix before coding
+4. **Maintain architecture abstraction** - Keep common code separate from arch-specific code
+5. **Test in QEMU** - Always verify changes by running `./run.sh` and using shell commands
+6. **Document unsafe code** - Every unsafe block must explain why it's safe
+7. **Update documentation** - When adding/modifying modules, update corresponding docs in `docs/`
+8. **Keep Project Structure current** - Update AGENTS.md and AGENTS-kr.md when adding new files/directories
 
 ## Documentation Guidelines
 

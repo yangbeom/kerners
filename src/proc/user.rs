@@ -15,9 +15,14 @@ pub const USER_STACK_SIZE: usize = 64 * 1024;
 const MAX_EXECUTABLE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 const AUXV_AT_NULL: usize = 0;
 const AUXV_AT_PHDR: usize = 3;
+const AUXV_AT_PHENT: usize = 4;
 const AUXV_AT_PHNUM: usize = 5;
 const AUXV_AT_PAGESZ: usize = 6;
+const AUXV_AT_BASE: usize = 7;
 const AUXV_AT_ENTRY: usize = 9;
+const MAX_SHEBANG_DEPTH: usize = 4;
+const DEFAULT_EXEC_PATH: &str = "/bin:/sbin:/usr/bin:/usr/sbin";
+const MAX_INTERP_PATH_LEN: usize = 4096;
 
 /// 유저 스택 베이스 주소 (가상 주소, 높은 주소에서 시작)
 /// 실제로는 물리 메모리를 매핑해야 하지만, 현재는 identity mapping 사용
@@ -110,8 +115,15 @@ impl UserProcess {
                 "li t0, 0x80",          // MPIE 비트
                 "csrs mstatus, t0",
 
+                // mstatus.FS=Dirty (사용자 FP 명령 허용)
+                "li t0, 0x6000",
+                "csrs mstatus, t0",
+
                 // mepc = 유저 엔트리
                 "csrw mepc, {entry}",
+
+                // trap 진입 시 사용할 현재 커널 스택 저장
+                "csrw mscratch, sp",
 
                 // 스택 설정
                 "mv sp, {sp}",
@@ -157,8 +169,10 @@ pub struct PreparedExecImage {
 struct ExecAuxv {
     entry: usize,
     phdr: usize,
+    phent: usize,
     phnum: usize,
     pagesz: usize,
+    base: usize,
 }
 
 /// 부팅 시 PID 1 이미지를 전달하기 위한 단일 슬롯
@@ -274,7 +288,10 @@ unsafe fn enter_user_image(
             "csrc mstatus, t0",// MPP=U-mode
             "li t0, 0x80",     // mstatus.MPIE
             "csrs mstatus, t0",
+            "li t0, 0x6000",   // mstatus.FS=Dirty (사용자 FP 허용)
+            "csrs mstatus, t0",
             "csrw mepc, {entry}",
+            "csrw mscratch, sp", // trap 진입 시 사용할 현재 커널 스택
             "mv sp, {sp}",
             "mv a0, {argc}",
             "mv a1, {argv}",
@@ -296,43 +313,7 @@ pub fn prepare_exec_image(
     argv: &[String],
     envp: &[String],
 ) -> Result<PreparedExecImage, ExecError> {
-    let elf_data = read_executable(path)?;
-    let elf = crate::module::Elf64::parse(&elf_data).map_err(|_| ExecError::InvalidElf)?;
-
-    // Phase 10-1 1차 범위: ET_EXEC만 허용 (ET_DYN은 추후)
-    if elf.file_type() != ElfType::Exec {
-        return Err(ExecError::UnsupportedExecutableType);
-    }
-
-    // 동적 ELF는 추후 로드맵(PT_INTERP)에서 지원
-    if elf
-        .program_headers()
-        .into_iter()
-        .flatten()
-        .any(|ph| ph.p_type == program_type::PT_INTERP)
-    {
-        return Err(ExecError::DynamicElfNotSupported);
-    }
-
-    if elf.load_segments().next().is_none() {
-        return Err(ExecError::InvalidElf);
-    }
-
-    let mut auxv = build_exec_auxv(&elf);
-    let entry = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
-    auxv.entry = entry;
-
-    let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
-        build_user_stack(path, argv, envp, &auxv)?;
-
-    Ok(PreparedExecImage {
-        entry,
-        user_stack,
-        stack_top,
-        argc,
-        argv: argv_ptr,
-        envp: envp_ptr,
-    })
+    prepare_exec_image_inner(path, argv, envp, 0)
 }
 
 fn map_module_error(err: ModuleError) -> ExecError {
@@ -392,6 +373,176 @@ fn read_executable(path: &str) -> Result<Vec<u8>, ExecError> {
     }
 
     Ok(buf)
+}
+
+fn resolve_exec_path(path: &str, envp: &[String]) -> Result<String, ExecError> {
+    if path.contains('/') {
+        return Ok(String::from(path));
+    }
+
+    let path_env = envp
+        .iter()
+        .find_map(|entry| entry.strip_prefix("PATH="))
+        .unwrap_or(DEFAULT_EXEC_PATH);
+
+    for raw_dir in path_env.split(':') {
+        let dir = if raw_dir.is_empty() { "." } else { raw_dir };
+        let mut candidate = String::from(dir);
+        if !candidate.ends_with('/') {
+            candidate.push('/');
+        }
+        candidate.push_str(path);
+        if fs::lookup_path(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(ExecError::NotFound)
+}
+
+fn parse_shebang(data: &[u8]) -> Result<Option<(String, Option<String>)>, ExecError> {
+    if data.len() < 2 || data[0] != b'#' || data[1] != b'!' {
+        return Ok(None);
+    }
+
+    let line_end = data[2..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|idx| idx + 2)
+        .unwrap_or(data.len());
+    let line = core::str::from_utf8(&data[2..line_end]).map_err(|_| ExecError::InvalidElf)?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(ExecError::InvalidElf);
+    }
+
+    let mut split = line.splitn(2, char::is_whitespace);
+    let interp = split.next().ok_or(ExecError::InvalidElf)?;
+    if interp.is_empty() {
+        return Err(ExecError::InvalidElf);
+    }
+    let arg = split
+        .next()
+        .map(str::trim_start)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    Ok(Some((String::from(interp), arg)))
+}
+
+fn read_interp_path(elf: &crate::module::Elf64<'_>, data: &[u8]) -> Result<Option<String>, ExecError> {
+    let Some(phdrs) = elf.program_headers() else {
+        return Ok(None);
+    };
+    for ph in phdrs.iter() {
+        if ph.p_type != program_type::PT_INTERP {
+            continue;
+        }
+        let off = ph.p_offset as usize;
+        let size = ph.p_filesz as usize;
+        if size == 0 || size > MAX_INTERP_PATH_LEN {
+            return Err(ExecError::InvalidElf);
+        }
+        let end = off.checked_add(size).ok_or(ExecError::InvalidElf)?;
+        if end > data.len() {
+            return Err(ExecError::InvalidElf);
+        }
+        let raw = &data[off..end];
+        let nul = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        if nul == 0 {
+            return Err(ExecError::InvalidElf);
+        }
+        let path = core::str::from_utf8(&raw[..nul]).map_err(|_| ExecError::InvalidElf)?;
+        return Ok(Some(String::from(path)));
+    }
+    Ok(None)
+}
+
+fn prepare_exec_image_inner(
+    path: &str,
+    argv: &[String],
+    envp: &[String],
+    shebang_depth: usize,
+) -> Result<PreparedExecImage, ExecError> {
+    if shebang_depth > MAX_SHEBANG_DEPTH {
+        return Err(ExecError::InvalidArgument);
+    }
+
+    let resolved_path = resolve_exec_path(path, envp)?;
+    let elf_data = read_executable(&resolved_path)?;
+
+    if let Some((interp, interp_arg)) = parse_shebang(&elf_data)? {
+        if shebang_depth == MAX_SHEBANG_DEPTH {
+            return Err(ExecError::InvalidArgument);
+        }
+        let mut next_argv = Vec::new();
+        next_argv.push(interp.clone());
+        if let Some(arg) = interp_arg {
+            next_argv.push(arg);
+        }
+        next_argv.push(resolved_path.clone());
+        if !argv.is_empty() {
+            for arg in argv.iter().skip(1) {
+                next_argv.push(arg.clone());
+            }
+        }
+        return prepare_exec_image_inner(&interp, &next_argv, envp, shebang_depth + 1);
+    }
+
+    let elf = crate::module::Elf64::parse(&elf_data).map_err(|_| ExecError::InvalidElf)?;
+    match elf.file_type() {
+        ElfType::Exec | ElfType::Dyn => {}
+        _ => return Err(ExecError::UnsupportedExecutableType),
+    }
+    if elf.load_segments().next().is_none() {
+        return Err(ExecError::InvalidElf);
+    }
+
+    if let Some(interp_path) = read_interp_path(&elf, &elf_data)? {
+        let main = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
+
+        let interp_resolved = resolve_exec_path(&interp_path, envp)?;
+        let interp_data = read_executable(&interp_resolved)?;
+        let interp_elf =
+            crate::module::Elf64::parse(&interp_data).map_err(|_| ExecError::InvalidElf)?;
+        match interp_elf.file_type() {
+            ElfType::Exec | ElfType::Dyn => {}
+            _ => return Err(ExecError::UnsupportedExecutableType),
+        }
+        if interp_elf.load_segments().next().is_none() {
+            return Err(ExecError::InvalidElf);
+        }
+        if read_interp_path(&interp_elf, &interp_data)?.is_some() {
+            return Err(ExecError::DynamicElfNotSupported);
+        }
+        let interp = ModuleLoader::load_executable(&interp_data).map_err(map_module_error)?;
+
+        let mut auxv = build_exec_auxv(&elf, main.load_bias, interp.load_bias);
+        auxv.entry = main.entry;
+        let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
+            build_user_stack(&resolved_path, argv, envp, &auxv)?;
+        return Ok(PreparedExecImage {
+            entry: interp.entry,
+            user_stack,
+            stack_top,
+            argc,
+            argv: argv_ptr,
+            envp: envp_ptr,
+        });
+    }
+
+    let loaded = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
+    let mut auxv = build_exec_auxv(&elf, loaded.load_bias, 0);
+    auxv.entry = loaded.entry;
+    let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
+        build_user_stack(&resolved_path, argv, envp, &auxv)?;
+    Ok(PreparedExecImage {
+        entry: loaded.entry,
+        user_stack,
+        stack_top,
+        argc,
+        argv: argv_ptr,
+        envp: envp_ptr,
+    })
 }
 
 fn build_user_stack(
@@ -454,10 +605,14 @@ fn build_user_stack(
     words.push(auxv.entry);
     words.push(AUXV_AT_PHDR);
     words.push(auxv.phdr);
+    words.push(AUXV_AT_PHENT);
+    words.push(auxv.phent);
     words.push(AUXV_AT_PHNUM);
     words.push(auxv.phnum);
     words.push(AUXV_AT_PAGESZ);
     words.push(auxv.pagesz);
+    words.push(AUXV_AT_BASE);
+    words.push(auxv.base);
     words.push(AUXV_AT_NULL);
     words.push(0);
 
@@ -508,15 +663,22 @@ fn push_c_string(
     Ok(*sp)
 }
 
-fn build_exec_auxv(elf: &crate::module::Elf64<'_>) -> ExecAuxv {
+fn build_exec_auxv(elf: &crate::module::Elf64<'_>, load_bias: usize, at_base: usize) -> ExecAuxv {
     let phnum = elf.header.e_phnum as usize;
-    let phdr = find_phdr_vaddr(elf).unwrap_or(0);
+    let phdr = find_phdr_vaddr(elf)
+        .and_then(|addr| addr.checked_add(load_bias))
+        .unwrap_or(0);
+    let entry = (elf.entry_point() as usize)
+        .checked_add(load_bias)
+        .unwrap_or(0);
 
     ExecAuxv {
-        entry: elf.entry_point() as usize,
+        entry,
         phdr,
+        phent: core::mem::size_of::<Elf64ProgramHeader>(),
         phnum,
         pagesz: crate::mm::page::PAGE_SIZE,
+        base: at_base,
     }
 }
 

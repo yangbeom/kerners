@@ -17,6 +17,8 @@ BUSYBOX_PATH="${2:-}"
 DEFAULT_DISK_IMG="${KERNERS_DISK_IMG:-$PROJECT_ROOT/disk.img}"
 DISK_IMG="${3:-$DEFAULT_DISK_IMG}"
 DISK_SIZE_MB="${DISK_SIZE_MB:-64}"
+BUSYBOX_COPY_COUNT=7
+DISK_OVERHEAD_MB=32
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -56,6 +58,27 @@ if command -v file >/dev/null 2>&1; then
     fi
 fi
 
+busybox_size_bytes=0
+if command -v stat >/dev/null 2>&1; then
+    if busybox_size_bytes="$(stat -f %z "$BUSYBOX_PATH" 2>/dev/null)"; then
+        :
+    elif busybox_size_bytes="$(stat -c %s "$BUSYBOX_PATH" 2>/dev/null)"; then
+        :
+    else
+        busybox_size_bytes=0
+    fi
+fi
+
+if [[ "$busybox_size_bytes" =~ ^[0-9]+$ ]] && [[ "$busybox_size_bytes" -gt 0 ]]; then
+    required_bytes=$((busybox_size_bytes * BUSYBOX_COPY_COUNT))
+    required_bytes=$((required_bytes + DISK_OVERHEAD_MB * 1024 * 1024))
+    required_mb=$(((required_bytes + 1024 * 1024 - 1) / (1024 * 1024)))
+    if [[ "$required_mb" -gt "$DISK_SIZE_MB" ]]; then
+        print_info "Auto-adjusting disk size: ${DISK_SIZE_MB}MB -> ${required_mb}MB"
+        DISK_SIZE_MB="$required_mb"
+    fi
+fi
+
 print_info "Creating FAT32 user disk image: $DISK_IMG (${DISK_SIZE_MB}MB, arch=$ARCH)"
 dd if=/dev/zero of="$DISK_IMG" bs=1M count="$DISK_SIZE_MB" 2>/dev/null
 
@@ -88,6 +111,9 @@ fi
 mmd -i "$DISK_IMG" ::/bin >/dev/null 2>&1 || true
 mmd -i "$DISK_IMG" ::/sbin >/dev/null 2>&1 || true
 mmd -i "$DISK_IMG" ::/etc >/dev/null 2>&1 || true
+mmd -i "$DISK_IMG" ::/usr >/dev/null 2>&1 || true
+mmd -i "$DISK_IMG" ::/usr/bin >/dev/null 2>&1 || true
+mmd -i "$DISK_IMG" ::/usr/sbin >/dev/null 2>&1 || true
 
 # BusyBox 엔트리 복사 (symlink 미지원 환경을 고려해 복제)
 mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/bin/busybox
@@ -95,6 +121,8 @@ mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/init
 mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/sbin/init
 mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/bin/init
 mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/bin/sh
+mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/usr/bin/busybox
+mcopy -o -i "$DISK_IMG" "$BUSYBOX_PATH" ::/usr/bin/sh
 
 print_info "Installed BusyBox entries:"
 print_info "  /bin/busybox"
@@ -102,6 +130,8 @@ print_info "  /init"
 print_info "  /sbin/init"
 print_info "  /bin/init"
 print_info "  /bin/sh"
+print_info "  /usr/bin/busybox"
+print_info "  /usr/bin/sh"
 
 print_info "Disk image contents (/):"
 mdir -i "$DISK_IMG" :: 2>/dev/null || true
@@ -109,5 +139,7 @@ print_info "Disk image contents (/bin):"
 mdir -i "$DISK_IMG" ::/bin 2>/dev/null || true
 print_info "Disk image contents (/sbin):"
 mdir -i "$DISK_IMG" ::/sbin 2>/dev/null || true
+print_info "Disk image contents (/usr/bin):"
+mdir -i "$DISK_IMG" ::/usr/bin 2>/dev/null || true
 
 print_info "User disk ready: $DISK_IMG"

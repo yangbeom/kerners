@@ -125,8 +125,13 @@ pub fn handle_irq() {
 
     let _ = crate::proc::wake_sleepers_by_timer(crate::time::monotonic_now_ns());
 
-    // 선점 스케줄링: 타이머 틱마다 스케줄러 호출
-    crate::proc::scheduler::schedule();
+    // NOTE:
+    // RISC-V trap 컨텍스트 안에서 직접 context_switch를 수행하면
+    // 스레드의 복귀 주소가 trap 복귀 경로로 오염될 수 있어
+    // 테스트 중 instruction access fault가 발생한다.
+    //
+    // 따라서 타이머 IRQ에서는 wakeup/tick 처리만 수행하고,
+    // 실제 스케줄링 전환은 yield/syscall 경로에서 이뤄지도록 둔다.
 }
 
 /// 현재 틱 수 반환

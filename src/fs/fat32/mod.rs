@@ -21,7 +21,30 @@ fn is_probably_kernel_ptr(addr: usize) -> bool {
     crate::mm::is_kernel_mapped_addr(addr)
 }
 
+#[inline]
+fn is_probably_user_ptr(addr: usize, len: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        addr >= 0x1000 && end <= crate::proc::user::USER_STACK_BASE
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        let _ = end;
+        false
+    }
+}
+
 static FAT32_READ_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FAT32_BUSYBOX_RAW_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FAT32_READ_RAW_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// FAT32 파일시스템
 pub struct Fat32FileSystem {
@@ -886,7 +909,17 @@ impl VNode for Fat32File {
                 buf_ptr
             );
         }
-        if !is_probably_kernel_ptr(buf_ptr) {
+        let raw_idx = FAT32_READ_RAW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if raw_idx < 8 {
+            crate::console::puts("[fat32-raw] read entry\n");
+        }
+        if self.name.as_str() == "BUSYBOX" {
+            let raw_idx = FAT32_BUSYBOX_RAW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if raw_idx < 4 {
+                crate::console::puts("[fat32-raw] BUSYBOX read entered\n");
+            }
+        }
+        if !is_probably_kernel_ptr(buf_ptr) && !is_probably_user_ptr(buf_ptr, buf.len()) {
             crate::kprintln!(
                 "[fat32] invalid read buffer pointer: file='{}' offset={} len={} buf={:#x}",
                 self.name,

@@ -6,6 +6,7 @@
 use crate::kprintln;
 use crate::mm;
 use crate::sync::Mutex;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -684,6 +685,88 @@ pub fn clone_root_table(src_root: usize) -> Result<usize, &'static str> {
         return Err("Invalid source root table");
     }
     clone_page_table_level(src_root, 0)
+}
+
+/// 유저 페이지 매핑 스냅샷
+#[derive(Clone, Copy)]
+pub struct UserPageMapping {
+    pub virt_addr: usize,
+    pub phys_addr: usize,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// root 기준 유저 페이지 매핑 목록 수집
+pub fn collect_user_page_mappings_for_root(
+    root: usize,
+) -> Result<Vec<UserPageMapping>, &'static str> {
+    if root == 0 || root & 0xFFF != 0 {
+        return Err("Invalid root table address");
+    }
+
+    let mut mappings = Vec::new();
+    let l0 = unsafe {
+        // SAFETY: root는 호출자가 전달한 유효한 L0 페이지 테이블 주소여야 한다.
+        &*(root as *const PageTable)
+    };
+
+    for l0_idx in 0..512 {
+        let l0e = l0.entry(l0_idx);
+        if !l0e.is_valid() || (l0e.0 & PageTableEntry::TABLE) == 0 {
+            continue;
+        }
+
+        let l1 = unsafe {
+            // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+            &*(l0e.addr() as *const PageTable)
+        };
+        for l1_idx in 0..512 {
+            let l1e = l1.entry(l1_idx);
+            if !l1e.is_valid() || (l1e.0 & PageTableEntry::TABLE) == 0 {
+                continue;
+            }
+
+            let l2 = unsafe {
+                // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+                &*(l1e.addr() as *const PageTable)
+            };
+            for l2_idx in 0..512 {
+                let l2e = l2.entry(l2_idx);
+                if !l2e.is_valid() || (l2e.0 & PageTableEntry::TABLE) == 0 {
+                    continue;
+                }
+
+                let l3 = unsafe {
+                    // SAFETY: 유효한 table descriptor의 물리 주소를 PageTable로 해석한다.
+                    &*(l2e.addr() as *const PageTable)
+                };
+                for l3_idx in 0..512 {
+                    let l3e = l3.entry(l3_idx);
+                    if !l3e.is_valid() {
+                        continue;
+                    }
+
+                    let user = (l3e.0 & (1 << 6)) != 0;
+                    if !user {
+                        continue;
+                    }
+
+                    let writable = (l3e.0 & (1 << 7)) == 0;
+                    let executable = (l3e.0 & (1 << 53)) == 0;
+                    let virt_addr =
+                        (l0_idx << 39) | (l1_idx << 30) | (l2_idx << 21) | (l3_idx << 12);
+                    mappings.push(UserPageMapping {
+                        virt_addr,
+                        phys_addr: l3e.addr(),
+                        writable,
+                        executable,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(mappings)
 }
 
 /// root 지정 유저 페이지 물리 주소 조회

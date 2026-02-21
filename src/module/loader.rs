@@ -323,6 +323,13 @@ impl LoadedModule {
 
 /// 로드된 모듈 목록
 static LOADED_MODULES: RwLock<Vec<Box<LoadedModule>>> = RwLock::new(Vec::new());
+static NEXT_EXEC_DYN_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// 실행 ELF 로드 결과
+pub struct ExecutableLoadInfo {
+    pub entry: usize,
+    pub load_bias: usize,
+}
 
 /// 모듈 로더
 pub struct ModuleLoader;
@@ -333,10 +340,93 @@ impl ModuleLoader {
     #[cfg(target_arch = "aarch64")]
     const EXEC_VADDR_MAX: usize = 0x0800_0000;
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "riscv64")]
+    const EXEC_VADDR_MIN: usize = 0x0001_0000;
+    #[cfg(target_arch = "riscv64")]
+    const EXEC_VADDR_MAX: usize = 0x2000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const EXEC_VADDR_MIN: usize = 0x4000_0000;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const EXEC_VADDR_MAX: usize = 0x8000_0000;
+
+    #[cfg(target_arch = "aarch64")]
+    const EXEC_DYN_BASE_START: usize = 0x0200_0000;
+    #[cfg(target_arch = "riscv64")]
+    const EXEC_DYN_BASE_START: usize = 0x0800_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    const EXEC_DYN_BASE_START: usize = 0x4800_0000;
+    const EXEC_DYN_GUARD_SIZE: usize = 2 * 1024 * 1024;
+
+    fn align_up(value: usize, align: usize) -> Result<usize, ModuleError> {
+        let plus = value.checked_add(align - 1).ok_or(ModuleError::InvalidFormat)?;
+        Ok(plus & !(align - 1))
+    }
+
+    fn compute_dyn_mapping_window(elf: &Elf64) -> Result<(usize, usize), ModuleError> {
+        let mut min_addr = usize::MAX;
+        let mut max_addr = 0usize;
+        let mut found = false;
+
+        for ph in elf.load_segments() {
+            let seg_start = (ph.p_vaddr as usize) & !(PAGE_SIZE - 1);
+            let raw_end = (ph.p_vaddr as usize)
+                .checked_add(ph.p_memsz as usize)
+                .ok_or(ModuleError::InvalidFormat)?;
+            let seg_end = Self::align_up(raw_end, PAGE_SIZE)?;
+            if seg_end < seg_start {
+                return Err(ModuleError::InvalidFormat);
+            }
+            min_addr = core::cmp::min(min_addr, seg_start);
+            max_addr = core::cmp::max(max_addr, seg_end);
+            found = true;
+        }
+
+        if !found || max_addr <= min_addr {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        Ok((min_addr, max_addr))
+    }
+
+    fn reserve_dyn_base(span: usize) -> Result<usize, ModuleError> {
+        let span = Self::align_up(span, PAGE_SIZE)?;
+        let step = span
+            .checked_add(Self::EXEC_DYN_GUARD_SIZE)
+            .ok_or(ModuleError::InvalidFormat)?;
+
+        loop {
+            let current = NEXT_EXEC_DYN_BASE.load(Ordering::Acquire);
+            let base = if current == 0 {
+                Self::EXEC_DYN_BASE_START
+            } else {
+                current
+            };
+            let next = base.checked_add(step).ok_or(ModuleError::InvalidFormat)?;
+            if next > Self::EXEC_VADDR_MAX {
+                return Err(ModuleError::InvalidFormat);
+            }
+
+            let previous = if current == 0 {
+                NEXT_EXEC_DYN_BASE.compare_exchange(
+                    0,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            } else {
+                NEXT_EXEC_DYN_BASE.compare_exchange(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            };
+
+            if previous.is_ok() {
+                return Ok(base);
+            }
+        }
+    }
 
     fn cleanup_exec_frames(frames: &mut Vec<usize>) {
         for frame in frames.drain(..) {
@@ -513,7 +603,7 @@ impl ModuleLoader {
     }
 
     /// 실행 파일 로드 (ELF executable)
-    pub fn load_executable(data: &[u8]) -> Result<usize, ModuleError> {
+    pub fn load_executable(data: &[u8]) -> Result<ExecutableLoadInfo, ModuleError> {
         kprintln!("[module] Loading executable");
         const PF_X: u32 = 0x1;
         const PF_W: u32 = 0x2;
@@ -522,8 +612,22 @@ impl ModuleLoader {
         let elf = Elf64::parse(data)?;
 
         // EXEC 또는 DYN 타입 확인
+        let mut load_bias = 0usize;
         match elf.file_type() {
-            ElfType::Exec | ElfType::Dyn => {}
+            ElfType::Exec => {}
+            ElfType::Dyn => {
+                let (dyn_min, dyn_max) = Self::compute_dyn_mapping_window(&elf)?;
+                if dyn_min < Self::EXEC_VADDR_MIN || dyn_max > Self::EXEC_VADDR_MAX {
+                    let span = dyn_max
+                        .checked_sub(dyn_min)
+                        .ok_or(ModuleError::InvalidFormat)?;
+                    let dyn_base = Self::reserve_dyn_base(span)?;
+                    load_bias = dyn_base
+                        .checked_sub(dyn_min)
+                        .ok_or(ModuleError::InvalidFormat)?;
+                }
+                kprintln!("[module] ET_DYN load bias: 0x{:x}", load_bias);
+            }
             _ => {
                 kprintln!(
                     "[module] Error: Not an executable (type={:?})",
@@ -541,9 +645,12 @@ impl ModuleLoader {
             let file_size = ph.p_filesz as usize;
             let mem_size = ph.p_memsz as usize;
             let vaddr = ph.p_vaddr as usize;
+            let mapped_vaddr = vaddr
+                .checked_add(load_bias)
+                .ok_or(ModuleError::InvalidFormat)?;
             let writable = (ph.p_flags & PF_W) != 0;
             let executable = (ph.p_flags & PF_X) != 0;
-            let vend = match vaddr.checked_add(mem_size) {
+            let vend = match mapped_vaddr.checked_add(mem_size) {
                 Some(end) => end,
                 None => {
                     Self::cleanup_exec_frames(&mut allocated_frames);
@@ -553,7 +660,7 @@ impl ModuleLoader {
 
             kprintln!(
                 "[module] LOAD segment: vaddr=0x{:x}, filesz={}, memsz={}",
-                vaddr,
+                mapped_vaddr,
                 file_size,
                 mem_size
             );
@@ -576,17 +683,17 @@ impl ModuleLoader {
             }
 
             // 사용자 공간 로드 허용 범위 검사
-            if vaddr < Self::EXEC_VADDR_MIN || vend > Self::EXEC_VADDR_MAX {
+            if mapped_vaddr < Self::EXEC_VADDR_MIN || vend > Self::EXEC_VADDR_MAX {
                 kprintln!(
                     "[module] executable segment vaddr out of supported range: 0x{:x}-0x{:x}",
-                    vaddr,
+                    mapped_vaddr,
                     vend
                 );
                 Self::cleanup_exec_frames(&mut allocated_frames);
                 return Err(ModuleError::InvalidFormat);
             }
 
-            let seg_page_start = vaddr & !(PAGE_SIZE - 1);
+            let seg_page_start = mapped_vaddr & !(PAGE_SIZE - 1);
             let seg_page_end = (vend + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
             for page_addr in (seg_page_start..seg_page_end).step_by(PAGE_SIZE) {
@@ -612,12 +719,12 @@ impl ModuleLoader {
                 }
 
                 // 파일 데이터 복사 (BSS는 0으로 유지)
-                let copy_start = core::cmp::max(page_addr, vaddr);
-                let file_vend = vaddr + file_size;
+                let copy_start = core::cmp::max(page_addr, mapped_vaddr);
+                let file_vend = mapped_vaddr + file_size;
                 let copy_end = core::cmp::min(page_addr + PAGE_SIZE, file_vend);
                 if copy_start < copy_end {
                     let copy_len = copy_end - copy_start;
-                    let src_off = file_offset + (copy_start - vaddr);
+                    let src_off = file_offset + (copy_start - mapped_vaddr);
                     let src_end = src_off + copy_len;
                     if src_end > data.len() {
                         Self::cleanup_exec_frames(&mut allocated_frames);
@@ -641,10 +748,12 @@ impl ModuleLoader {
         crate::arch::mmu::flush_tlb_all();
 
         // 엔트리 포인트 반환
-        let entry = elf.entry_point() as usize;
+        let entry = (elf.entry_point() as usize)
+            .checked_add(load_bias)
+            .ok_or(ModuleError::InvalidFormat)?;
         kprintln!("[module] Entry point: 0x{:x}", entry);
 
-        Ok(entry)
+        Ok(ExecutableLoadInfo { entry, load_bias })
     }
 
     /// 섹션들을 메모리에 로드

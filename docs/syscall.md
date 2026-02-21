@@ -59,7 +59,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_sendto` | 206 | `sendto(fd, buf, len, ...)` | baseline: `EBADF`/`EAFNOSUPPORT` |
 | `sys_brk` | 214 | `brk(addr) -> new_brk` | vm_group별 16MB 힙 윈도우 + 페이지 단위 확장/축소 및 매핑/해제 |
 | `sys_clone` | 220 | `clone(flags, ...)` | aarch64/riscv64 user-context fork/clone + vm_group/CLONE_* 리소스 그룹 + non-`CLONE_VM` COW 설정 |
-| `sys_execve` | 221 | `execve(path, argv, envp)` | static ELF 실행 준비 + 인자/환경 경계 검증 |
+| `sys_execve` | 221 | `execve(path, argv, envp)` | `ET_EXEC/ET_DYN` 실행 준비 + shebang/`PT_INTERP` 경로 + 인자/환경 경계 검증 |
 | `sys_mmap` | 222 | `mmap(addr, len, prot, flags, fd, off) -> addr` | anonymous + file-backed 지원(aarch64/riscv64), `MAP_FIXED`, `MAP_SHARED`, `MAP_PRIVATE`(fault COW), `PROT_{R,W,X}` |
 | `sys_munmap` | 215 | `munmap(addr, len)` | 부분/전체 unmap + 페이지 테이블 엔트리 해제 + 물리 프레임 반환 |
 | `sys_mprotect` | 226 | `mprotect(addr, len, prot)` | 매핑된 페이지 권한(R/W/X) 변경 + TLB flush |
@@ -158,19 +158,20 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
 
 ## `execve` 동작과 제약
 
-- 대상 실행 파일: static ELF 중심 (`ET_EXEC`)
-- 동적 로더 체인: `PT_INTERP`가 있으면 `ENOEXEC` 반환
+- 대상 실행 파일: `ET_EXEC`/`ET_DYN`
+- 동적 로더 체인: `PT_INTERP`가 있으면 인터프리터 ELF를 함께 로드하고 인터프리터 엔트리로 진입
 - 동작 순서:
   1. `path/argv/envp`를 유저 포인터에서 읽기
-  2. ELF 검증 및 `PT_LOAD` 세그먼트를 유저 가상주소(`p_vaddr`)로 매핑
-  3. 유저 스택(`argc/argv/envp/auxv`) 구성
-  4. trap 복귀 시점에 `PC/SP`를 새 이미지로 전환
+  2. 실행 경로 해석(PATH fallback) + shebang(`#!`)인 경우 인터프리터/argv 재구성
+  3. ELF 검증 및 `PT_LOAD` 세그먼트를 유저 가상주소로 매핑 (`ET_DYN`은 load bias 적용)
+  4. 유저 스택(`argc/argv/envp/auxv`) 구성
+  5. trap 복귀 시점에 `PC/SP`를 새 이미지로 전환
 - 현재 제약:
   - `argv/envp`는 개수/길이 + 총량(현재 32KiB) 상한을 검사하며, 초과 시 `E2BIG`
   - aarch64/riscv64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)
   - 유저 포인터 fault 복구는 제한적이며, 현재는 COW write fault 경로 중심으로만 복구
-  - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHNUM/AT_PAGESZ`)를 스택에 제공
-  - 동적 ELF(`PT_INTERP`, `ET_DYN`)는 아직 미지원
+  - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE`)를 스택에 제공
+  - TLS(`PT_TLS`, TLS relocation, thread pointer)는 별도 phase에서 지원 예정
 
 ## `mmap`/`fork` COW 동작 (aarch64/riscv64)
 

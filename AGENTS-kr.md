@@ -186,6 +186,7 @@ mount                # 마운트 목록
 - 하드웨어 접근은 volatile 읽기/쓰기 필수
 - plan.md 파일에 계획을 우선적으로 세운 후 개발진행
 - **Rust nightly 사용 금지**: nightly 툴체인을 사용하지 마세요. 이 프로젝트는 stable Rust로 빌드되도록 설계되었습니다. **`cargo +nightly` 명령어를 사용하지 마세요.**
+- **최소 수정 지양, 근본 원인 우선**: 테스트 실패/회귀 시 임시 우회보다 실패 경로를 확인해 구조적 원인을 먼저 수정하세요. 임시 핫픽스는 사용자가 명시적으로 요청한 경우에만 허용합니다.
 
 ## Testing
 
@@ -211,11 +212,12 @@ cargo build --release --target aarch64-unknown-none-softfloat --features embed_t
 
 1. **plan.md 확인** - 개발 계획 및 로드맵 확인
 2. **관련 docs 읽기** - `docs/` 하위 문서 참조
-3. **아키텍처 추상화 유지** - 공통 코드와 아키텍처별 코드 분리
-4. **QEMU 테스트** - `./run.sh`로 변경사항 검증
-5. **unsafe 코드 문서화** - 모든 unsafe 블록에 safety 설명
-6. **문서 업데이트** - 모듈 추가/수정 시 `docs/` 하위 문서 업데이트
-7. **프로젝트 구조 반영** - 새 파일/디렉토리 추가 시 AGENTS.md 및 AGENTS-kr.md 업데이트
+3. **근본 원인 분석 우선** - 실패 증상만 맞추지 말고 실제 실패 경로와 원인을 확인한 뒤 수정
+4. **아키텍처 추상화 유지** - 공통 코드와 아키텍처별 코드 분리
+5. **QEMU 테스트** - `./run.sh`로 변경사항 검증
+6. **unsafe 코드 문서화** - 모든 unsafe 블록에 safety 설명
+7. **문서 업데이트** - 모듈 추가/수정 시 `docs/` 하위 문서 업데이트
+8. **프로젝트 구조 반영** - 새 파일/디렉토리 추가 시 AGENTS.md 및 AGENTS-kr.md 업데이트
 
 ## Documentation Guidelines
 

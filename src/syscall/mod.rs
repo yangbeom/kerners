@@ -68,6 +68,9 @@ pub const SYS_READ: usize = 63;
 /// write(fd, buf, count) -> ssize_t
 pub const SYS_WRITE: usize = 64;
 
+/// sendfile(out_fd, in_fd, offset, count) -> ssize_t
+pub const SYS_SENDFILE: usize = 71;
+
 /// fstat(fd, statbuf) -> int
 pub const SYS_FSTAT: usize = 80;
 
@@ -254,6 +257,12 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         SYS_LSEEK => fs::sys_lseek(args[0] as i32, args[1] as i64, args[2] as i32),
         SYS_READ => fs::sys_read(args[0], args[1] as *mut u8, args[2]),
         SYS_WRITE => fs::sys_write(args[0], args[1] as *const u8, args[2]),
+        SYS_SENDFILE => fs::sys_sendfile(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as *mut i64,
+            args[3],
+        ),
         SYS_FSTAT => fs::sys_fstat(args[0] as i32, args[1] as *mut u8),
         SYS_NEWFSTATAT => fs::sys_newfstatat(
             args[0] as i32,

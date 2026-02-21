@@ -197,9 +197,11 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 - syscall trap 복귀 경로에서 현재 컨텍스트의 `PC/SP`를 새 ELF 이미지의 엔트리/스택으로 교체합니다.
 - 유저 스택 메모리는 현재 스레드(`Thread.user_stack`)에 바인딩해 수명을 보장합니다.
 - 유저 초기 스택의 auxv에는 최소 호환 키를 포함합니다:
-  - `AT_ENTRY`, `AT_PHDR`, `AT_PHNUM`, `AT_PAGESZ`
+  - `AT_ENTRY`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`
 - aarch64/riscv64 경로에서는 `path/argv/envp` 유저 포인터 범위를 선검증합니다.
-- 실행 파일은 static ELF(`ET_EXEC`) 기준이며, `PT_INTERP`를 포함한 동적 ELF는 지원하지 않습니다.
+- 실행 파일은 `ET_EXEC`/`ET_DYN`를 지원하며, `PT_INTERP`가 있으면 인터프리터를 함께 로드해
+  인터프리터 엔트리로 진입합니다.
+- shebang(`#!`) 스크립트 실행 시 인터프리터 + 스크립트 경로로 argv를 재구성합니다.
 - ELF `PT_LOAD` 세그먼트의 가상주소가 현재 identity-mapped RAM 범위를 벗어나면 exec 준비가 실패합니다.
 
 ### fork/vfork/wait 최소 동작

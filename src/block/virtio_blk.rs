@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::block::{BlockDevice, BlockError, BlockResult};
 use crate::sync::Mutex;
 use crate::virtio::mmio::{self, VirtIOMMIO};
@@ -127,6 +127,8 @@ pub struct VirtIOBlock {
 // Safety: VirtIOBlock은 Mutex로 보호됨
 unsafe impl Send for VirtIOBlock {}
 unsafe impl Sync for VirtIOBlock {}
+
+static VIRTIO_WAIT_SLOW_RAW_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl VirtIOBlock {
     #[inline]
@@ -558,6 +560,10 @@ impl VirtIOBlock {
 
             spins = spins.wrapping_add(1);
             if spins == 100_000 {
+                let raw_idx = VIRTIO_WAIT_SLOW_RAW_COUNT.fetch_add(1, Ordering::Relaxed);
+                if raw_idx < 16 {
+                    crate::console::puts("[virtio-blk-raw] wait_for_completion slow path\n");
+                }
                 let queue = self.queue.lock();
                 crate::kprintln!("[VirtIO-blk] slow completion, still waiting...");
                 let avail_idx = queue.avail_idx();

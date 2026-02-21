@@ -8,6 +8,18 @@
 
 use crate::kprintln;
 
+#[repr(align(16))]
+struct TrapStack([u8; 4096]);
+
+static mut TRAP_STACK: TrapStack = TrapStack([0; 4096]);
+
+const MSTATUS_MPP_MASK: u64 = 0x1800;
+const MSTATUS_MPP_S: u64 = 0x0800;
+const MSTATUS_FS_MASK: u64 = 0x6000;
+const MSTATUS_FS_DIRTY: u64 = 0x6000;
+const MSTATUS_MPRV: u64 = 1 << 17;
+const MSTATUS_SUM: u64 = 1 << 18;
+
 /// Trap 발생 시 저장되는 CPU 컨텍스트 (M-mode)
 #[repr(C)]
 pub struct TrapContext {
@@ -21,6 +33,34 @@ pub struct TrapContext {
     pub mcause: u64,
     /// Machine Trap Value (추가 정보, 예: fault 주소)
     pub mtval: u64,
+}
+
+#[inline]
+fn enter_riscv_syscall_data_access_mode() -> u64 {
+    let mut current: u64 = 0;
+    unsafe {
+        // SAFETY: trap 핸들러(M-mode)에서만 호출하며 mstatus를 임시 조정해
+        // 데이터 접근을 S-privilege 기반 주소 변환(MPRV) + SUM 허용으로 수행한다.
+        core::arch::asm!("csrr {0}, mstatus", out(reg) current, options(nomem, nostack));
+    }
+    let updated = (current & !MSTATUS_MPP_MASK) | MSTATUS_MPP_S | MSTATUS_MPRV | MSTATUS_SUM;
+    unsafe {
+        // SAFETY: 위에서 계산한 유효 mstatus 값으로 현재 trap 처리 구간의 데이터 접근 모드만 바꾼다.
+        core::arch::asm!("csrw mstatus, {0}", in(reg) updated, options(nomem, nostack));
+    }
+    current
+}
+
+#[inline]
+fn restore_riscv_syscall_data_access_mode(saved_mstatus: u64) {
+    unsafe {
+        // SAFETY: enter_riscv_syscall_data_access_mode에서 저장한 원래 mstatus를 즉시 복원한다.
+        core::arch::asm!(
+            "csrw mstatus, {0}",
+            in(reg) saved_mstatus,
+            options(nomem, nostack)
+        );
+    }
 }
 
 /// scause 레지스터의 예외 코드 해석 (인터럽트가 아닌 경우)
@@ -95,10 +135,13 @@ pub extern "C" fn trap_handler(ctx: &mut TrapContext) {
         // 이전 privilege가 U-mode면 복귀 직전에 pending signal 전달
         let from_user = ((ctx.mstatus >> 11) & 0x3) == 0;
         if from_user {
+            let saved_mstatus = enter_riscv_syscall_data_access_mode();
             if crate::syscall::apply_pending_sigreturn_riscv64(ctx) {
+                restore_riscv_syscall_data_access_mode(saved_mstatus);
                 return;
             }
             let _ = crate::syscall::deliver_pending_signal_riscv64(ctx);
+            restore_riscv_syscall_data_access_mode(saved_mstatus);
         }
     } else {
         handle_exception(ctx, cause_code);
@@ -198,6 +241,12 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
                 ctx.gpr[15] as usize,  // a5 = x15
             ];
             
+            let saved_mstatus = if cause == 8 {
+                Some(enter_riscv_syscall_data_access_mode())
+            } else {
+                None
+            };
+
             let ret = if cause == 8 {
                 crate::syscall::syscall_handler_riscv64_with_user_context(
                     syscall_num,
@@ -234,6 +283,15 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
             }
 
             let _ = crate::syscall::deliver_pending_signal_riscv64(ctx);
+
+            if cause == 8 {
+                // 사용자 코드가 부동소수점 명령을 사용할 수 있도록 FS 상태를 활성화한다.
+                ctx.mstatus = (ctx.mstatus & !MSTATUS_FS_MASK) | MSTATUS_FS_DIRTY;
+            }
+
+            if let Some(saved) = saved_mstatus {
+                restore_riscv_syscall_data_access_mode(saved);
+            }
         }
         12 => {
             // Instruction page fault
@@ -277,16 +335,32 @@ core::arch::global_asm!(
 .balign 4
 .global trap_vector
 trap_vector:
+    // trap 전용 스택으로 전환
+    // - 평상시 mscratch: trap stack top
+    // - trap 진입 직후 mscratch: 기존 sp(유저/커널)
+    csrrw sp, mscratch, sp
+
     // 컨텍스트 저장을 위한 스택 공간 확보
     // 32 GPRs + mstatus + mepc + mcause + mtval = 36 * 8 = 288 bytes
     addi sp, sp, -288
 
     // x1-x31 저장 (x0은 항상 0)
+    // 주의: x2(sp)는 트랩 진입 시점의 원래 사용자 SP를 저장해야 한다.
     sd x1, 8(sp)
-    sd x2, 16(sp)
     sd x3, 24(sp)
     sd x4, 32(sp)
     sd x5, 40(sp)
+    csrr t0, mscratch
+    sd t0, 16(sp)
+    // 중첩 trap 대비: 다음 trap 진입 시 사용할 안전한 trap stack top 갱신
+    addi t0, sp, 288
+    csrw mscratch, t0
+    // 커널 Rust 코드 진입 전 gp(x3)를 커널 global pointer로 맞춘다.
+    // 사용자 모드 trap에서는 x3에 사용자 gp가 들어올 수 있어 전역 접근이 깨질 수 있다.
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
     sd x6, 48(sp)
     sd x7, 56(sp)
     sd x8, 64(sp)
@@ -336,7 +410,6 @@ trap_vector:
 
     // x1-x31 복원
     ld x1, 8(sp)
-    ld x2, 16(sp)
     ld x3, 24(sp)
     ld x4, 32(sp)
     ld x5, 40(sp)
@@ -367,8 +440,10 @@ trap_vector:
     ld x30, 240(sp)
     ld x31, 248(sp)
 
-    // 스택 복원
-    addi sp, sp, 288
+    // 중첩 trap 대비 mscratch를 현재 frame top으로 되돌린 뒤, 원래 sp(유저/커널) 복원
+    addi x2, sp, 288        // x2 = frame top
+    csrw mscratch, x2
+    ld x2, -272(x2)         // x2 = saved original sp (frame+16)
 
     // trap에서 복귀 (M-mode)
     mret
@@ -384,6 +459,11 @@ pub fn init() {
 
     unsafe {
         let vector = trap_vector as usize;
+        let trap_stack_top = {
+            // SAFETY: 단일 CPU 부트 단계에서 정적 trap 스택 버퍼 끝 주소를 계산한다.
+            let base = core::ptr::addr_of_mut!(TRAP_STACK) as *mut u8;
+            unsafe { base.add(core::mem::size_of::<TrapStack>()) as usize }
+        };
         // mtvec의 MODE 비트: 0 = Direct, 1 = Vectored
         // Direct 모드 사용 (모든 trap이 같은 주소로)
         core::arch::asm!(
@@ -391,8 +471,17 @@ pub fn init() {
             in(reg) vector,
             options(nomem, nostack)
         );
+        core::arch::asm!(
+            "csrw mscratch, {0}",
+            in(reg) trap_stack_top,
+            options(nomem, nostack)
+        );
 
-        crate::kprintln!("[riscv64] Trap vector initialized at {:#x} (M-mode)", vector);
+        crate::kprintln!(
+            "[riscv64] Trap vector initialized at {:#x} (M-mode, trap_stack={:#x})",
+            vector,
+            trap_stack_top
+        );
     }
 }
 

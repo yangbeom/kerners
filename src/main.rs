@@ -76,6 +76,10 @@ core::arch::global_asm!(
     .type _start, @function
 _start:
     // a0 = hartid, a1 = DTB 주소 (OpenSBI/QEMU가 전달)
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
     
     // Hart 0만 부팅 진행, 나머지는 대기
     csrr t0, mhartid

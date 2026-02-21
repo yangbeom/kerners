@@ -55,9 +55,11 @@ pub extern "C" fn module_version() -> *const u8 {
 
 현재 제약:
 
-- 유저 가상주소 매핑(`p_vaddr -> page table mapping`)은 아직 미구현
-- 따라서 `PT_LOAD`의 `p_vaddr` 범위가 현재 identity-mapped RAM 범위를 벗어나면 로드 실패
-  - 현재 가드 범위: `0x4000_0000..0x8000_0000`
+- `PT_LOAD`의 `p_vaddr`를 유저 페이지 테이블로 매핑한다.
+- `ET_DYN`은 실행 시 load bias를 적용해 유효 사용자 주소 범위로 이동 매핑한다.
+- 가드 범위를 벗어난 세그먼트는 로드 실패한다.
+  - aarch64: `0x0010_0000..0x0800_0000`
+  - riscv64: `0x4000_0000..0x8000_0000`
 
 ## 로딩/언로딩 흐름
 

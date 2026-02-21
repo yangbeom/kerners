@@ -74,8 +74,12 @@ pub fn init() {
 }
 
 pub fn append(level: LogLevel, seconds: u64, micros: u64, cpu_id: u32, msg: &str) {
-    let mut buf = RING_BUFFER.lock();
-    buf.append(level, seconds, micros, cpu_id, msg);
+    // 로깅 경로에서 영구 스핀으로 시스템 전체가 멈추는 것을 방지하기 위해
+    // 링버퍼 잠금은 비차단으로 시도한다. 실패 시 UART 출력은 이미 끝났으므로
+    // dmesg 저장만 생략하고 즉시 복귀한다.
+    if let Some(mut buf) = RING_BUFFER.try_lock() {
+        buf.append(level, seconds, micros, cpu_id, msg);
+    }
 }
 
 pub fn dump_logs() {

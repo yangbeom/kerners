@@ -5,6 +5,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use crate::console;
 use crate::fs::{self, VfsError, VNodeType, FileMode};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
@@ -47,6 +48,7 @@ const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
 const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
 const PPOLL_MAX_FDS: usize = 1024;
+const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
 
 const POLLIN: i16 = 0x0001;
 const POLLPRI: i16 = 0x0002;
@@ -364,6 +366,119 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> isize {
         }
         _ => errno::ENOENT,
     }
+}
+
+/// sys_sendfile - 파일 디스크립터 간 데이터 전송
+///
+/// baseline:
+/// - in_fd에서 읽어 out_fd로 순차 기록한다.
+/// - `offset`이 non-null이면 입력 FD의 현재 오프셋은 보존하고, 해당 위치를 갱신한다.
+/// - 부분 전송 후 오류가 발생하면 이미 전송된 바이트 수를 우선 반환한다.
+pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize {
+    if count == 0 {
+        return 0;
+    }
+
+    let table = match fd::kernel_fd_table() {
+        Ok(t) => t,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let out_file = match table.get(out_fd) {
+        Ok(f) => f,
+        Err(_) => return errno::EBADF,
+    };
+    let in_file = match table.get(in_fd) {
+        Ok(f) => f,
+        Err(_) => return errno::EBADF,
+    };
+
+    if !out_file.flags.is_writable() || !in_file.flags.is_readable() {
+        return errno::EBADF;
+    }
+
+    let use_explicit_offset = !offset.is_null();
+    let mut explicit_in_pos = if use_explicit_offset {
+        let initial = unsafe {
+            // SAFETY: 사용자 포인터 non-null 여부를 확인했고 i64 하나를 읽는다.
+            core::ptr::read_unaligned(offset)
+        };
+        if initial < 0 {
+            return errno::EINVAL;
+        }
+        initial as usize
+    } else {
+        0
+    };
+
+    let mut remaining = count;
+    let mut moved = 0usize;
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(SENDFILE_CHUNK_SIZE).is_err() {
+        return errno::ENOMEM;
+    }
+    buf.resize(SENDFILE_CHUNK_SIZE, 0);
+
+    while remaining > 0 {
+        let to_read = core::cmp::min(remaining, buf.len());
+        let read_res = if use_explicit_offset {
+            in_file.vnode.read(explicit_in_pos, &mut buf[..to_read])
+        } else {
+            in_file.read(&mut buf[..to_read])
+        };
+
+        let nread = match read_res {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) => {
+                if moved > 0 {
+                    break;
+                }
+                return vfs_error_to_errno(e);
+            }
+        };
+
+        if use_explicit_offset {
+            explicit_in_pos = explicit_in_pos.saturating_add(nread);
+        }
+
+        let mut written_from_chunk = 0usize;
+        while written_from_chunk < nread {
+            let write_res = out_file.write(&buf[written_from_chunk..nread]);
+            let nwritten = match write_res {
+                Ok(0) => {
+                    if moved > 0 {
+                        break;
+                    }
+                    return errno::EIO;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    if moved > 0 {
+                        break;
+                    }
+                    return vfs_error_to_errno(e);
+                }
+            };
+
+            written_from_chunk += nwritten;
+            moved += nwritten;
+            remaining = remaining.saturating_sub(nwritten);
+        }
+
+        if written_from_chunk < nread {
+            break;
+        }
+    }
+
+    if use_explicit_offset {
+        unsafe {
+            // SAFETY: 사용자 포인터 non-null 여부를 확인했고 i64 하나를 기록한다.
+            core::ptr::write_unaligned(offset, explicit_in_pos as i64);
+        }
+    }
+
+    moved as isize
 }
 
 /// sys_open - 파일 열기

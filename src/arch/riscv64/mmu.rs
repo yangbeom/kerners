@@ -16,6 +16,7 @@
 use crate::kprintln;
 use crate::mm::page::alloc_frame;
 use crate::sync::Mutex;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr::write_bytes;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -616,6 +617,72 @@ pub fn clone_root_table(src_root: usize) -> Result<usize, &'static str> {
         return Err("Invalid source root table");
     }
     clone_page_table_level(src_root, 2)
+}
+
+/// 유저 페이지 매핑 스냅샷
+#[derive(Clone, Copy)]
+pub struct UserPageMapping {
+    pub virt_addr: usize,
+    pub phys_addr: usize,
+    pub writable: bool,
+    pub executable: bool,
+}
+
+/// root 기준 유저 페이지 매핑 목록 수집
+pub fn collect_user_page_mappings_for_root(
+    root: usize,
+) -> Result<Vec<UserPageMapping>, &'static str> {
+    if root == 0 || root & 0xFFF != 0 {
+        return Err("Invalid root table address");
+    }
+
+    let mut mappings = Vec::new();
+    let l2 = unsafe {
+        // SAFETY: root는 호출자가 전달한 유효한 L2(루트) 페이지 테이블 주소여야 한다.
+        &*(root as *const PageTable)
+    };
+
+    for vpn2 in 0..512 {
+        let l2e = l2.entry(vpn2);
+        if !l2e.is_valid() || l2e.is_leaf() {
+            continue;
+        }
+
+        let l1 = unsafe {
+            // SAFETY: 유효한 non-leaf L2 엔트리는 L1 테이블 주소를 가진다.
+            &*(l2e.addr() as *const PageTable)
+        };
+        for vpn1 in 0..512 {
+            let l1e = l1.entry(vpn1);
+            if !l1e.is_valid() || l1e.is_leaf() {
+                continue;
+            }
+
+            let l0 = unsafe {
+                // SAFETY: 유효한 non-leaf L1 엔트리는 L0 테이블 주소를 가진다.
+                &*(l1e.addr() as *const PageTable)
+            };
+            for vpn0 in 0..512 {
+                let l0e = l0.entry(vpn0);
+                if !l0e.is_valid() || !l0e.is_leaf() {
+                    continue;
+                }
+                if (l0e.0 & PageTableEntry::U) == 0 {
+                    continue;
+                }
+
+                let virt_addr = (vpn2 << 30) | (vpn1 << 21) | (vpn0 << 12);
+                mappings.push(UserPageMapping {
+                    virt_addr,
+                    phys_addr: l0e.addr(),
+                    writable: (l0e.0 & PageTableEntry::W) != 0,
+                    executable: (l0e.0 & PageTableEntry::X) != 0,
+                });
+            }
+        }
+    }
+
+    Ok(mappings)
 }
 
 /// root 지정 유저 페이지 물리 주소 조회
