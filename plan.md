@@ -502,29 +502,68 @@
 - [x] 회귀 검증: `make test`, `make test-riscv64` 모두 `RESULT: 14 passed, 0 failed`
 
 ### Phase 15: 유저스페이스 분리 (중기)
+- [x] 2026-02-19 회귀: `make test-all` (`aarch64`/`riscv64`) PASS 유지
+- [x] 기반 구현 완료: `ET_DYN` load bias, `PT_INTERP` 체인, `PATH` 탐색, shebang, auxv(`AT_PHENT`/`AT_BASE`)
+- [x] 15-1 외부 Linux static ELF end-to-end 수용 테스트 완료 (2026-02-21, `aarch64`/`riscv64`)
+- [ ] 잔여 검증: 15-2 static ELF 기반 유저 공간 시나리오 + 15-3 동적 ELF 런타임 링크
 
-#### 15-1. 유저 바이너리 기반 셸
-- [ ] (선택) 유저 ELF 빌드 환경 구축 (Rust no_std + 커스텀 syscall wrapper)
-- [ ] 외부 Linux 크로스 툴체인 산출물과 실행 호환성 검증
-- [ ] 최소 libc 구현 또는 thin syscall wrapper 라이브러리
-- [ ] `/bin/sh` — 기본 셸 (파이프, 리다이렉션)
-- [ ] `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm`
-- [ ] `/bin/ps` — 프로세스 목록 (procfs 읽기)
+#### 15-1. 외부 Linux static ELF bring-up (필수 1단계)
+- [x] 상태 메모: 외부 static ELF 실물 검증 완료. 검증 로그: `logs/phase15-1-aarch64-20260221-101515.log`, `logs/phase15-1-riscv64-20260221-101556.log`
+- [x] 목표 바이너리 고정: 외부 툴체인 산출물(`aarch64`/`riscv64`) static ELF 2종 이상(`hello`, `busybox`)
+- [x] `sys_execve` 경로로 `/bin/*` static ELF 직접 실행 검증
+- [x] 실행 실패 경계조건 회귀 점검: `ENOENT`, `ENOEXEC`, `E2BIG`, `EFAULT`
+- [x] user disk 배치 규칙 정리 (`scripts/prepare_user_disk.sh` 기준 `/bin`, `/sbin`, `/usr/bin`)
+- [x] 수용 기준: 양 아키텍처에서 외부 static ELF 실행 + 정상 종료코드/출력 확인, 커널 panic 없음
 
-#### 15-2. 프로그램 로더
-- [ ] `sys_execve`로 `/bin/` 바이너리 실행
-- [ ] PATH 환경변수 탐색
-- [ ] Shebang (`#!`) 지원
+#### 15-2. static ELF 기반 유저 공간 최소 운영 (필수 2단계)
+- [ ] 상태 메모: PATH/shebang은 완료, 실제 `/bin/sh` 기반 사용자 명령 시나리오 검증이 남아 있음
+- [x] PATH 탐색 최소 구현 (`/bin:/sbin:/usr/bin:/usr/sbin`)
+- [x] Shebang (`#!`) 1차 지원 (인터프리터 경로 + 인자 전달, 최대 depth 제한 포함)
+- [ ] `/bin/sh` baseline 동작 (파이프/리다이렉션은 현재 syscall 범위 내 최소 동작)
+- [ ] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm`
+- [ ] `/bin/ps` — procfs 기반 프로세스 목록 조회
+- [ ] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 
-#### 15-3. 동적 ELF 로더 (추후)
-- [ ] (from Phase 10-1D) BusyBox static init 안정화 이후 착수
-- [ ] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 체인 로딩)
-- [ ] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함)
+#### 15-3. 동적 ELF 로더 (필수 3단계, 추후)
+- [ ] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
+- [ ] 상태 메모: 엔트리 체인(`PT_INTERP`)과 `ET_DYN` 매핑은 완료, 동적 심볼/재배치/so 의존성 해석이 남아 있음
+- [x] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 로더 체인, 인터프리터 엔트리 전이)
+- [x] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함, load bias 기반 매핑)
 - [ ] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석
 - [ ] 런타임 재배치 (`REL`/`RELA`, `JUMP_SLOT`, `GLOB_DAT`)
 - [ ] 공유 라이브러리 의존성 로딩 (`/lib`, `/usr/lib`)
-- [ ] 최소 런타임 ABI 정비 (TLS 등 핵심 항목)
-- [ ] 테스트: 동적 링크된 hello/glibc 또는 musl dyn 바이너리 실행
+- [x] 최소 런타임 ABI 정비 (TLS 제외: `AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer/TLS reloc는 Phase 15.5에서 구현)
+- [ ] 수용 기준: 동적 링크 hello 1종 이상 + busybox dyn 경로 부팅/명령 실행
+
+#### 15-4. (선택) 유저 ELF 빌드 환경 구축 (보조 트랙)
+- [ ] Rust `no_std` + thin syscall wrapper 기반 로컬 유저 ELF 빌드 템플릿 제공
+- [ ] 최소 libc 대체 또는 wrapper 라이브러리 정리 (테스트/디버그 목적)
+- [ ] 샘플 유저 프로그램(`hello`, `syscall smoke`)과 빌드 스크립트 제공
+- [ ] CI 회귀용으로만 사용하고, 외부 Linux ELF 호환의 선행조건으로 강제하지 않음
+
+### Phase 15.5: TLS (Thread Local Storage) 지원 (중기, 별도 phase)
+
+#### 15.5-1. TLS 로더/메모리 모델
+- [ ] 착수 조건: Phase 15-3 완료 (동적 ELF 기본 경로 안정화)
+- [ ] ELF `PT_TLS` 파싱 및 TLS 초기 이미지(`.tdata`) + zero-fill(`.tbss`) 모델 도입
+- [ ] 프로세스/스레드별 TLS 블록 레이아웃 정의 (정렬/크기/모듈 오프셋 포함)
+- [ ] 스레드 생성/복제(`spawn`/`clone`) 시 TLS 블록 할당/초기화 경로 추가
+
+#### 15.5-2. 아키텍처별 thread pointer 활성화
+- [ ] aarch64: `TPIDR_EL0` 설정/복원 경로 추가
+- [ ] riscv64: `tp` 레지스터 설정/복원 경로 추가
+- [ ] 컨텍스트 스위치 시 thread pointer 일관성 보장
+
+#### 15.5-3. TLS 재배치 및 동적 로더 연동
+- [ ] 최소 TLS 재배치 타입 지원(local-exec/initial-exec 우선)
+- [ ] 미지원 TLS 재배치 타입은 명시적 실패(`ENOEXEC` 또는 `ENOTSUP`) 처리
+- [ ] 동적 로딩된 `.so`의 TLS metadata 등록/해제 라이프사이클 연동
+
+#### 15.5-4. 검증/수용 기준
+- [ ] `__thread`/`thread_local` 변수 읽기/쓰기 smoke (단일 스레드)
+- [ ] 멀티 스레드에서 TLS 독립성 검증 (스레드별 값 분리)
+- [ ] 양 아키텍처(`aarch64`, `riscv64`) 동적 ELF + TLS 샘플 실행
+- [ ] 기존 `make test`, `make test-riscv64` 회귀 PASS 유지
 
 ### Phase 16: I/O 멀티플렉싱 및 IPC 확장 (중기)
 
