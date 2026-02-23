@@ -2,7 +2,7 @@
 //!
 //! exit, yield, getpid, execve 등
 
-use super::errno;
+use super::{errno, uaccess};
 use crate::fs;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::fs::fd;
@@ -279,6 +279,7 @@ const MAX_SIGNAL_COUNT: usize = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 const SA_SIGINFO: u64 = 0x0000_0004;
+const SA_RESTORER: u64 = 0x0400_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESTART: u64 = 0x1000_0000;
 const SS_ONSTACK: i32 = 0x1;
@@ -1758,9 +1759,12 @@ pub fn deliver_pending_signal_aarch64(ctx: &mut crate::arch::exception::Exceptio
         spsr: ctx.spsr,
         sp_el0: sp_el0 as u64,
     };
+    if uaccess::write_unaligned(frame_sp as *mut KernelSigFrameAarch64, frame).is_err() {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
+    }
     unsafe {
-        // SAFETY: 사용자 스택 영역 유효성을 검증한 뒤 sigframe을 기록한다.
-        core::ptr::write_unaligned(frame_sp as *mut KernelSigFrameAarch64, frame);
+        // SAFETY: 저장한 사용자 sigframe 기준으로 EL0 스택 포인터를 갱신한다.
         core::arch::asm!(
             "msr sp_el0, {sp}",
             sp = in(reg) frame_sp,
@@ -1783,7 +1787,15 @@ pub fn deliver_pending_signal_riscv64(ctx: &mut crate::arch::trap::TrapContext) 
         return false;
     };
 
-    if action.sa_restorer == 0 {
+    if action.sa_restorer == 0 || !user_pointer_in_range(action.sa_restorer as usize, 1) {
+        if signum == SIGNAL_SIGCHLD {
+            // riscv64 사용자 공간은 SA_RESTORER 없이 핸들러를 등록할 수 있다.
+            // 현재 커널은 사용자 restorer trampoline을 제공하지 않으므로
+            // 유효하지 않은 restorer로 점프해 추가 SIGSEGV를 유발하지 않도록
+            // SIGCHLD 사용자 핸들러 전달을 건너뛴다.
+            set_signal_mask_for_tid(tid, old_mask);
+            return false;
+        }
         finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
         proc::exit();
     }
@@ -1805,9 +1817,9 @@ pub fn deliver_pending_signal_riscv64(ctx: &mut crate::arch::trap::TrapContext) 
         mstatus: ctx.mstatus,
         mepc: ctx.mepc,
     };
-    unsafe {
-        // SAFETY: 사용자 스택 영역 유효성을 검증한 뒤 sigframe을 기록한다.
-        core::ptr::write_unaligned(frame_sp as *mut KernelSigFrameRiscv64, frame);
+    if uaccess::write_unaligned(frame_sp as *mut KernelSigFrameRiscv64, frame).is_err() {
+        finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+        proc::exit();
     }
 
     ctx.gpr[10] = signum as u64; // a0
@@ -1826,9 +1838,9 @@ pub fn sys_rt_sigreturn_aarch64(_gpr: [u64; 31], _elr: u64, _spsr: u64, sp_el0: 
         return errno::EFAULT;
     }
 
-    let frame = unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigframe을 읽는다.
-        core::ptr::read_unaligned(sp_el0 as *const KernelSigFrameAarch64)
+    let frame = match uaccess::read_unaligned(sp_el0 as *const KernelSigFrameAarch64) {
+        Ok(frame) => frame,
+        Err(_) => return errno::EFAULT,
     };
     if frame.magic != SIGFRAME_MAGIC {
         return errno::EFAULT;
@@ -1860,9 +1872,9 @@ pub fn sys_rt_sigreturn_riscv(gpr: [u64; 32], _mstatus: u64, _mepc: u64) -> isiz
         return errno::EFAULT;
     }
 
-    let frame = unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigframe을 읽는다.
-        core::ptr::read_unaligned(sp as *const KernelSigFrameRiscv64)
+    let frame = match uaccess::read_unaligned(sp as *const KernelSigFrameRiscv64) {
+        Ok(frame) => frame,
+        Err(_) => return errno::EFAULT,
     };
     if frame.magic != SIGFRAME_MAGIC {
         return errno::EFAULT;
@@ -2130,31 +2142,22 @@ fn remove_process_info(tid: proc::Tid) {
     }
 }
 
-fn write_user_i32(ptr: *mut i32, value: i32) {
+fn write_user_i32(ptr: *mut i32, value: i32) -> Result<(), isize> {
     if ptr.is_null() {
-        return;
+        return Ok(());
     }
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 기록한다.
-        core::ptr::write_unaligned(ptr, value);
-    }
+    uaccess::write_unaligned(ptr, value)
 }
 
-fn read_user_u64(ptr: *const u8) -> u64 {
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 읽는다.
-        core::ptr::read_unaligned(ptr as *const u64)
-    }
+fn read_user_u64(ptr: *const u8) -> Result<u64, isize> {
+    uaccess::read_unaligned(ptr as *const u64)
 }
 
-fn write_user_u64(ptr: *mut u8, value: u64) {
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 기록한다.
-        core::ptr::write_unaligned(ptr as *mut u64, value);
-    }
+fn write_user_u64(ptr: *mut u8, value: u64) -> Result<(), isize> {
+    uaccess::write_unaligned(ptr as *mut u64, value)
 }
 
-fn write_waitid_siginfo(ptr: *mut u8, child_tid: isize, wait_status: i32) {
+fn write_waitid_siginfo(ptr: *mut u8, child_tid: isize, wait_status: i32) -> Result<(), isize> {
     let siginfo = LinuxWaitidSigInfo {
         si_signo: SIGNAL_SIGCHLD as i32,
         si_errno: 0,
@@ -2165,13 +2168,10 @@ fn write_waitid_siginfo(ptr: *mut u8, child_tid: isize, wait_status: i32) {
         si_utime: 0,
         si_stime: 0,
     };
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 기록한다.
-        core::ptr::write_unaligned(ptr as *mut LinuxWaitidSigInfo, siginfo);
-    }
+    uaccess::write_unaligned(ptr as *mut LinuxWaitidSigInfo, siginfo)
 }
 
-fn clear_waitid_siginfo(ptr: *mut u8) {
+fn clear_waitid_siginfo(ptr: *mut u8) -> Result<(), isize> {
     let empty = LinuxWaitidSigInfo {
         si_signo: 0,
         si_errno: 0,
@@ -2182,10 +2182,7 @@ fn clear_waitid_siginfo(ptr: *mut u8) {
         si_utime: 0,
         si_stime: 0,
     };
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 기록한다.
-        core::ptr::write_unaligned(ptr as *mut LinuxWaitidSigInfo, empty);
-    }
+    uaccess::write_unaligned(ptr as *mut LinuxWaitidSigInfo, empty)
 }
 
 fn write_uts_field(dst: &mut [u8; 65], value: &str) {
@@ -2370,9 +2367,8 @@ pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
             }
         };
 
-        unsafe {
-            // SAFETY: 사용자 포인터 범위를 검증한 뒤 stack_t 구조체를 기록한다.
-            core::ptr::write_unaligned(old_ss as *mut LinuxSigAltStack, old);
+        if let Err(e) = uaccess::write_unaligned(old_ss as *mut LinuxSigAltStack, old) {
+            return e;
         }
     }
 
@@ -2380,9 +2376,9 @@ pub fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> isize {
         return 0;
     }
 
-    let next = unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 stack_t 구조체를 읽는다.
-        core::ptr::read_unaligned(ss as *const LinuxSigAltStack)
+    let next = match uaccess::read_unaligned(ss as *const LinuxSigAltStack) {
+        Ok(next) => next,
+        Err(e) => return e,
     };
     let allowed_flags = SS_DISABLE | SS_AUTODISARM;
     if (next.ss_flags & !allowed_flags) != 0 {
@@ -2441,9 +2437,8 @@ pub fn sys_rt_sigaction(signum: i32, act: *const u8, oldact: *mut u8, sigsetsize
     let current = signal_action_for_group(sighand_group, sig);
 
     if !oldact.is_null() {
-        unsafe {
-            // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigaction 구조체를 기록한다.
-            core::ptr::write_unaligned(oldact as *mut LinuxSigAction, current);
+        if let Err(e) = uaccess::write_unaligned(oldact as *mut LinuxSigAction, current) {
+            return e;
         }
     }
 
@@ -2455,12 +2450,12 @@ pub fn sys_rt_sigaction(signum: i32, act: *const u8, oldact: *mut u8, sigsetsize
         return errno::EINVAL;
     }
 
-    let mut next = unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 sigaction 구조체를 읽는다.
-        core::ptr::read_unaligned(act as *const LinuxSigAction)
+    let mut next = match uaccess::read_unaligned(act as *const LinuxSigAction) {
+        Ok(next) => next,
+        Err(e) => return e,
     };
     // 현재 단계에서는 핵심 플래그만 유지한다.
-    next.sa_flags &= SA_SIGINFO | SA_NODEFER | SA_RESTART;
+    next.sa_flags &= SA_SIGINFO | SA_RESTORER | SA_NODEFER | SA_RESTART;
     set_signal_action_for_group(sighand_group, sig, next);
     0
 }
@@ -2485,14 +2480,19 @@ pub fn sys_rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize:
 
     let old_mask = processes[idx].signal_mask;
     if !oldset.is_null() {
-        write_user_u64(oldset, old_mask);
+        if let Err(e) = write_user_u64(oldset, old_mask) {
+            return e;
+        }
     }
 
     if set.is_null() {
         return 0;
     }
 
-    let set_bits = read_user_u64(set);
+    let set_bits = match read_user_u64(set) {
+        Ok(bits) => bits,
+        Err(e) => return e,
+    };
     let unmaskable_bits = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
     match how {
         SIG_BLOCK => processes[idx].signal_mask |= set_bits & !unmaskable_bits,
@@ -2525,9 +2525,9 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
         return errno::EFAULT;
     }
 
-    let req_ts = unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 읽는다.
-        core::ptr::read_unaligned(req as *const LinuxTimespec)
+    let req_ts = match uaccess::read_unaligned(req as *const LinuxTimespec) {
+        Ok(ts) => ts,
+        Err(e) => return e,
     };
     if req_ts.tv_sec < 0 || req_ts.tv_nsec < 0 || req_ts.tv_nsec >= 1_000_000_000 {
         return errno::EINVAL;
@@ -2542,9 +2542,8 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            unsafe {
-                // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
-                core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
+            if let Err(e) = uaccess::write_unaligned(rem as *mut LinuxTimespec, zero) {
+                return e;
             }
         }
         return 0;
@@ -2553,9 +2552,8 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
     let tid = current_tid_or_zero();
     if has_unmasked_pending_signal(tid) {
         if !rem.is_null() {
-            unsafe {
-                // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
-                core::ptr::write_unaligned(rem as *mut LinuxTimespec, req_ts);
+            if let Err(e) = uaccess::write_unaligned(rem as *mut LinuxTimespec, req_ts) {
+                return e;
             }
         }
         return errno::EINTR;
@@ -2571,9 +2569,8 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
                     tv_sec: 0,
                     tv_nsec: 0,
                 };
-                unsafe {
-                    // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
-                    core::ptr::write_unaligned(rem as *mut LinuxTimespec, zero);
+                if let Err(e) = uaccess::write_unaligned(rem as *mut LinuxTimespec, zero) {
+                    return e;
                 }
             }
             return 0;
@@ -2588,9 +2585,8 @@ pub fn sys_nanosleep(req: *const u8, rem: *mut u8) -> isize {
                     tv_sec: (remaining / 1_000_000_000) as i64,
                     tv_nsec: (remaining % 1_000_000_000) as i64,
                 };
-                unsafe {
-                    // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
-                    core::ptr::write_unaligned(rem as *mut LinuxTimespec, rem_ts);
+                if let Err(e) = uaccess::write_unaligned(rem as *mut LinuxTimespec, rem_ts) {
+                    return e;
                 }
             }
             return errno::EINTR;
@@ -2623,9 +2619,8 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut u8) -> isize {
         tv_nsec: nsec as i64,
     };
 
-    unsafe {
-        // SAFETY: 사용자 공간 포인터가 유효하다는 syscall 호출자 계약 하에 timespec을 기록한다.
-        core::ptr::write_unaligned(tp as *mut LinuxTimespec, ts);
+    if let Err(e) = uaccess::write_unaligned(tp as *mut LinuxTimespec, ts) {
+        return e;
     }
     0
 }
@@ -2647,9 +2642,8 @@ pub fn sys_clock_getres(clock_id: i32, tp: *mut u8) -> isize {
         tv_sec: (res_ns / 1_000_000_000) as i64,
         tv_nsec: (res_ns % 1_000_000_000) as i64,
     };
-    unsafe {
-        // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 기록한다.
-        core::ptr::write_unaligned(tp as *mut LinuxTimespec, ts);
+    if let Err(e) = uaccess::write_unaligned(tp as *mut LinuxTimespec, ts) {
+        return e;
     }
     0
 }
@@ -2668,9 +2662,8 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
             tv_sec: sec as i64,
             tv_usec: (nsec / 1_000) as i64,
         };
-        unsafe {
-            // SAFETY: 사용자 공간 포인터가 유효하다는 syscall 호출자 계약 하에 timeval을 기록한다.
-            core::ptr::write_unaligned(tv as *mut LinuxTimeval, tv_out);
+        if let Err(e) = uaccess::write_unaligned(tv as *mut LinuxTimeval, tv_out) {
+            return e;
         }
     }
 
@@ -2682,9 +2675,8 @@ pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
             tz_minuteswest: 0,
             tz_dsttime: 0,
         };
-        unsafe {
-            // SAFETY: 사용자 공간 포인터가 유효하다는 syscall 호출자 계약 하에 timezone을 기록한다.
-            core::ptr::write_unaligned(tz as *mut LinuxTimezone, tz_out);
+        if let Err(e) = uaccess::write_unaligned(tz as *mut LinuxTimezone, tz_out) {
+            return e;
         }
     }
 
@@ -2775,9 +2767,9 @@ pub fn sys_tgkill(tgid: isize, tid: isize, sig: i32) -> isize {
     sys_tkill(mapped_tid, sig)
 }
 
-fn write_sigtimedwait_info(info: *mut u8, signum: u32) {
+fn write_sigtimedwait_info(info: *mut u8, signum: u32) -> Result<(), isize> {
     if info.is_null() {
-        return;
+        return Ok(());
     }
 
     let siginfo = LinuxSigInfoHeader {
@@ -2786,10 +2778,7 @@ fn write_sigtimedwait_info(info: *mut u8, signum: u32) {
         si_code: 0,
         _pad: 0,
     };
-    unsafe {
-        // SAFETY: 호출자가 전달한 사용자 포인터 범위를 선검증한 뒤 siginfo 헤더를 기록한다.
-        core::ptr::write_unaligned(info as *mut LinuxSigInfoHeader, siginfo);
-    }
+    uaccess::write_unaligned(info as *mut LinuxSigInfoHeader, siginfo)
 }
 
 /// sys_rt_sigtimedwait - 지정 시그널 대기
@@ -2822,9 +2811,9 @@ pub fn sys_rt_sigtimedwait(
         if validate_user_pointer(timeout as usize, core::mem::size_of::<LinuxTimespec>()).is_err() {
             return errno::EFAULT;
         }
-        let ts = unsafe {
-            // SAFETY: 사용자 포인터 범위를 검증한 뒤 timespec을 읽는다.
-            core::ptr::read_unaligned(timeout as *const LinuxTimespec)
+        let ts = match uaccess::read_unaligned(timeout as *const LinuxTimespec) {
+            Ok(ts) => ts,
+            Err(e) => return e,
         };
         if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
             return errno::EINVAL;
@@ -2836,12 +2825,17 @@ pub fn sys_rt_sigtimedwait(
     };
 
     let unwaitable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
-    let accepted = read_user_u64(set) & !unwaitable;
+    let accepted = match read_user_u64(set) {
+        Ok(bits) => bits & !unwaitable,
+        Err(e) => return e,
+    };
     let tid = current_tid_or_zero();
     clear_sigtimedwait_mask_for_tid(tid);
 
     if let Some(signum) = take_pending_signal(tid, accepted) {
-        write_sigtimedwait_info(info, signum);
+        if let Err(e) = write_sigtimedwait_info(info, signum) {
+            return e;
+        }
         return signum as isize;
     }
 
@@ -2856,7 +2850,9 @@ pub fn sys_rt_sigtimedwait(
 
         if let Some(signum) = take_pending_signal(tid, accepted) {
             clear_sigtimedwait_mask_for_tid(tid);
-            write_sigtimedwait_info(info, signum);
+            if let Err(e) = write_sigtimedwait_info(info, signum) {
+                return e;
+            }
             return signum as isize;
         }
 
@@ -2870,7 +2866,9 @@ pub fn sys_rt_sigtimedwait(
         clear_sigtimedwait_mask_for_tid(tid);
 
         if let Some(signum) = take_pending_signal(tid, accepted) {
-            write_sigtimedwait_info(info, signum);
+            if let Err(e) = write_sigtimedwait_info(info, signum) {
+                return e;
+            }
             return signum as isize;
         }
 
@@ -2999,10 +2997,14 @@ pub fn sys_clone(
     }
 
     if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
-        write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
+        if let Err(e) = write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32) {
+            return e;
+        }
     }
     if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
-        write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
+        if let Err(e) = write_user_i32(child_tid_ptr as *mut i32, child_tid as i32) {
+            return e;
+        }
     }
 
     child_tid
@@ -3122,10 +3124,14 @@ fn finalize_clone_with_vm_setup(
     }
 
     if flags & CLONE_PARENT_SETTID != 0 && !parent_tid_ptr.is_null() {
-        write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32);
+        if let Err(e) = write_user_i32(parent_tid_ptr as *mut i32, child_tid as i32) {
+            return e;
+        }
     }
     if flags & CLONE_CHILD_SETTID != 0 && !child_tid_ptr.is_null() {
-        write_user_i32(child_tid_ptr as *mut i32, child_tid as i32);
+        if let Err(e) = write_user_i32(child_tid_ptr as *mut i32, child_tid as i32) {
+            return e;
+        }
     }
 
     mark_pending_fork_child_ready(child_tid);
@@ -3286,7 +3292,10 @@ pub fn sys_wait4(pid: isize, status: *mut i32, options: i32, _rusage: *mut u8) -
 
     loop {
         if let Some(child) = pop_zombie_child(parent_tid, pid) {
-            write_user_i32(status, child.status);
+            if let Err(e) = write_user_i32(status, child.status) {
+                ZOMBIE_CHILDREN.lock().push(child);
+                return e;
+            }
             remove_process_info(child.child_tid as proc::Tid);
             return child.child_tid;
         }
@@ -3342,7 +3351,12 @@ pub fn sys_waitid(idtype: i32, id: usize, infop: *mut u8, options: i32, _rusage:
         };
 
         if let Some(child) = zombie {
-            write_waitid_siginfo(infop, child.child_tid, child.status);
+            if let Err(e) = write_waitid_siginfo(infop, child.child_tid, child.status) {
+                if options & WNOWAIT == 0 {
+                    ZOMBIE_CHILDREN.lock().push(child);
+                }
+                return e;
+            }
             if options & WNOWAIT == 0 {
                 remove_process_info(child.child_tid as proc::Tid);
             }
@@ -3354,7 +3368,9 @@ pub fn sys_waitid(idtype: i32, id: usize, infop: *mut u8, options: i32, _rusage:
         }
 
         if options & WNOHANG != 0 {
-            clear_waitid_siginfo(infop);
+            if let Err(e) = clear_waitid_siginfo(infop) {
+                return e;
+            }
             return 0;
         }
 
@@ -3393,9 +3409,8 @@ pub fn sys_uname(buf: *mut u8) -> isize {
     write_uts_field(&mut uts.machine, machine);
     write_uts_field(&mut uts.domainname, "localdomain");
 
-    unsafe {
-        // SAFETY: syscall 호출자 계약 상 유효한 사용자 포인터로 가정하고 값을 기록한다.
-        core::ptr::write_unaligned(buf as *mut LinuxUtsName, uts);
+    if let Err(e) = uaccess::write_unaligned(buf as *mut LinuxUtsName, uts) {
+        return e;
     }
     0
 }
@@ -4501,10 +4516,7 @@ fn read_user_string_array(
         };
         validate_user_pointer(slot, ptr_size)?;
 
-        let ptr = unsafe {
-            // SAFETY: 사용자 포인터 배열의 현재 슬롯 범위를 먼저 검증했고, 그 범위를 비정렬 읽기한다.
-            core::ptr::read_unaligned(slot as *const *const u8)
-        };
+        let ptr = uaccess::read_unaligned(slot as *const *const u8)?;
 
         if ptr.is_null() {
             return Ok((out, total_bytes));
@@ -4537,59 +4549,29 @@ fn read_user_c_string(ptr: *const u8, max_len: usize) -> Result<String, isize> {
             Some(v) => v,
             None => return Err(errno::EFAULT),
         };
-        validate_user_pointer(byte_addr, 1)?;
-
-        let byte = unsafe {
-            // SAFETY: 사용자 주소 범위를 검증한 뒤 1바이트를 읽는다.
-            core::ptr::read(byte_addr as *const u8)
-        };
+        let byte = uaccess::read_byte(byte_addr as *const u8)?;
         if byte == 0 {
             break;
         }
         len += 1;
     }
 
-    validate_user_pointer(ptr as usize, len)?;
-
-    let bytes = unsafe {
-        // SAFETY: 위 루프에서 NUL 종단 길이를 계산했고, 동일 범위를 read-only slice로 변환한다.
-        core::slice::from_raw_parts(ptr, len)
-    };
-
-    let s = core::str::from_utf8(bytes).map_err(|_| errno::EINVAL)?;
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(len).is_err() {
+        return Err(errno::ENOMEM);
+    }
+    bytes.resize(len, 0);
+    uaccess::copy_from_user(&mut bytes, ptr)?;
+    let s = core::str::from_utf8(&bytes).map_err(|_| errno::EINVAL)?;
     Ok(String::from(s))
 }
 
 #[inline]
 fn validate_user_pointer(ptr: usize, len: usize) -> Result<(), isize> {
-    if user_pointer_in_range(ptr, len) {
-        Ok(())
-    } else {
-        Err(errno::EFAULT)
-    }
+    uaccess::validate_user_pointer(ptr, len)
 }
 
 #[inline]
 fn user_pointer_in_range(ptr: usize, len: usize) -> bool {
-    if ptr == 0 {
-        return false;
-    }
-
-    if len == 0 {
-        return true;
-    }
-
-    let Some(end) = ptr.checked_add(len) else {
-        return false;
-    };
-
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        ptr >= MIN_USER_VADDR && end <= MAX_USER_VADDR_EXCLUSIVE
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
-    {
-        ptr >= 0x1000 && end > ptr
-    }
+    uaccess::user_pointer_in_range(ptr, len)
 }

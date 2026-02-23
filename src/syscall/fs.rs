@@ -11,7 +11,7 @@ use crate::fs::{self, VfsError, VNodeType, FileMode};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
 use crate::proc;
 use crate::sync::Mutex;
-use super::errno;
+use super::{errno, uaccess};
 
 /// VFS 에러를 errno로 변환
 fn vfs_error_to_errno(e: VfsError) -> isize {
@@ -162,27 +162,11 @@ const DT_LNK: u8 = 10;
 const DT_SOCK: u8 = 12;
 
 fn read_c_path(path: *const u8) -> Result<String, isize> {
-    if path.is_null() {
-        return Err(errno::EFAULT);
+    match uaccess::read_c_string(path, MAX_PATH_LEN) {
+        Ok(s) => Ok(s),
+        Err(e) if e == errno::E2BIG => Err(errno::EINVAL),
+        Err(e) => Err(e),
     }
-
-    let mut len = 0usize;
-    unsafe {
-        // SAFETY: syscall 인자로 전달된 NUL 종단 문자열 포인터를 최대 길이 내에서 순회한다.
-        while *path.add(len) != 0 {
-            len += 1;
-            if len > MAX_PATH_LEN {
-                return Err(errno::EINVAL);
-            }
-        }
-    }
-
-    let bytes = unsafe {
-        // SAFETY: 위에서 길이를 검증했으며, 동일 범위를 read-only slice로 변환한다.
-        core::slice::from_raw_parts(path, len)
-    };
-    let s = core::str::from_utf8(bytes).map_err(|_| errno::EINVAL)?;
-    Ok(String::from(s))
 }
 
 fn normalize_user_path(path: &str) -> Result<String, isize> {
@@ -284,11 +268,10 @@ fn write_linux_stat(stat_buf: *mut u8, stat: &fs::Stat) -> isize {
         __unused5: 0,
     };
 
-    unsafe {
-        // SAFETY: 사용자 버퍼에 LinuxStat 호환 구조체를 그대로 복사한다.
-        core::ptr::write_unaligned(stat_buf as *mut LinuxStat, linux_stat);
+    match uaccess::write_unaligned(stat_buf as *mut LinuxStat, linux_stat) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
-    0
 }
 
 /// sys_write - 파일 디스크립터에 쓰기
@@ -302,36 +285,92 @@ fn write_linux_stat(stat_buf: *mut u8, stat: &fs::Stat) -> isize {
 /// * 성공: 쓴 바이트 수
 /// * 실패: 음수 에러 코드
 pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> isize {
-    // 버퍼 유효성 검사 (간단한 null 체크)
     if buf.is_null() {
         return errno::EFAULT;
     }
+    if count == 0 {
+        return 0;
+    }
 
-    // VFS가 초기화되었으면 FD 테이블 사용
     if let Ok(fd_table) = current_fd_table() {
         if let Ok(file) = fd_table.get(fd as i32) {
-            let slice = unsafe { core::slice::from_raw_parts(buf, count) };
-            match file.write(slice) {
-                Ok(n) => return n as isize,
-                Err(e) => return vfs_error_to_errno(e),
+            let chunk_size = core::cmp::min(count, SENDFILE_CHUNK_SIZE);
+            let mut chunk = Vec::new();
+            if chunk.try_reserve_exact(chunk_size).is_err() {
+                return errno::ENOMEM;
             }
+            chunk.resize(chunk_size, 0);
+
+            let mut total_written = 0usize;
+            while total_written < count {
+                let to_copy = core::cmp::min(chunk_size, count - total_written);
+                let src_addr = match (buf as usize).checked_add(total_written) {
+                    Some(v) => v as *const u8,
+                    None => {
+                        return if total_written > 0 {
+                            total_written as isize
+                        } else {
+                            errno::EFAULT
+                        };
+                    }
+                };
+                if let Err(e) = uaccess::copy_from_user(&mut chunk[..to_copy], src_addr) {
+                    return if total_written > 0 {
+                        total_written as isize
+                    } else {
+                        e
+                    };
+                }
+
+                let written = match file.write(&chunk[..to_copy]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return if total_written > 0 {
+                            total_written as isize
+                        } else {
+                            vfs_error_to_errno(e)
+                        };
+                    }
+                };
+                total_written += written;
+                if written != to_copy {
+                    break;
+                }
+            }
+            return total_written as isize;
         }
     }
 
-    // 폴백: 기존 콘솔 출력
     match fd {
         1 | 2 => {
-            // stdout (1) 또는 stderr (2) - 콘솔 출력
+            let mut written = 0usize;
             for i in 0..count {
-                let c = unsafe { *buf.add(i) };
+                let c_addr = match (buf as usize).checked_add(i) {
+                    Some(v) => v as *const u8,
+                    None => {
+                        return if written > 0 {
+                            written as isize
+                        } else {
+                            errno::EFAULT
+                        };
+                    }
+                };
+                let c = match uaccess::read_byte(c_addr) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return if written > 0 {
+                            written as isize
+                        } else {
+                            e
+                        };
+                    }
+                };
                 console::putc(c);
+                written += 1;
             }
-            count as isize
+            written as isize
         }
-        _ => {
-            // 지원하지 않는 fd
-            errno::ENOENT
-        }
+        _ => errno::ENOENT,
     }
 }
 
@@ -354,11 +393,28 @@ pub fn sys_writev(fd: i32, iov: *const u8, iovcnt: i32) -> isize {
     }
 
     let mut total_written = 0isize;
-    let iov_ptr = iov as *const LinuxIovec;
+    let iov_base = iov as usize;
+    let iov_ent_size = core::mem::size_of::<LinuxIovec>();
     for idx in 0..iovcnt as usize {
-        let entry = unsafe {
-            // SAFETY: iovcnt 범위를 검증했으며, 사용자 메모리에서 iovec 엔트리 하나를 읽는다.
-            core::ptr::read_unaligned(iov_ptr.add(idx))
+        let entry_addr = match iov_base.checked_add(idx * iov_ent_size) {
+            Some(v) => v as *const LinuxIovec,
+            None => {
+                return if total_written > 0 {
+                    total_written
+                } else {
+                    errno::EFAULT
+                };
+            }
+        };
+        let entry = match uaccess::read_unaligned(entry_addr) {
+            Ok(entry) => entry,
+            Err(e) => {
+                return if total_written > 0 {
+                    total_written
+                } else {
+                    e
+                };
+            }
         };
         if entry.iov_len == 0 {
             continue;
@@ -406,35 +462,43 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> isize {
     if buf.is_null() {
         return errno::EFAULT;
     }
+    if count == 0 {
+        return 0;
+    }
 
-    // VFS가 초기화되었으면 FD 테이블 사용
     if let Ok(fd_table) = current_fd_table() {
         if let Ok(file) = fd_table.get(fd as i32) {
-            let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
-            match file.read(slice) {
-                Ok(n) => return n as isize,
+            let chunk_len = core::cmp::min(count, SENDFILE_CHUNK_SIZE);
+            let mut tmp = Vec::new();
+            if tmp.try_reserve_exact(chunk_len).is_err() {
+                return errno::ENOMEM;
+            }
+            tmp.resize(chunk_len, 0);
+
+            match file.read(&mut tmp[..]) {
+                Ok(n) => {
+                    if n == 0 {
+                        return 0;
+                    }
+                    match uaccess::copy_to_user(buf, &tmp[..n]) {
+                        Ok(()) => return n as isize,
+                        Err(e) => return e,
+                    }
+                }
                 Err(e) => return vfs_error_to_errno(e),
             }
         }
     }
 
-    // 폴백: 기존 콘솔 입력
     match fd {
         0 => {
-            // stdin - 콘솔 입력 (한 문자만 읽기)
-            if count == 0 {
-                return 0;
-            }
-
-            // 폴링 방식으로 한 문자 읽기
             loop {
                 if let Some(c) = crate::arch::uart::getc() {
-                    unsafe {
-                        *buf = c;
+                    if let Err(e) = uaccess::write_byte(buf, c) {
+                        return e;
                     }
                     return 1;
                 }
-                // CPU 양보
                 core::hint::spin_loop();
             }
         }
@@ -473,9 +537,9 @@ pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> 
 
     let use_explicit_offset = !offset.is_null();
     let mut explicit_in_pos = if use_explicit_offset {
-        let initial = unsafe {
-            // SAFETY: 사용자 포인터 non-null 여부를 확인했고 i64 하나를 읽는다.
-            core::ptr::read_unaligned(offset)
+        let initial = match uaccess::read_unaligned(offset) {
+            Ok(v) => v,
+            Err(e) => return e,
         };
         if initial < 0 {
             return errno::EINVAL;
@@ -546,9 +610,8 @@ pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> 
     }
 
     if use_explicit_offset {
-        unsafe {
-            // SAFETY: 사용자 포인터 non-null 여부를 확인했고 i64 하나를 기록한다.
-            core::ptr::write_unaligned(offset, explicit_in_pos as i64);
+        if let Err(e) = uaccess::write_unaligned(offset, explicit_in_pos as i64) {
+            return e;
         }
     }
 
@@ -707,10 +770,15 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
         return errno::ERANGE;
     }
 
-    unsafe {
-        // SAFETY: 호출자가 제공한 buf는 최소 required 바이트 이상이며 겹치지 않는다.
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-        *buf.add(bytes.len()) = 0;
+    if let Err(e) = uaccess::copy_to_user(buf, bytes) {
+        return e;
+    }
+    let nul_ptr = match (buf as usize).checked_add(bytes.len()) {
+        Some(v) => v as *mut u8,
+        None => return errno::EFAULT,
+    };
+    if let Err(e) = uaccess::write_byte(nul_ptr, 0) {
+        return e;
     }
     required as isize
 }
@@ -867,9 +935,8 @@ pub fn sys_ioctl(fd_num: i32, request: usize, argp: usize) -> isize {
                 c_ispeed: 0,
                 c_ospeed: 0,
             };
-            unsafe {
-                // SAFETY: 사용자 공간이 제공한 버퍼에 termios 구조체를 기록한다.
-                core::ptr::write_unaligned(argp as *mut LinuxTermios, termios);
+            if let Err(e) = uaccess::write_unaligned(argp as *mut LinuxTermios, termios) {
+                return e;
             }
             0
         }
@@ -884,9 +951,8 @@ pub fn sys_ioctl(fd_num: i32, request: usize, argp: usize) -> isize {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            unsafe {
-                // SAFETY: 사용자 공간이 제공한 버퍼에 winsize 구조체를 기록한다.
-                core::ptr::write_unaligned(argp as *mut LinuxWinSize, ws);
+            if let Err(e) = uaccess::write_unaligned(argp as *mut LinuxWinSize, ws) {
+                return e;
             }
             0
         }
@@ -945,6 +1011,7 @@ pub fn sys_getdents64(fd_num: i32, dirp: *mut u8, count: usize) -> isize {
 
     let mut written = 0usize;
     let mut idx = *cursor;
+    let mut record = Vec::new();
 
     while idx < entries.len() {
         let entry = &entries[idx];
@@ -964,21 +1031,33 @@ pub fn sys_getdents64(fd_num: i32, dirp: *mut u8, count: usize) -> isize {
         let d_off = (idx + 1) as i64;
         let d_type = linux_d_type(entry.node_type);
 
-        unsafe {
-            // SAFETY: dirp와 count는 호출자가 제공한 유효 사용자 버퍼를 가정하고,
-            // 범위 체크(written + reclen <= count) 후에만 기록한다.
-            let rec = dirp.add(written);
-            let mut header = [0u8; 19];
-            header[0..8].copy_from_slice(&ino.to_le_bytes());
-            header[8..16].copy_from_slice(&d_off.to_le_bytes());
-            header[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-            header[18] = d_type;
-            core::ptr::copy_nonoverlapping(header.as_ptr(), rec, header.len());
-            core::ptr::copy_nonoverlapping(name.as_ptr(), rec.add(19), name.len());
-            *rec.add(19 + name.len()) = 0;
-            for pad in (19 + name.len() + 1)..reclen {
-                *rec.add(pad) = 0;
+        if record.try_reserve_exact(reclen).is_err() {
+            return if written > 0 {
+                written as isize
+            } else {
+                errno::ENOMEM
+            };
+        }
+        record.clear();
+        record.resize(reclen, 0);
+        record[0..8].copy_from_slice(&ino.to_le_bytes());
+        record[8..16].copy_from_slice(&d_off.to_le_bytes());
+        record[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        record[18] = d_type;
+        record[19..(19 + name.len())].copy_from_slice(name);
+
+        let rec = match (dirp as usize).checked_add(written) {
+            Some(v) => v as *mut u8,
+            None => {
+                return if written > 0 {
+                    written as isize
+                } else {
+                    errno::EFAULT
+                };
             }
+        };
+        if let Err(e) = uaccess::copy_to_user(rec, &record[..]) {
+            return if written > 0 { written as isize } else { e };
         }
 
         written += reclen;
@@ -1025,10 +1104,23 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> isize {
         }
     };
 
-    unsafe {
-        // SAFETY: 사용자 포인터가 유효하다는 syscall 계약 하에서 두 i32 값을 기록한다.
-        core::ptr::write_unaligned(pipefd, read_fd);
-        core::ptr::write_unaligned(pipefd.add(1), write_fd);
+    if let Err(e) = uaccess::write_unaligned(pipefd, read_fd) {
+        let _ = table.close(read_fd);
+        let _ = table.close(write_fd);
+        return e;
+    }
+    let write_ptr = match (pipefd as usize).checked_add(core::mem::size_of::<i32>()) {
+        Some(v) => v as *mut i32,
+        None => {
+            let _ = table.close(read_fd);
+            let _ = table.close(write_fd);
+            return errno::EFAULT;
+        }
+    };
+    if let Err(e) = uaccess::write_unaligned(write_ptr, write_fd) {
+        let _ = table.close(read_fd);
+        let _ = table.close(write_fd);
+        return e;
     }
 
     0
@@ -1065,9 +1157,8 @@ pub fn sys_readlinkat(_dirfd: i32, path: *const u8, buf: *mut u8, bufsiz: usize)
 
     let bytes = target.as_bytes();
     let to_copy = core::cmp::min(bytes.len(), bufsiz);
-    unsafe {
-        // SAFETY: bufsiz 경계 내에서만 복사하며, 입력 문자열은 불변 메모리다.
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, to_copy);
+    if let Err(e) = uaccess::copy_to_user(buf, &bytes[..to_copy]) {
+        return e;
     }
     to_copy as isize
 }
@@ -1112,11 +1203,10 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
         f_spare: [0; 4],
     };
 
-    unsafe {
-        // SAFETY: 사용자 버퍼에 Linux statfs 호환 구조체를 기록한다.
-        core::ptr::write_unaligned(buf as *mut LinuxStatFs, linux);
+    match uaccess::write_unaligned(buf as *mut LinuxStatFs, linux) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
-    0
 }
 
 /// sys_ppoll - 파일 디스크립터 이벤트 대기
@@ -1142,9 +1232,9 @@ pub fn sys_ppoll(
     let timeout_deadline_ns = if timeout.is_null() {
         None
     } else {
-        let ts = unsafe {
-            // SAFETY: timeout 포인터가 non-null인지 확인했고, 리눅스 timespec ABI 크기만큼 읽는다.
-            core::ptr::read_unaligned(timeout as *const LinuxTimespec)
+        let ts = match uaccess::read_unaligned(timeout as *const LinuxTimespec) {
+            Ok(ts) => ts,
+            Err(e) => return e,
         };
         if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
             return errno::EINVAL;
@@ -1155,7 +1245,8 @@ pub fn sys_ppoll(
         Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
     };
 
-    let pollfds = fds as *mut LinuxPollFd;
+    let pollfds = fds as usize;
+    let pollfd_size = core::mem::size_of::<LinuxPollFd>();
 
     loop {
         let table = match current_fd_table() {
@@ -1165,13 +1256,13 @@ pub fn sys_ppoll(
 
         let mut ready = 0isize;
         for idx in 0..nfds {
-            let entry_ptr = unsafe {
-                // SAFETY: nfds 경계를 보장한 루프에서 배열 원소 포인터를 계산한다.
-                pollfds.add(idx)
+            let entry_addr = match pollfds.checked_add(idx * pollfd_size) {
+                Some(v) => v as *mut LinuxPollFd,
+                None => return errno::EFAULT,
             };
-            let mut entry = unsafe {
-                // SAFETY: 엔트리 크기만큼 비정렬 읽기를 수행한다.
-                core::ptr::read_unaligned(entry_ptr)
+            let mut entry = match uaccess::read_unaligned(entry_addr as *const LinuxPollFd) {
+                Ok(entry) => entry,
+                Err(e) => return e,
             };
             entry.revents = 0;
 
@@ -1195,9 +1286,8 @@ pub fn sys_ppoll(
                 ready += 1;
             }
 
-            unsafe {
-                // SAFETY: 같은 엔트리 위치에 동일 크기 구조체를 비정렬 기록한다.
-                core::ptr::write_unaligned(entry_ptr, entry);
+            if let Err(e) = uaccess::write_unaligned(entry_addr, entry) {
+                return e;
             }
         }
 

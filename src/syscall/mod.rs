@@ -5,6 +5,7 @@
 
 mod fs;
 mod process;
+mod uaccess;
 
 use crate::kprintln;
 #[cfg(target_arch = "riscv64")]
