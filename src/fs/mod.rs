@@ -436,6 +436,25 @@ pub fn lookup_path(path: &str) -> VfsResult<Arc<dyn VNode>> {
     path::resolve(&fs.root(), &relative_path)
 }
 
+/// 경로의 부모 디렉토리와 마지막 컴포넌트를 반환
+///
+/// mount table 기준으로 부모 디렉토리를 해석하므로 `/mnt/...` 같은
+/// 하위 마운트 경로 생성/삭제 연산에서 일관된 동작을 보장한다.
+pub fn resolve_parent_path(path: &str) -> VfsResult<(Arc<dyn VNode>, String)> {
+    let normalized = path::normalize(path)?;
+    let (parent_path, name) = path::split(&normalized);
+    if name.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let parent = lookup_path(parent_path)?;
+    if parent.node_type() != VNodeType::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+
+    Ok((parent, String::from(name)))
+}
+
 /// 마운트 목록 반환
 pub fn list_mounts() -> Vec<(String, String)> {
     let mounts = MOUNT_TABLE.read();

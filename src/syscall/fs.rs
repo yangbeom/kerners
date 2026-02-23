@@ -588,10 +588,7 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> isize {
         }
         Err(VfsError::NotFound) if open_flags.is_create() => {
             // 파일 생성
-            let (parent, name) = match fs::path::resolve_parent(
-                &fs::root_fs().unwrap().root(),
-                &path_norm
-            ) {
+            let (parent, name) = match fs::resolve_parent_path(&path_norm) {
                 Ok(p) => p,
                 Err(e) => return vfs_error_to_errno(e),
             };
@@ -1235,12 +1232,7 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
         Err(e) => return e,
     };
 
-    let root = match fs::root_fs() {
-        Some(fs) => fs.root(),
-        None => return errno::EIO,
-    };
-
-    match fs::path::resolve_parent(&root, &path_norm) {
+    match fs::resolve_parent_path(&path_norm) {
         Ok((parent, name)) => {
             let create_mode = mode & !super::process::current_umask();
             match parent.create(&name, VNodeType::Directory, FileMode::new(create_mode)) {
@@ -1263,12 +1255,7 @@ pub fn sys_unlink(path: *const u8) -> isize {
         Err(e) => return e,
     };
 
-    let root = match fs::root_fs() {
-        Some(fs) => fs.root(),
-        None => return errno::EIO,
-    };
-
-    match fs::path::resolve_parent(&root, &path_norm) {
+    match fs::resolve_parent_path(&path_norm) {
         Ok((parent, name)) => {
             match parent.unlink(&name) {
                 Ok(()) => 0,
