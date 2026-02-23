@@ -502,6 +502,10 @@ pub fn handle_user_page_fault_riscv64(far: usize, cause: u64) -> bool {
     process::handle_user_page_fault_riscv64(far, cause)
 }
 
+pub fn terminate_current_by_sigsegv(fault_pc: usize, fault_addr: usize) -> ! {
+    process::terminate_current_by_sigsegv(fault_pc, fault_addr)
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn deliver_pending_signal_aarch64(
     ctx: &mut crate::arch::exception::ExceptionContext,

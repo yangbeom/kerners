@@ -1517,6 +1517,18 @@ pub fn handle_user_page_fault_riscv64(far: usize, cause: u64) -> bool {
     handle_user_page_fault_write(far)
 }
 
+pub fn terminate_current_by_sigsegv(fault_pc: usize, fault_addr: usize) -> ! {
+    let tid = current_tid_or_zero();
+    finalize_exit_by_signal(tid, SIGNAL_SIGSEGV);
+    kprintln!(
+        "[signal] tid={} terminating by SIGSEGV (pc={:#x}, addr={:#x})",
+        tid,
+        fault_pc,
+        fault_addr
+    );
+    proc::exit();
+}
+
 fn signal_to_mask(signum: u32) -> u64 {
     if signum == 0 || signum > 64 {
         return 0;

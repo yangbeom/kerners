@@ -159,9 +159,15 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
     }
 
     // 데이터 abort(page fault) 처리:
-    // - EL0(user) fault 뿐 아니라, 커널 모듈이 유저 VA를 접근하는 same-EL fault도
-    //   COW 대상이면 복구 후 복귀한다.
-    if ec == EC_DATA_ABORT_LOWER || ec == EC_DATA_ABORT_SAME {
+    // - lower EL(user) fault는 COW 복구 실패 시 현재 태스크를 SIGSEGV로 종료한다.
+    // - same EL fault는 COW 복구 대상(커널 모듈의 user VA 접근)일 때만 복구 후 복귀한다.
+    if ec == EC_DATA_ABORT_LOWER {
+        if crate::syscall::handle_user_page_fault_aarch64(ctx.far as usize, ctx.esr) {
+            return;
+        }
+        crate::syscall::terminate_current_by_sigsegv(ctx.elr as usize, ctx.far as usize);
+    }
+    if ec == EC_DATA_ABORT_SAME {
         if crate::syscall::handle_user_page_fault_aarch64(ctx.far as usize, ctx.esr) {
             return;
         }
