@@ -295,6 +295,10 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
         }
         12 => {
             // Instruction page fault
+            let from_user = ((ctx.mstatus >> 11) & 0x3) == 0;
+            if from_user {
+                crate::syscall::terminate_current_by_sigsegv(ctx.mepc as usize, ctx.mtval as usize);
+            }
             kprintln!("\n[EXCEPTION] Instruction page fault");
             print_trap_context(ctx);
             panic!("Instruction page fault at {:#x}, address: {:#x}", ctx.mepc, ctx.mtval);
@@ -304,6 +308,10 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
             if crate::syscall::handle_user_page_fault_riscv64(ctx.mtval as usize, cause) {
                 return;
             }
+            let from_user = ((ctx.mstatus >> 11) & 0x3) == 0;
+            if from_user {
+                crate::syscall::terminate_current_by_sigsegv(ctx.mepc as usize, ctx.mtval as usize);
+            }
             kprintln!("\n[EXCEPTION] Load page fault");
             print_trap_context(ctx);
             panic!("Load page fault at {:#x}, address: {:#x}", ctx.mepc, ctx.mtval);
@@ -312,6 +320,10 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
             // Store page fault
             if crate::syscall::handle_user_page_fault_riscv64(ctx.mtval as usize, cause) {
                 return;
+            }
+            let from_user = ((ctx.mstatus >> 11) & 0x3) == 0;
+            if from_user {
+                crate::syscall::terminate_current_by_sigsegv(ctx.mepc as usize, ctx.mtval as usize);
             }
             kprintln!("\n[EXCEPTION] Store page fault");
             print_trap_context(ctx);
