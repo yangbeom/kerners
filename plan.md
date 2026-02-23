@@ -661,3 +661,15 @@
 - [ ] VirtIO-input (키보드/마우스)
 - [ ] RTC (Real-Time Clock) — 실제 시간
 - [ ] DTB 기반 ELF 드라이버 모듈 동적 로딩
+
+### Phase 21: 추가 파일시스템 지원 (중장기, 추후)
+
+- [ ] 착수 조건: rootfs → 실루트 전환(switch_root) 안정화 + mount-aware 경로 생성/삭제 일관성 확보
+- [ ] ext4 (우선순위 1) — read/write baseline (`create`, `unlink`, `mkdir`, `rmdir`, `truncate`)
+- [ ] xfs (우선순위 2) — 대용량 파일/디렉토리 중심 baseline read/write
+- [ ] btrfs (우선순위 3) — 우선 read-only + 기본 subvolume 조회, 이후 CoW write 단계 확장
+- [ ] f2fs (우선순위 4) — flash-friendly 워크로드용 baseline read/write
+- [ ] exFAT (우선순위 5) — 이동식 미디어 호환성 baseline read/write
+- [ ] 공통 VFS 기능 점검: `statfs`, `getdents64`, `mmap(file-backed)`, page cache/writeback 연동
+- [ ] 테스트/이미지 파이프라인: 파일시스템별 QEMU 디스크 이미지 생성 스크립트 + smoke 시나리오
+- [ ] 수용 기준: `/` 실루트 + 하위 마운트 조합에서 BusyBox 기본 명령(생성/조회/삭제) 회귀 PASS
