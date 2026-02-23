@@ -363,35 +363,87 @@ fn ensure_dir(path: &str) {
 }
 
 #[cfg(not(feature = "test_runner"))]
-fn try_mount_boot_rootfs() {
+fn mount_fat32_from_vda() -> Option<alloc::sync::Arc<dyn fs::FileSystem>> {
+    let Some(device) = block::get_device("vda") else {
+        kprintln!("[init] /dev/vda not found");
+        return None;
+    };
+
+    match fs::fat32::mount_fat32(device) {
+        Ok(fat32) => {
+            let fs_obj: alloc::sync::Arc<dyn fs::FileSystem> = fat32;
+            Some(fs_obj)
+        }
+        Err(e) => {
+            kprintln!("[init] failed to parse FAT32 on /dev/vda: {:?}", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn try_mount_boot_fs_at_mnt() -> bool {
     if fs::list_mounts().iter().any(|(path, _)| path == "/mnt") {
-        return;
+        return true;
     }
 
     ensure_dir("/mnt");
 
-    let Some(device) = block::get_device("vda") else {
-        kprintln!("[init] /dev/vda not found, skipping auto-mount");
-        return;
+    let Some(fat32) = mount_fat32_from_vda() else {
+        return false;
     };
 
-    match fs::fat32::mount_fat32(device) {
-        Ok(fat32) => match fs::mount("/mnt", fat32) {
-            Ok(()) => kprintln!("[init] mounted boot filesystem at /mnt"),
-            Err(e) => kprintln!("[init] failed to mount /mnt: {:?}", e),
-        },
-        Err(e) => kprintln!("[init] failed to parse FAT32 on /dev/vda: {:?}", e),
+    match fs::mount("/mnt", fat32) {
+        Ok(()) => {
+            kprintln!("[init] mounted boot filesystem at /mnt");
+            true
+        }
+        Err(e) => {
+            kprintln!("[init] failed to mount /mnt: {:?}", e);
+            false
+        }
     }
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn try_switch_root_to_fat32() -> bool {
+    let Some(fat32) = mount_fat32_from_vda() else {
+        return false;
+    };
+
+    fs::switch_root_fs(fat32);
+    ensure_dir("/dev");
+    ensure_dir("/proc");
+    kprintln!("[init] switched root filesystem to FAT32 (/dev/vda)");
+    true
 }
 
 #[cfg(not(feature = "test_runner"))]
 fn try_launch_init_process() -> bool {
     use alloc::string::String;
 
+    let policy = rootfs_policy_from_bootargs();
+    let mut include_mnt_fallback = true;
+
+    match policy {
+        RootFsPolicy::Ramfs => {
+            let _ = try_mount_boot_fs_at_mnt();
+        }
+        RootFsPolicy::Fat32 => {
+            if try_switch_root_to_fat32() {
+                include_mnt_fallback = false;
+            } else {
+                kprintln!(
+                    "[init] FAT32 root requested but switch_root failed, keeping ramfs root"
+                );
+                let _ = try_mount_boot_fs_at_mnt();
+            }
+        }
+    }
+
     ensure_dir("/bin");
     ensure_dir("/sbin");
     ensure_dir("/etc");
-    try_mount_boot_rootfs();
 
     let envp = alloc::vec![
         String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"),
@@ -399,12 +451,8 @@ fn try_launch_init_process() -> bool {
         String::from("TERM=linux"),
     ];
 
-    // 현재 루트(RamFS) 우선 탐색 후, 자동 마운트 경로(/mnt)를 fallback으로 탐색
-    let init_candidates: [&str; 9] = [
-        "/sbin/init",
-        "/etc/init",
-        "/bin/init",
-        "/bin/sh",
+    const ROOT_INIT_CANDIDATES: [&str; 4] = ["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
+    const MNT_INIT_CANDIDATES: [&str; 5] = [
         "/mnt/init",
         "/mnt/bin/init",
         "/mnt/bin/sh",
@@ -412,17 +460,31 @@ fn try_launch_init_process() -> bool {
         "/mnt/etc/init",
     ];
 
-    for path in init_candidates {
+    let try_candidate = |path: &str| -> bool {
         kprintln!("[init] trying PID1 candidate '{}'", path);
         let argv = alloc::vec![String::from(path)];
         match proc::user::spawn_init_process(path, &argv, &envp) {
             Ok(tid) => {
                 kprintln!("[init] launched PID1 candidate '{}' (tid={})", path, tid);
-                return true;
+                true
             }
-            Err(proc::user::ExecError::NotFound) => {}
+            Err(proc::user::ExecError::NotFound) => false,
             Err(err) => {
                 kprintln!("[init] failed to start '{}': {:?}", path, err);
+                false
+            }
+        }
+    };
+
+    for path in ROOT_INIT_CANDIDATES {
+        if try_candidate(path) {
+            return true;
+        }
+    }
+    if include_mnt_fallback {
+        for path in MNT_INIT_CANDIDATES {
+            if try_candidate(path) {
+                return true;
             }
         }
     }

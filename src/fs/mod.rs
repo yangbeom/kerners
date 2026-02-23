@@ -337,17 +337,29 @@ static ROOT_FS: RwLock<Option<Arc<dyn FileSystem>>> = RwLock::new(None);
 
 /// 루트 파일시스템 설정
 pub fn set_root_fs(fs: Arc<dyn FileSystem>) {
-    let mut root = ROOT_FS.write();
-    *root = Some(fs.clone());
-
-    // 마운트 테이블에도 추가
     let mut mounts = MOUNT_TABLE.write();
+    let had_root = mounts.iter().any(|m| m.path == "/");
+    mounts.retain(|m| m.path != "/");
     mounts.push(MountPoint {
         path: String::from("/"),
-        fs,
+        fs: fs.clone(),
     });
+    // 경로 길이로 정렬 (긴 경로가 먼저 매칭되도록)
+    mounts.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
 
-    crate::kprintln!("[vfs] Root filesystem mounted");
+    let mut root = ROOT_FS.write();
+    *root = Some(fs);
+
+    if had_root {
+        crate::kprintln!("[vfs] Root filesystem switched");
+    } else {
+        crate::kprintln!("[vfs] Root filesystem mounted");
+    }
+}
+
+/// 루트 파일시스템 교체 (switch_root)
+pub fn switch_root_fs(fs: Arc<dyn FileSystem>) {
+    set_root_fs(fs);
 }
 
 /// 루트 파일시스템 가져오기
