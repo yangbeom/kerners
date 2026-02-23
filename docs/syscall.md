@@ -71,7 +71,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 |---------|------|----------|------|
 | `sys_dup` | 23 | `dup(oldfd) -> newfd` | baseline FD 복제 |
 | `sys_dup3` | 24 | `dup3(oldfd, newfd, flags)` | baseline (`O_CLOEXEC` no-op) |
-| `sys_fcntl` | 25 | `fcntl(fd, cmd, arg)` | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
+| `sys_fcntl` | 25 | `fcntl(fd, cmd, arg)` | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`; `F_DUPFD*`는 `arg` 이상 최소 빈 FD 선택) |
 | `sys_ioctl` | 29 | `ioctl(fd, req, arg)` | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
 | `sys_statfs` | 43 | `statfs(path, buf)` | 마운트 기준 파일시스템 통계 조회 |
 | `sys_faccessat` | 48 | `faccessat(dirfd, path, mode, flags)` | baseline 경로 존재 확인 |
@@ -96,6 +96,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 - `getcwd`는 NUL 종료 문자열 길이를 반환하며, 버퍼 부족 시 `ERANGE`를 반환합니다.
 - `readlinkat`는 baseline에서 `dirfd`를 무시하고 경로 기반으로 동작합니다.
 - `pipe2`는 ring buffer 기반 baseline 구현이며, 블로킹/`PIPE_BUF` 원자성은 아직 범위 밖입니다.
+- `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)`는 Linux와 동일하게 `arg` 이상 첫 빈 FD로 복제합니다 (`F_DUPFD_CLOEXEC`의 close-on-exec 비트 자체는 아직 no-op).
 
 ## 파일 구조
 
@@ -149,6 +150,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
 | `ENOTDIR` | -20 | 디렉토리가 아님 |
 | `EISDIR` | -21 | 디렉토리임 |
 | `EINVAL` | -22 | 잘못된 인자 |
+| `EMFILE` | -24 | 프로세스 FD 한도 초과 |
 | `ENOTTY` | -25 | TTY가 아닌 디바이스 |
 | `ERANGE` | -34 | 버퍼 크기 부족 |
 | `EAFNOSUPPORT` | -97 | 지원하지 않는 주소 체계 |

@@ -550,6 +550,7 @@ pub mod errno {
     pub const ENOTDIR: isize = -20;
     pub const EISDIR: isize = -21;
     pub const EINVAL: isize = -22;
+    pub const EMFILE: isize = -24;
     pub const ENOTTY: isize = -25;
     pub const ERANGE: isize = -34;
     pub const EAFNOSUPPORT: isize = -97;

@@ -652,7 +652,7 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         sid: tid,
         vm_group: default_group,
         fs_group: default_group,
-        files_group: default_group,
+        files_group: 0,
         umask: DEFAULT_UMASK,
         sighand_group: default_group,
         signal_mask: 0,
@@ -688,6 +688,16 @@ fn vm_group_for_tid(tid: proc::Tid) -> u64 {
 
 fn current_vm_group() -> u64 {
     vm_group_for_tid(current_tid_or_zero())
+}
+
+fn files_group_for_tid(tid: proc::Tid) -> u64 {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].files_group
+}
+
+pub fn current_files_group() -> u64 {
+    files_group_for_tid(current_tid_or_zero())
 }
 
 /// tid에 해당하는 프로세스 상태 스냅샷을 반환한다.
@@ -2907,7 +2917,7 @@ pub fn sys_clone(
     let child_tid = NEXT_FAKE_CHILD_TID.fetch_add(1, Ordering::SeqCst) as isize;
     let child_tid_u64 = child_tid as proc::Tid;
     let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
-    {
+    let (parent_files_group, child_files_group) = {
         let mut processes = PROCESS_INFOS.lock();
         let parent_idx = ensure_process_info_for_tid_locked(&mut processes, parent_tid);
 
@@ -2955,6 +2965,15 @@ pub fn sys_clone(
             exit_signal,
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
+        (parent_files_group, child_files_group)
+    };
+
+    if parent_files_group != child_files_group {
+        match fd::clone_fd_table_group(parent_files_group, child_files_group) {
+            Ok(()) => {}
+            Err(fs::VfsError::NoSpace) => return errno::EMFILE,
+            Err(_) => return errno::EIO,
+        }
     }
 
     ZOMBIE_CHILDREN.lock().push(ZombieChild {
@@ -3007,7 +3026,7 @@ fn finalize_clone_with_vm_setup(
     child_tid_ptr: *mut u8,
 ) -> isize {
     let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
-    let (parent_vm_group, child_vm_group) = {
+    let (parent_vm_group, child_vm_group, parent_files_group, child_files_group) = {
         let mut processes = PROCESS_INFOS.lock();
         let parent_idx = ensure_process_info_for_tid_locked(&mut processes, parent_tid);
         let parent_pgid = processes[parent_idx].pgid;
@@ -3055,8 +3074,21 @@ fn finalize_clone_with_vm_setup(
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
 
-        (parent_vm_group, child_vm_group)
+        (
+            parent_vm_group,
+            child_vm_group,
+            parent_files_group,
+            child_files_group,
+        )
     };
+
+    if parent_files_group != child_files_group {
+        match fd::clone_fd_table_group(parent_files_group, child_files_group) {
+            Ok(()) => {}
+            Err(fs::VfsError::NoSpace) => return errno::EMFILE,
+            Err(_) => return errno::EIO,
+        }
+    }
 
     if flags & CLONE_VM != 0 {
         let root = vm_root_for_group(parent_vm_group);
@@ -3992,8 +4024,12 @@ pub fn sys_mmap(
                 return errno::EINVAL;
             }
 
-            let table = match fd::kernel_fd_table() {
+            let table = match fd::fd_table_for_group(current_files_group()) {
                 Ok(table) => table,
+                Err(fs::VfsError::NotFound) => match fd::fd_table_for_group(0) {
+                    Ok(table) => table,
+                    Err(_) => return errno::EBADF,
+                },
                 Err(_) => return errno::EBADF,
             };
             let file = match table.get(fd as i32) {

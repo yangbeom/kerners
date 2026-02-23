@@ -33,6 +33,15 @@ fn vfs_error_to_errno(e: VfsError) -> isize {
 const MAX_PATH_LEN: usize = 4096;
 static CURRENT_CWD: Mutex<Option<String>> = Mutex::new(None);
 
+fn current_fd_table() -> Result<Arc<fd::FdTable>, VfsError> {
+    let files_group = super::process::current_files_group();
+    match fd::fd_table_for_group(files_group) {
+        Ok(table) => Ok(table),
+        Err(VfsError::NotFound) => fd::fd_table_for_group(0),
+        Err(e) => Err(e),
+    }
+}
+
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
@@ -299,7 +308,7 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> isize {
     }
 
     // VFS가 초기화되었으면 FD 테이블 사용
-    if let Ok(fd_table) = fd::kernel_fd_table() {
+    if let Ok(fd_table) = current_fd_table() {
         if let Ok(file) = fd_table.get(fd as i32) {
             let slice = unsafe { core::slice::from_raw_parts(buf, count) };
             match file.write(slice) {
@@ -399,7 +408,7 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> isize {
     }
 
     // VFS가 초기화되었으면 FD 테이블 사용
-    if let Ok(fd_table) = fd::kernel_fd_table() {
+    if let Ok(fd_table) = current_fd_table() {
         if let Ok(file) = fd_table.get(fd as i32) {
             let slice = unsafe { core::slice::from_raw_parts_mut(buf, count) };
             match file.read(slice) {
@@ -444,7 +453,7 @@ pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> 
         return 0;
     }
 
-    let table = match fd::kernel_fd_table() {
+    let table = match current_fd_table() {
         Ok(t) => t,
         Err(e) => return vfs_error_to_errno(e),
     };
@@ -605,7 +614,7 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> isize {
     }
 
     // FD 테이블에 추가
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => {
             match table.insert(alloc::sync::Arc::new(open_file)) {
                 Ok(fd) => fd as isize,
@@ -618,7 +627,7 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> isize {
 
 /// sys_close - 파일 닫기
 pub fn sys_close(fd: i32) -> isize {
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => {
             match table.close(fd) {
                 Ok(()) => 0,
@@ -643,7 +652,7 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> isize {
         _ => return errno::EINVAL,
     };
 
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => {
             match table.get(fd) {
                 Ok(file) => {
@@ -752,7 +761,7 @@ pub fn sys_newfstatat(_dirfd: i32, path: *const u8, stat_buf: *mut u8, _flags: u
 
 /// sys_dup - 파일 디스크립터 복제
 pub fn sys_dup(old_fd: i32) -> isize {
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => match table.dup(old_fd) {
             Ok(new_fd) => new_fd as isize,
             Err(VfsError::InvalidArgument) => errno::EBADF,
@@ -772,7 +781,7 @@ pub fn sys_dup3(old_fd: i32, new_fd: i32, flags: u32) -> isize {
         return errno::EINVAL;
     }
 
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => match table.dup2(old_fd, new_fd) {
             Ok(fd) => fd as isize,
             Err(VfsError::InvalidArgument) => errno::EBADF,
@@ -784,22 +793,25 @@ pub fn sys_dup3(old_fd: i32, new_fd: i32, flags: u32) -> isize {
 
 /// sys_fcntl - 파일 디스크립터 제어
 pub fn sys_fcntl(fd_num: i32, cmd: i32, arg: usize) -> isize {
-    let table = match fd::kernel_fd_table() {
+    let table = match current_fd_table() {
         Ok(t) => t,
         Err(e) => return vfs_error_to_errno(e),
     };
 
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            if arg == 0 {
-                sys_dup(fd_num)
-            } else {
-                // baseline: 최소 fd 요구는 정확히 만족하지 못하며, arg 위치로 복제한다.
-                match table.dup2(fd_num, arg as i32) {
-                    Ok(fd) => fd as isize,
-                    Err(VfsError::InvalidArgument) => errno::EBADF,
-                    Err(e) => vfs_error_to_errno(e),
-                }
+            if table.get(fd_num).is_err() {
+                return errno::EBADF;
+            }
+            if arg > i32::MAX as usize {
+                return errno::EINVAL;
+            }
+
+            match table.dup_from_min(fd_num, arg as i32) {
+                Ok(fd) => fd as isize,
+                Err(VfsError::InvalidArgument) => errno::EINVAL,
+                Err(VfsError::NoSpace) => errno::EMFILE,
+                Err(e) => vfs_error_to_errno(e),
             }
         }
         F_GETFD => {
@@ -835,7 +847,7 @@ pub fn sys_fcntl(fd_num: i32, cmd: i32, arg: usize) -> isize {
 ///
 /// 10-1C baseline: BusyBox init에 필요한 TTY 요청만 최소 지원한다.
 pub fn sys_ioctl(fd_num: i32, request: usize, argp: usize) -> isize {
-    let table = match fd::kernel_fd_table() {
+    let table = match current_fd_table() {
         Ok(t) => t,
         Err(e) => return vfs_error_to_errno(e),
     };
@@ -887,7 +899,7 @@ pub fn sys_ioctl(fd_num: i32, request: usize, argp: usize) -> isize {
 
 /// sys_fstat - 파일 상태 조회
 pub fn sys_fstat(fd: i32, stat_buf: *mut u8) -> isize {
-    match fd::kernel_fd_table() {
+    match current_fd_table() {
         Ok(table) => {
             match table.get(fd) {
                 Ok(file) => {
@@ -912,7 +924,7 @@ pub fn sys_getdents64(fd_num: i32, dirp: *mut u8, count: usize) -> isize {
         return errno::EINVAL;
     }
 
-    let table = match fd::kernel_fd_table() {
+    let table = match current_fd_table() {
         Ok(t) => t,
         Err(e) => return vfs_error_to_errno(e),
     };
@@ -989,7 +1001,7 @@ pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> isize {
         return errno::EINVAL;
     }
 
-    let table = match fd::kernel_fd_table() {
+    let table = match current_fd_table() {
         Ok(t) => t,
         Err(e) => return vfs_error_to_errno(e),
     };
@@ -1149,7 +1161,7 @@ pub fn sys_ppoll(
     let pollfds = fds as *mut LinuxPollFd;
 
     loop {
-        let table = match fd::kernel_fd_table() {
+        let table = match current_fd_table() {
             Ok(t) => t,
             Err(_) => return errno::EIO,
         };

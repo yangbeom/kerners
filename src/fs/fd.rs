@@ -2,7 +2,6 @@
 //!
 //! 프로세스별 파일 디스크립터 테이블
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -255,6 +254,34 @@ impl FdTable {
         self.insert(file)
     }
 
+    /// 최소 FD 이상에서 첫 빈 슬롯으로 복제 (fcntl F_DUPFD semantics)
+    pub fn dup_from_min(&self, old_fd: i32, min_fd: i32) -> VfsResult<i32> {
+        if old_fd < 0 || min_fd < 0 || min_fd as usize >= self.max_fds {
+            return Err(VfsError::InvalidArgument);
+        }
+
+        let mut files = self.files.write();
+        let file = files
+            .get(old_fd as usize)
+            .and_then(|slot| slot.clone())
+            .ok_or(VfsError::InvalidArgument)?;
+
+        for idx in min_fd as usize..self.max_fds {
+            if idx < files.len() {
+                if files[idx].is_none() {
+                    files[idx] = Some(file.clone());
+                    return Ok(idx as i32);
+                }
+            } else {
+                files.resize(idx + 1, None);
+                files[idx] = Some(file.clone());
+                return Ok(idx as i32);
+            }
+        }
+
+        Err(VfsError::NoSpace)
+    }
+
     /// FD를 특정 번호로 복제 (dup2)
     pub fn dup2(&self, old_fd: i32, new_fd: i32) -> VfsResult<i32> {
         if new_fd < 0 || new_fd as usize >= self.max_fds {
@@ -287,6 +314,15 @@ impl FdTable {
         let mut files = self.files.write();
         files.clear();
     }
+
+    /// 현재 FD 상태를 복제한 새 테이블 생성
+    pub fn clone_table(&self) -> Self {
+        let files = self.files.read();
+        Self {
+            files: RwLock::new(files.clone()),
+            max_fds: self.max_fds,
+        }
+    }
 }
 
 impl Default for FdTable {
@@ -295,23 +331,44 @@ impl Default for FdTable {
     }
 }
 
-/// 커널 전역 FD 테이블 (단일 프로세스 환경용)
-static KERNEL_FD_TABLE: RwLock<Option<FdTable>> = RwLock::new(None);
+/// 파일 그룹별 FD 테이블
+static KERNEL_FD_TABLES: RwLock<Vec<(u64, Arc<FdTable>)>> = RwLock::new(Vec::new());
 
 /// 커널 FD 테이블 초기화
 pub fn init_kernel_fd_table(console: Arc<dyn VNode>) {
-    let mut table = KERNEL_FD_TABLE.write();
-    *table = Some(FdTable::with_stdio(console));
+    let mut tables = KERNEL_FD_TABLES.write();
+    tables.clear();
+    tables.push((0, Arc::new(FdTable::with_stdio(console))));
 }
 
-/// 커널 FD 테이블 가져오기
-pub fn kernel_fd_table() -> VfsResult<&'static FdTable> {
-    // Safety: 초기화 후에는 변경되지 않음
-    let table = KERNEL_FD_TABLE.read();
-    if table.is_some() {
-        // 참조 유지를 위해 unsafe 사용
-        Ok(unsafe { &*(table.as_ref().unwrap() as *const FdTable) })
-    } else {
-        Err(VfsError::NotFound)
+/// 파일 그룹의 FD 테이블 가져오기
+pub fn fd_table_for_group(group_id: u64) -> VfsResult<Arc<FdTable>> {
+    let tables = KERNEL_FD_TABLES.read();
+    tables
+        .iter()
+        .find(|(id, _)| *id == group_id)
+        .map(|(_, table)| table.clone())
+        .ok_or(VfsError::NotFound)
+}
+
+/// 부모 파일 그룹 FD 테이블을 자식 파일 그룹으로 복제한다.
+pub fn clone_fd_table_group(parent_group_id: u64, child_group_id: u64) -> VfsResult<()> {
+    if parent_group_id == child_group_id {
+        return Ok(());
     }
+
+    let mut tables = KERNEL_FD_TABLES.write();
+
+    if tables.iter().any(|(id, _)| *id == child_group_id) {
+        return Ok(());
+    }
+
+    let parent = tables
+        .iter()
+        .find(|(id, _)| *id == parent_group_id)
+        .map(|(_, table)| table.clone())
+        .ok_or(VfsError::NotFound)?;
+
+    tables.push((child_group_id, Arc::new(parent.clone_table())));
+    Ok(())
 }
