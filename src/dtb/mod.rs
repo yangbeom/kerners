@@ -743,6 +743,76 @@ impl DeviceTree {
         }
     }
 
+    /// `/chosen/bootargs` 문자열 반환
+    pub fn get_chosen_bootargs(&self) -> Option<&str> {
+        unsafe { self.scan_chosen_bootargs() }
+    }
+
+    /// `/chosen/bootargs` 속성 스캔
+    unsafe fn scan_chosen_bootargs(&self) -> Option<&str> {
+        unsafe {
+            let struct_base = self.struct_base();
+            let mut offset = 0usize;
+            let mut depth = 0i32;
+            let mut chosen_depth: Option<i32> = None;
+
+            loop {
+                let token_ptr = (struct_base + offset) as *const u32;
+                let token = u32::from_be(token_ptr.read_volatile());
+                offset += 4;
+
+                match token {
+                    FDT_BEGIN_NODE => {
+                        let name_ptr = (struct_base + offset) as *const u8;
+                        let name = self.read_cstring(name_ptr);
+                        let name_len = name.len() + 1;
+                        offset = Self::align4(offset + name_len);
+
+                        depth += 1;
+                        if depth == 2 && name == "chosen" {
+                            chosen_depth = Some(depth);
+                        }
+                    }
+                    FDT_END_NODE => {
+                        if chosen_depth == Some(depth) {
+                            chosen_depth = None;
+                        }
+                        depth -= 1;
+                    }
+                    FDT_PROP => {
+                        let len =
+                            u32::from_be(((struct_base + offset) as *const u32).read_volatile());
+                        offset += 4;
+                        let nameoff =
+                            u32::from_be(((struct_base + offset) as *const u32).read_volatile());
+                        offset += 4;
+
+                        let prop_name = self.get_string(nameoff);
+                        let prop_data = (struct_base + offset) as *const u8;
+
+                        if chosen_depth == Some(depth) && prop_name == "bootargs" {
+                            let raw =
+                                core::slice::from_raw_parts(prop_data, len as usize);
+                            let end = raw
+                                .iter()
+                                .position(|b| *b == 0)
+                                .unwrap_or(raw.len());
+                            if let Ok(s) = core::str::from_utf8(&raw[..end]) {
+                                return Some(s);
+                            }
+                            return None;
+                        }
+
+                        offset = Self::align4(offset + len as usize);
+                    }
+                    FDT_NOP => {}
+                    FDT_END => return None,
+                    _ => return None,
+                }
+            }
+        }
+    }
+
     /// 루트 노드의 compatible 속성 읽기
     ///
     /// 보드 식별에 사용됩니다. 예: ["linux,dummy-virt", "qemu,virt"]
@@ -951,4 +1021,9 @@ pub fn get() -> Option<&'static DeviceTree> {
 /// 전역 DTB blob 범위 반환 (base, size)
 pub fn blob_range() -> Option<(usize, usize)> {
     get().map(|dt| dt.blob_range())
+}
+
+/// `/chosen/bootargs` 문자열 반환
+pub fn chosen_bootargs() -> Option<&'static str> {
+    get().and_then(|dt| dt.get_chosen_bootargs())
 }

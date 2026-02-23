@@ -209,6 +209,8 @@ fn aarch64_start(dtb_addr: usize) -> ! {
         }
     };
 
+    log_bootargs();
+
     // 메모리 관리 시스템 초기화
     kprintln!("");
     match mm::init(ram_base, ram_size) {
@@ -309,6 +311,39 @@ fn aarch64_start(dtb_addr: usize) -> ! {
     kprintln!("\n[boot] Initialization complete!");
 
     loop {}
+}
+
+#[cfg(not(feature = "test_runner"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootFsPolicy {
+    Ramfs,
+    Fat32,
+}
+
+fn log_bootargs() {
+    if let Some(bootargs) = dtb::chosen_bootargs() {
+        if !bootargs.is_empty() {
+            kprintln!("[boot] DTB bootargs: {}", bootargs);
+        }
+    }
+}
+
+#[cfg(not(feature = "test_runner"))]
+fn rootfs_policy_from_bootargs() -> RootFsPolicy {
+    let Some(bootargs) = dtb::chosen_bootargs() else {
+        return RootFsPolicy::Ramfs;
+    };
+
+    for token in bootargs.split_ascii_whitespace() {
+        if token == "kerners.root=fat32" || token == "kerners.switch_root=fat32" {
+            return RootFsPolicy::Fat32;
+        }
+        if token == "kerners.root=ramfs" || token == "kerners.switch_root=ramfs" {
+            return RootFsPolicy::Ramfs;
+        }
+    }
+
+    RootFsPolicy::Ramfs
 }
 
 #[cfg(not(feature = "test_runner"))]
@@ -1367,6 +1402,8 @@ fn riscv64_start(dtb_addr: usize) -> ! {
             }
         }
     };
+
+    log_bootargs();
 
     // 메모리 관리 초기화
     kprintln!("");
