@@ -505,7 +505,7 @@
 - [x] 2026-02-19 회귀: `make test-all` (`aarch64`/`riscv64`) PASS 유지
 - [x] 기반 구현 완료: `ET_DYN` load bias, `PT_INTERP` 체인, `PATH` 탐색, shebang, auxv(`AT_PHENT`/`AT_BASE`)
 - [x] 15-1 외부 Linux static ELF end-to-end 수용 테스트 완료 (2026-02-21, `aarch64`/`riscv64`)
-- [ ] 잔여 검증: 15-2 static ELF 기반 유저 공간 시나리오 + 15-3 동적 ELF 런타임 링크
+- [ ] 잔여 검증: 15-2 잔여(`/bin/ps` 포함 full 시나리오, PID1 종료 원인) + 15-3 동적 ELF 런타임 링크
 
 #### 15-1. 외부 Linux static ELF bring-up (필수 1단계)
 - [x] 상태 메모: 외부 static ELF 실물 검증 완료. 검증 로그: `logs/phase15-1-aarch64-20260221-101515.log`, `logs/phase15-1-riscv64-20260221-101556.log`
@@ -516,12 +516,16 @@
 - [x] 수용 기준: 양 아키텍처에서 외부 static ELF 실행 + 정상 종료코드/출력 확인, 커널 panic 없음
 
 #### 15-2. static ELF 기반 유저 공간 최소 운영 (필수 2단계)
-- [ ] 상태 메모: PATH/shebang은 완료, 실제 `/bin/sh` 기반 사용자 명령 시나리오 검증이 남아 있음
+- [ ] 상태 메모: PATH/shebang은 완료, `switch_root=fat32` rcS smoke는 통과했으나 full 시나리오 검증이 남아 있음
 - [x] PATH 탐색 최소 구현 (`/bin:/sbin:/usr/bin:/usr/sbin`)
 - [x] Shebang (`#!`) 1차 지원 (인터프리터 경로 + 인자 전달, 최대 depth 제한 포함)
-- [ ] `/bin/sh` baseline 동작 (파이프/리다이렉션은 현재 syscall 범위 내 최소 동작)
-- [ ] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm`
+- [x] syscall user-copy 공통 계층화: `src/syscall/uaccess.rs` 도입 + `src/syscall/fs.rs`/`src/syscall/process.rs` 사용자 포인터 접근 전면 전환
+- [x] riscv64 user access 안정화: 접근 단위 `mstatus(MPRV+SUM+MPP=S)` 토글로 redirection 경로 `Bad file descriptor` 반복 재현 차단
+- [x] 2026-02-24 `switch_root=fat32` rcS smoke(`PH15_2_BEGIN -> cat /t15.txt -> mkdir / -> PH15_2_END`) 양 아키텍처 PASS (`logs/phase15-2-final-aarch64-20260224-070939.log`, `logs/phase15-2-final-riscv64-20260224-070939.log`)
+- [x] `/bin/sh` non-interactive baseline 동작: rcS 경로에서 `cat`, `mkdir` 자식 `execve` 연쇄 완료 확인
+- [ ] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm` (현재 `cat`/`mkdir` 검증 완료)
 - [ ] `/bin/ps` — procfs 기반 프로세스 목록 조회
+- [ ] 후속 안정화: rcS 완료 이후 `tid=1` 종료(SIGSEGV) 원인 분석/수정
 - [ ] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)

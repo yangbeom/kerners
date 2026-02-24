@@ -105,6 +105,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `mod.rs` | syscall 번호 상수, 디스패처, errno 모듈 |
 | `fs.rs` | 파일시스템 관련 syscall 구현 (VFS 연동) |
 | `process.rs` | 프로세스 관련 syscall 구현 (`execve` 전이 큐 포함) |
+| `uaccess.rs` | 사용자 포인터 접근 헬퍼 (범위 검증, copy, riscv64 access-mode 전환) |
 
 ## 테스트 전용 헬퍼 (non-Linux syscall ABI)
 
@@ -157,6 +158,18 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
 | `ENOSYS` | -38 | 미구현 syscall |
 
 VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
+
+## 유저 포인터 접근 (`uaccess`)
+
+- 사용자 메모리 접근은 `src/syscall/uaccess.rs`로 통일되어 있습니다.
+- 공통 helper:
+  - `read_unaligned` / `write_unaligned`
+  - `read_byte` / `write_byte`
+  - `copy_from_user` / `copy_to_user`
+  - `read_c_string`
+- 모든 helper는 사용자 VA 범위 + 길이 오버플로를 먼저 검증하고, 실패 시 `EFAULT`를 반환합니다.
+- `riscv64`에서는 접근 단위로 `mstatus`를 `MPRV+SUM+MPP=S`로 임시 전환 후 즉시 복원합니다. 이 방식으로 syscall 중 `yield/schedule` 이후에도 사용자 포인터 접근 일관성을 유지합니다.
+- `fs.rs`/`process.rs`의 주요 사용자 버퍼 경로(`read/write`, `getdents64`, `pipe2`, `wait4/waitid`, `sigaction` 등)가 동일 정책을 따릅니다.
 
 ## `execve` 동작과 제약
 

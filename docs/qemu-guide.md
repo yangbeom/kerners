@@ -66,6 +66,41 @@ make busybox-smoke ARCH=aarch64 BUSYBOX=/absolute/path/to/busybox
 
 `BUSYBOX_SMOKE_REQUIRE_COW=1`을 지정하면 `COW_FORK_TEST: PASS` 마커를 필수로 검사합니다.
 
+### Phase 15-2 rcS 스모크 (`switch_root=fat32`)
+
+아래 시나리오는 15-2 최소 경로(`cat` + `mkdir`)를 양 아키텍처에서 재현합니다.
+
+```bash
+ARCH=aarch64
+BUSYBOX=target/user/${ARCH}/busybox
+DISK=logs/phase15-2-${ARCH}.img
+
+./scripts/prepare_user_disk.sh "$ARCH" "$BUSYBOX" "$DISK"
+mmd -i "$DISK" ::/etc/init.d
+
+cat >/tmp/rcS <<'EOF'
+#!/bin/sh
+echo PH15_2_BEGIN
+cat /t15.txt
+mkdir /
+echo PH15_2_END
+EOF
+printf 'hello_phase15\n' >/tmp/t15.txt
+
+mcopy -o -i "$DISK" /tmp/rcS ::/etc/init.d/rcS
+mcopy -o -i "$DISK" /tmp/t15.txt ::/t15.txt
+
+KERNERS_DISK_IMG="$DISK" \
+KERNERS_BOOTARGS="kerners.root=fat32" \
+./run.sh "$ARCH" 512 1
+```
+
+기대 로그 마커:
+- `PH15_2_BEGIN`
+- `hello_phase15`
+- `PH15_2_END`
+- `Kernel panic`, `Bad file descriptor` 미발생
+
 ## 수동 실행 방법
 
 ### 1. 빌드
