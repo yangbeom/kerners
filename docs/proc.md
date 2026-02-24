@@ -203,6 +203,9 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
   인터프리터 엔트리로 진입합니다.
 - shebang(`#!`) 스크립트 실행 시 인터프리터 + 스크립트 경로로 argv를 재구성합니다.
 - ELF `PT_LOAD` 세그먼트의 가상주소가 현재 identity-mapped RAM 범위를 벗어나면 exec 준비가 실패합니다.
+- `vfork(CLONE_VM)`처럼 현재 vm_group을 다른 태스크와 공유 중일 때는 `execve` 진입 시
+  커널 root table 기반으로 루트 테이블을 분리(clone)한 뒤 로딩하고, 성공 시 새 vm_group으로 전환합니다.
+  이 경로로 PID1/자식 간 주소공간 오염으로 인한 stack protector(SIGSEGV) 종료를 방지합니다.
 
 ### fork/vfork/wait 최소 동작
 

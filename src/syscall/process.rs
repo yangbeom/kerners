@@ -4431,6 +4431,13 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// * `argv` - 인자 배열 (`char**`, 마지막은 NULL)
 /// * `envp` - 환경변수 배열 (`char**`, 마지막은 NULL)
 pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> isize {
+    let tid = match proc::current_tid() {
+        Some(t) => t,
+        None => return errno::EPERM,
+    };
+    ensure_process_info_for_tid(tid);
+    reset_sigaltstack_for_tid(tid);
+
     let path_str = match read_user_c_string(path, MAX_EXEC_PATH_LEN) {
         Ok(s) => s,
         Err(e) => return e,
@@ -4456,17 +4463,63 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         return errno::E2BIG;
     }
 
+    let vm_group_before_exec = vm_group_for_tid(tid);
+    flush_shared_writeback_for_vm_group(vm_group_before_exec);
+
+    let mut exec_vm_isolation: Option<(usize, usize, u64)> = None;
+    if process_count_in_vm_group(vm_group_before_exec) > 1 {
+        let old_root = proc::current_user_root_table()
+            .unwrap_or(crate::arch::mmu::current_root_table());
+        let kernel_root = crate::arch::mmu::kernel_root_table();
+        let isolated_root = match crate::arch::mmu::clone_root_table(kernel_root) {
+            Ok(root) => root,
+            Err(_) => return errno::ENOMEM,
+        };
+
+        if crate::arch::mmu::switch_root_table(isolated_root).is_err() {
+            return errno::EIO;
+        }
+        if !proc::set_thread_user_root_table(tid, isolated_root) {
+            let _ = crate::arch::mmu::switch_root_table(old_root);
+            return errno::EPERM;
+        }
+
+        exec_vm_isolation = Some((old_root, isolated_root, vm_group_before_exec));
+    }
+
     let image = match proc::user::prepare_exec_image(&path_str, &argv_list, &envp_list) {
         Ok(img) => img,
-        Err(e) => return exec_error_to_errno(e),
+        Err(e) => {
+            if let Some((old_root, _, _)) = exec_vm_isolation {
+                if crate::arch::mmu::switch_root_table(old_root).is_err() {
+                    return errno::EIO;
+                }
+                if !proc::set_thread_user_root_table(tid, old_root) {
+                    return errno::EPERM;
+                }
+            }
+            return exec_error_to_errno(e);
+        }
     };
 
-    let tid = match proc::current_tid() {
-        Some(t) => t,
-        None => return errno::EPERM,
-    };
-    ensure_process_info_for_tid(tid);
-    reset_sigaltstack_for_tid(tid);
+    if let Some((_, isolated_root, old_vm_group)) = exec_vm_isolation {
+        let new_vm_group = next_resource_group_id();
+        {
+            let mut processes = PROCESS_INFOS.lock();
+            let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+            processes[idx].vm_group = new_vm_group;
+        }
+        set_vm_root_for_group(new_vm_group, isolated_root);
+        if !proc::set_thread_user_root_table(tid, isolated_root) {
+            return errno::EPERM;
+        }
+        kprintln!(
+            "[exec] vm isolation applied: tid={} vm_group {} -> {}",
+            tid,
+            old_vm_group,
+            new_vm_group
+        );
+    }
 
     {
         let mut pending = PENDING_EXECS.lock();
@@ -4482,8 +4535,6 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         path_str,
         argv_list.len()
     );
-
-    flush_shared_writeback_for_vm_group(current_vm_group());
 
     // vfork 부모는 자식이 execve/exit 시점에 해제된다.
     complete_vfork_wait(tid);

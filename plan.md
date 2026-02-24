@@ -517,7 +517,7 @@
 - [x] 수용 기준: 양 아키텍처에서 외부 static ELF 실행 + 정상 종료코드/출력 확인, 커널 panic 없음
 
 #### 15-2. static ELF 기반 유저 공간 최소 운영 (필수 2단계)
-- [ ] 상태 메모: PATH/shebang + full rcS smoke는 통과했으나 `tid=1` SIGSEGV 후속 안정화가 남아 있음
+- [x] 상태 메모: PATH/shebang + full rcS smoke + `vfork+execve` 격리 안정화 완료 (`tid=1` SIGSEGV 해소)
 - [x] PATH 탐색 최소 구현 (`/bin:/sbin:/usr/bin:/usr/sbin`)
 - [x] Shebang (`#!`) 1차 지원 (인터프리터 경로 + 인자 전달, 최대 depth 제한 포함)
 - [x] syscall user-copy 공통 계층화: `src/syscall/uaccess.rs` 도입 + `src/syscall/fs.rs`/`src/syscall/process.rs` 사용자 포인터 접근 전면 전환
@@ -527,8 +527,9 @@
 - [x] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm` (rcS full smoke 검증)
 - [x] `/bin/ps` — procfs 기반 프로세스 목록 조회 (`sysinfo(179)` baseline 구현 포함)
 - [x] 2026-02-24 full rcS smoke(`ls/cat/mkdir/redirection/rm/rmdir/head/ps`) 양 아키텍처 PASS (`logs/phase15-2-full-rc-fix-aarch64-20260224-191936.log`, `logs/phase15-2-full-rc-fix-riscv64-20260224-191936.log`)
-- [ ] 후속 안정화: rcS 완료 이후 `tid=1` 종료(SIGSEGV) 원인 분석/수정
-- [ ] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
+- [x] 후속 안정화: `vfork(CLONE_VM)` 자식의 `execve` 시 공유 vm_group 격리(root clone + vm_group 분리) 적용으로 PID1 stack protector SIGSEGV 제거
+- [x] 2026-02-24 full rcS 재검증 PASS (`logs/phase15-2-full-vforkfix-aarch64-20260224-194133.log`, `logs/phase15-2-full-vforkfix-riscv64-20260224-194133.log`) — `PH15_2_RC_END` 확인, `tid=1 terminating by SIGSEGV` 미발생
+- [x] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)
 - [ ] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
