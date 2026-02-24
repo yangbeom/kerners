@@ -132,6 +132,9 @@ pub const SYS_GETEGID: usize = 177;
 /// gettid() -> pid_t
 pub const SYS_GETTID: usize = 178;
 
+/// sysinfo(info) -> int
+pub const SYS_SYSINFO: usize = 179;
+
 /// execve(path, argv, envp) -> int
 pub const SYS_EXECVE: usize = 221;
 
@@ -301,6 +304,7 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         SYS_GETGID => process::sys_getgid(),
         SYS_GETEGID => process::sys_getegid(),
         SYS_GETTID => process::sys_gettid(),
+        SYS_SYSINFO => process::sys_sysinfo(args[0] as *mut u8),
         SYS_SET_TID_ADDRESS => process::sys_set_tid_address(args[0] as *mut i32),
         SYS_NANOSLEEP => process::sys_nanosleep(args[0] as *const u8, args[1] as *mut u8),
         SYS_SIGALTSTACK => process::sys_sigaltstack(args[0] as *const u8, args[1] as *mut u8),
@@ -375,8 +379,8 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
             fs::sys_mkdir(args[1] as *const u8, args[2] as u32)
         }
         SYS_UNLINKAT => {
-            // unlinkat(dirfd, path, flags) - dirfd, flags 무시
-            fs::sys_unlink(args[1] as *const u8)
+            // unlinkat(dirfd, path, flags) - dirfd 무시, AT_REMOVEDIR 처리
+            fs::sys_unlinkat(args[1] as *const u8, args[2] as u32)
         }
         _ => {
             kprintln!(

@@ -41,6 +41,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_getuid`/`sys_geteuid` | 174/175 | `getuid()/geteuid()` | baseline: 0(root) 반환 |
 | `sys_getgid`/`sys_getegid` | 176/177 | `getgid()/getegid()` | baseline: 0(root) 반환 |
 | `sys_gettid` | 178 | `gettid() -> tid` | 현재 스레드 ID 조회 |
+| `sys_sysinfo` | 179 | `sysinfo(info)` | uptime + 메모리/프로세스 수 baseline (`mem_unit=1`) |
 | `sys_set_tid_address` | 96 | `set_tid_address(ptr)` | baseline: tid 반환, clear_child_tid 미구현 |
 | `sys_clock_gettime` | 113 | `clock_gettime(clockid, tp)` | `CLOCK_MONOTONIC/CLOCK_REALTIME` 분리, RTC 폴백 지원 |
 | `sys_clock_getres` | 114 | `clock_getres(clockid, tp)` | 시계 해상도 반환 (`tp=NULL` 허용) |
@@ -88,7 +89,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_newfstatat` | 79 | `newfstatat(dirfd, path, stat, flags)` | baseline 경로 stat |
 | `sys_fstat` | 80 | `fstat(fd, statbuf)` | 파일 상태 조회 |
 | `sys_mkdirat` | 34 | `mkdirat(dirfd, path, mode)` | 디렉토리 생성 |
-| `sys_unlinkat` | 35 | `unlinkat(dirfd, path, flags)` | 파일 삭제 |
+| `sys_unlinkat` | 35 | `unlinkat(dirfd, path, flags)` | 파일/디렉토리 삭제 (`AT_REMOVEDIR` 지원) |
 
 **참고**:
 - `openat`, `mkdirat`, `unlinkat`의 `dirfd` 인자는 현재 무시됩니다.
@@ -97,6 +98,7 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 - `readlinkat`는 baseline에서 `dirfd`를 무시하고 경로 기반으로 동작합니다.
 - `pipe2`는 ring buffer 기반 baseline 구현이며, 블로킹/`PIPE_BUF` 원자성은 아직 범위 밖입니다.
 - `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)`는 Linux와 동일하게 `arg` 이상 첫 빈 FD로 복제합니다 (`F_DUPFD_CLOEXEC`의 close-on-exec 비트 자체는 아직 no-op).
+- `unlinkat`는 `flags==0`(unlink)와 `flags==AT_REMOVEDIR`(rmdir)만 지원하며, 그 외 플래그는 `EINVAL`을 반환합니다.
 
 ## 파일 구조
 

@@ -410,6 +410,25 @@ struct LinuxUtsName {
     domainname: [u8; 65],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxSysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _f: [u8; 0],
+}
+
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3413,6 +3432,42 @@ pub fn sys_uname(buf: *mut u8) -> isize {
         return e;
     }
     0
+}
+
+/// sys_sysinfo - 시스템 메모리/업타임 요약 조회
+pub fn sys_sysinfo(info: *mut u8) -> isize {
+    if info.is_null() {
+        return errno::EFAULT;
+    }
+
+    let page = crate::mm::page::stats();
+    let uptime_sec = (crate::time::monotonic_now_ns() / 1_000_000_000) as i64;
+    let procs = proc::thread_snapshots()
+        .into_iter()
+        .filter(|thread| thread.tid > 0 && thread.state != proc::ThreadState::Terminated)
+        .count();
+
+    let sysinfo = LinuxSysinfo {
+        uptime: uptime_sec,
+        loads: [0; 3],
+        totalram: page.total_pages.saturating_mul(crate::mm::page::PAGE_SIZE) as u64,
+        freeram: page.free_pages.saturating_mul(crate::mm::page::PAGE_SIZE) as u64,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: core::cmp::min(procs, u16::MAX as usize) as u16,
+        pad: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _f: [],
+    };
+
+    match uaccess::write_unaligned(info as *mut LinuxSysinfo, sysinfo) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// sys_setpgid - 프로세스 그룹 설정

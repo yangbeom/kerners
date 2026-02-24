@@ -121,7 +121,7 @@
 | 25 | `fcntl` | ✅ 구현 | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
 | 29 | `ioctl` | ✅ 구현 | baseline TTY (`TCGETS/TCSETS/TIOCGWINSZ/TIOCSCTTY`) |
 | 34 | `mkdirat` | ✅ 구현 | dirfd 무시, path만 사용 |
-| 35 | `unlinkat` | ✅ 구현 | dirfd/flags 무시 |
+| 35 | `unlinkat` | ✅ 구현 | dirfd 무시, `AT_REMOVEDIR` 지원 |
 | 43 | `statfs` | ✅ 구현 | mount 기준 `FsStats` 반환 (`procfs` magic 포함) |
 | 48 | `faccessat` | ✅ 구현 | baseline 경로 존재 확인 |
 | 49 | `chdir` | ✅ 구현 | baseline 디렉토리 검증 + 전역 cwd 갱신 |
@@ -165,6 +165,7 @@
 | 176 | `getgid` | ✅ 구현 | baseline: 0 반환 |
 | 177 | `getegid` | ✅ 구현 | baseline: 0 반환 |
 | 178 | `gettid` | ✅ 구현 | tid 반환 |
+| 179 | `sysinfo` | ✅ 구현 | uptime/memory/procs baseline (`mem_unit=1`) |
 | 198 | `socket` | ✅ 구현 | baseline: `EAFNOSUPPORT` |
 | 206 | `sendto` | ✅ 구현 | baseline: `EBADF`/`EAFNOSUPPORT` |
 | 214 | `brk` | ✅ 구현 | vm_group별 힙 영역 트래킹 + 페이지 단위 확장/축소 |
@@ -516,15 +517,16 @@
 - [x] 수용 기준: 양 아키텍처에서 외부 static ELF 실행 + 정상 종료코드/출력 확인, 커널 panic 없음
 
 #### 15-2. static ELF 기반 유저 공간 최소 운영 (필수 2단계)
-- [ ] 상태 메모: PATH/shebang은 완료, `switch_root=fat32` rcS smoke는 통과했으나 full 시나리오 검증이 남아 있음
+- [ ] 상태 메모: PATH/shebang + full rcS smoke는 통과했으나 `tid=1` SIGSEGV 후속 안정화가 남아 있음
 - [x] PATH 탐색 최소 구현 (`/bin:/sbin:/usr/bin:/usr/sbin`)
 - [x] Shebang (`#!`) 1차 지원 (인터프리터 경로 + 인자 전달, 최대 depth 제한 포함)
 - [x] syscall user-copy 공통 계층화: `src/syscall/uaccess.rs` 도입 + `src/syscall/fs.rs`/`src/syscall/process.rs` 사용자 포인터 접근 전면 전환
 - [x] riscv64 user access 안정화: 접근 단위 `mstatus(MPRV+SUM+MPP=S)` 토글로 redirection 경로 `Bad file descriptor` 반복 재현 차단
 - [x] 2026-02-24 `switch_root=fat32` rcS smoke(`PH15_2_BEGIN -> cat /t15.txt -> mkdir / -> PH15_2_END`) 양 아키텍처 PASS (`logs/phase15-2-final-aarch64-20260224-070939.log`, `logs/phase15-2-final-riscv64-20260224-070939.log`)
 - [x] `/bin/sh` non-interactive baseline 동작: rcS 경로에서 `cat`, `mkdir` 자식 `execve` 연쇄 완료 확인
-- [ ] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm` (현재 `cat`/`mkdir` 검증 완료)
-- [ ] `/bin/ps` — procfs 기반 프로세스 목록 조회
+- [x] 기본 유저 명령 경로 정착: `/bin/ls`, `/bin/cat`, `/bin/echo`, `/bin/mkdir`, `/bin/rm` (rcS full smoke 검증)
+- [x] `/bin/ps` — procfs 기반 프로세스 목록 조회 (`sysinfo(179)` baseline 구현 포함)
+- [x] 2026-02-24 full rcS smoke(`ls/cat/mkdir/redirection/rm/rmdir/head/ps`) 양 아키텍처 PASS (`logs/phase15-2-full-rc-fix-aarch64-20260224-191936.log`, `logs/phase15-2-full-rc-fix-riscv64-20260224-191936.log`)
 - [ ] 후속 안정화: rcS 완료 이후 `tid=1` 종료(SIGSEGV) 원인 분석/수정
 - [ ] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 

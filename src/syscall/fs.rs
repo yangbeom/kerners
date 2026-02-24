@@ -56,6 +56,7 @@ const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
 const TCSETSF: usize = 0x5404;
 const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
+const AT_REMOVEDIR: u32 = 0x200;
 const PPOLL_MAX_FDS: usize = 1024;
 const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
 const IOV_MAX: usize = 1024;
@@ -1336,6 +1337,19 @@ pub fn sys_mkdir(path: *const u8, mode: u32) -> isize {
 
 /// sys_unlink - 파일 삭제
 pub fn sys_unlink(path: *const u8) -> isize {
+    sys_unlinkat(path, 0)
+}
+
+/// sys_unlinkat - 파일/디렉토리 삭제
+///
+/// baseline:
+/// - dirfd는 무시한다.
+/// - flags는 `AT_REMOVEDIR`만 지원한다.
+pub fn sys_unlinkat(path: *const u8, flags: u32) -> isize {
+    if flags & !AT_REMOVEDIR != 0 {
+        return errno::EINVAL;
+    }
+
     let path_owned = match read_c_path(path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1347,9 +1361,16 @@ pub fn sys_unlink(path: *const u8) -> isize {
 
     match fs::resolve_parent_path(&path_norm) {
         Ok((parent, name)) => {
-            match parent.unlink(&name) {
-                Ok(()) => 0,
-                Err(e) => vfs_error_to_errno(e),
+            if flags & AT_REMOVEDIR != 0 {
+                match parent.rmdir(&name) {
+                    Ok(()) => 0,
+                    Err(e) => vfs_error_to_errno(e),
+                }
+            } else {
+                match parent.unlink(&name) {
+                    Ok(()) => 0,
+                    Err(e) => vfs_error_to_errno(e),
+                }
             }
         }
         Err(e) => vfs_error_to_errno(e),
