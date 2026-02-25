@@ -325,12 +325,14 @@ impl LoadedModule {
 /// 로드된 모듈 목록
 static LOADED_MODULES: RwLock<Vec<Box<LoadedModule>>> = RwLock::new(Vec::new());
 static NEXT_EXEC_DYN_BASE: AtomicUsize = AtomicUsize::new(0);
+static EXEC_DYNAMIC_SYMBOLS: RwLock<Vec<(String, usize)>> = RwLock::new(Vec::new());
 
 /// 실행 ELF 로드 결과
 pub struct ExecutableLoadInfo {
     pub entry: usize,
     pub load_bias: usize,
     pub dynamic: ExecutableDynamicInfo,
+    pub exported_symbols: Vec<(String, usize)>,
 }
 
 /// 실행 ELF의 .dynamic/DT_* 요약 정보
@@ -461,6 +463,35 @@ impl ModuleLoader {
                 return Ok(base);
             }
         }
+    }
+
+    pub fn clear_exec_dynamic_symbols() {
+        let mut symbols = EXEC_DYNAMIC_SYMBOLS.write();
+        symbols.clear();
+    }
+
+    fn register_exec_dynamic_symbols(symbols: &[(String, usize)]) {
+        if symbols.is_empty() {
+            return;
+        }
+
+        let mut global = EXEC_DYNAMIC_SYMBOLS.write();
+        for (name, addr) in symbols.iter() {
+            if let Some(pos) = global.iter().position(|(n, _)| n == name) {
+                global[pos] = (name.clone(), *addr);
+            } else {
+                global.push((name.clone(), *addr));
+            }
+        }
+    }
+
+    fn lookup_exec_dynamic_symbol(name: &str) -> Option<usize> {
+        let global = EXEC_DYNAMIC_SYMBOLS.read();
+        global
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, addr)| *addr)
     }
 
     fn cleanup_exec_frames(frames: &mut Vec<usize>) {
@@ -682,6 +713,90 @@ impl ModuleLoader {
         Ok(symbol)
     }
 
+    fn dynamic_symbol_count(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+    ) -> Result<usize, ModuleError> {
+        if dyn_info.hash != 0 {
+            let hash_vaddr = Self::remove_load_bias(dyn_info.hash, load_bias)?;
+            let bytes = Self::file_slice_for_vaddr(elf, data, hash_vaddr, 8)?;
+            let nchain = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+            if nchain > 0 {
+                return Ok(nchain);
+            }
+        }
+
+        if dyn_info.symtab != 0 && dyn_info.strtab != 0 && dyn_info.strtab > dyn_info.symtab {
+            let sym_ent = if dyn_info.syment == 0 {
+                size_of::<Elf64Symbol>()
+            } else {
+                dyn_info.syment
+            };
+            if sym_ent >= size_of::<Elf64Symbol>() {
+                let span = dyn_info
+                    .strtab
+                    .checked_sub(dyn_info.symtab)
+                    .ok_or(ModuleError::InvalidFormat)?;
+                return Ok(span / sym_ent);
+            }
+        }
+
+        Ok(0)
+    }
+
+    fn collect_dynamic_exports(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+    ) -> Result<Vec<(String, usize)>, ModuleError> {
+        let strtab = Self::dynamic_strtab(elf, data, load_bias, dyn_info)?;
+        let Some(strtab) = strtab else {
+            return Ok(Vec::new());
+        };
+
+        let symbol_count = Self::dynamic_symbol_count(elf, data, load_bias, dyn_info)?;
+        if symbol_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut exports = Vec::new();
+        for sym_index in 1..(symbol_count as u32) {
+            let sym = match Self::dynamic_symbol_at(elf, data, load_bias, dyn_info, sym_index) {
+                Ok(sym) => sym,
+                Err(_) => break,
+            };
+
+            let binding = sym.binding();
+            if binding != 1 && binding != 2 {
+                continue;
+            }
+
+            if sym.st_shndx == section_index::SHN_UNDEF {
+                continue;
+            }
+
+            let name = Self::string_at(strtab, sym.st_name as usize);
+            if name.is_empty() {
+                continue;
+            }
+
+            let value = if sym.st_shndx == section_index::SHN_ABS {
+                sym.st_value as usize
+            } else {
+                (sym.st_value as usize)
+                    .checked_add(load_bias)
+                    .ok_or(ModuleError::InvalidFormat)?
+            };
+
+            exports.push((String::from(name), value));
+        }
+
+        Ok(exports)
+    }
+
     fn resolve_dynamic_symbol(
         elf: &Elf64,
         data: &[u8],
@@ -701,6 +816,9 @@ impl ModuleLoader {
                 .unwrap_or("");
             if !name.is_empty() {
                 if let Some(addr) = lookup_symbol(name) {
+                    return Ok(Some(addr));
+                }
+                if let Some(addr) = Self::lookup_exec_dynamic_symbol(name) {
                     return Ok(Some(addr));
                 }
                 kprintln!("[module] dynamic unresolved symbol: {}", name);
@@ -1472,6 +1590,8 @@ impl ModuleLoader {
 
         let dynamic_info = Self::parse_dynamic_info(&elf, load_bias)?;
         Self::apply_dynamic_relocations(&elf, data, load_bias, &dynamic_info, &page_mappings)?;
+        let exported_symbols = Self::collect_dynamic_exports(&elf, data, load_bias, &dynamic_info)?;
+        Self::register_exec_dynamic_symbols(&exported_symbols);
         if dynamic_info.at_dynamic != 0 {
             kprintln!(
                 "[module] DYNAMIC: at={:#x}, needed={}, strtab={:#x}, symtab={:#x}, rela={:#x}, rel={:#x}, jmprel={:#x}",
@@ -1495,6 +1615,7 @@ impl ModuleLoader {
             entry,
             load_bias,
             dynamic: dynamic_info,
+            exported_symbols,
         })
     }
 

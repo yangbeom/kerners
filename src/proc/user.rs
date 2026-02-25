@@ -23,6 +23,7 @@ const AUXV_AT_FLAGS: usize = 8;
 const AUXV_AT_ENTRY: usize = 9;
 const MAX_SHEBANG_DEPTH: usize = 4;
 const DEFAULT_EXEC_PATH: &str = "/bin:/sbin:/usr/bin:/usr/sbin";
+const DEFAULT_SHARED_LIB_PATH: &str = "/lib:/usr/lib:/lib64:/usr/lib64";
 const MAX_INTERP_PATH_LEN: usize = 4096;
 
 /// 유저 스택 베이스 주소 (가상 주소, 높은 주소에서 시작)
@@ -315,7 +316,12 @@ pub fn prepare_exec_image(
     argv: &[String],
     envp: &[String],
 ) -> Result<PreparedExecImage, ExecError> {
-    prepare_exec_image_inner(path, argv, envp, 0)
+    ModuleLoader::clear_exec_dynamic_symbols();
+    let result = prepare_exec_image_inner(path, argv, envp, 0);
+    if result.is_err() {
+        ModuleLoader::clear_exec_dynamic_symbols();
+    }
+    result
 }
 
 fn map_module_error(err: ModuleError) -> ExecError {
@@ -400,6 +406,96 @@ fn resolve_exec_path(path: &str, envp: &[String]) -> Result<String, ExecError> {
     }
 
     Err(ExecError::NotFound)
+}
+
+fn resolve_shared_library_path(name: &str, envp: &[String]) -> Result<String, ExecError> {
+    if name.contains('/') {
+        if fs::lookup_path(name).is_ok() {
+            return Ok(String::from(name));
+        }
+        return Err(ExecError::NotFound);
+    }
+
+    let lib_path = envp
+        .iter()
+        .find_map(|entry| entry.strip_prefix("LD_LIBRARY_PATH="))
+        .unwrap_or(DEFAULT_SHARED_LIB_PATH);
+
+    for raw_dir in lib_path.split(':') {
+        let dir = if raw_dir.is_empty() { "." } else { raw_dir };
+        let mut candidate = String::from(dir);
+        if !candidate.ends_with('/') {
+            candidate.push('/');
+        }
+        candidate.push_str(name);
+        if fs::lookup_path(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(ExecError::NotFound)
+}
+
+fn collect_shared_dependencies(
+    elf_data: &[u8],
+    envp: &[String],
+    seen_paths: &mut Vec<String>,
+    ordered_paths: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    let elf = crate::module::Elf64::parse(elf_data).map_err(|_| ExecError::InvalidElf)?;
+    let needed = elf
+        .dynamic_needed_names()
+        .map_err(|_| ExecError::InvalidElf)?;
+    if needed.is_empty() {
+        return Ok(());
+    }
+
+    for needed_name in needed {
+        let dep_path = resolve_shared_library_path(needed_name, envp)?;
+        if seen_paths.iter().any(|p| p == &dep_path) {
+            continue;
+        }
+
+        seen_paths.push(dep_path.clone());
+        let dep_data = read_executable(&dep_path)?;
+        collect_shared_dependencies(&dep_data, envp, seen_paths, ordered_paths)?;
+        ordered_paths.push(dep_path);
+    }
+    Ok(())
+}
+
+fn preload_shared_dependencies(
+    current_path: &str,
+    elf_data: &[u8],
+    envp: &[String],
+    loaded_shared_paths: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    let mut seen_paths = loaded_shared_paths.clone();
+    if !seen_paths.iter().any(|p| p == current_path) {
+        seen_paths.push(String::from(current_path));
+    }
+
+    let mut ordered_paths = Vec::new();
+    collect_shared_dependencies(elf_data, envp, &mut seen_paths, &mut ordered_paths)?;
+
+    for dep_path in ordered_paths {
+        if loaded_shared_paths.iter().any(|p| p == &dep_path) {
+            continue;
+        }
+
+        let dep_data = read_executable(&dep_path)?;
+        kprintln!("[exec] preload shared object: {}", dep_path);
+        let dep = ModuleLoader::load_executable(&dep_data).map_err(map_module_error)?;
+        kprintln!(
+            "[exec] shared loaded: path='{}' base={:#x} exports={}",
+            dep_path,
+            dep.load_bias,
+            dep.exported_symbols.len()
+        );
+        loaded_shared_paths.push(dep_path);
+    }
+
+    Ok(())
 }
 
 fn parse_shebang(data: &[u8]) -> Result<Option<(String, Option<String>)>, ExecError> {
@@ -499,9 +595,10 @@ fn prepare_exec_image_inner(
         return Err(ExecError::InvalidElf);
     }
 
-    if let Some(interp_path) = read_interp_path(&elf, &elf_data)? {
-        let main = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
+    let mut loaded_shared_paths = Vec::new();
+    preload_shared_dependencies(&resolved_path, &elf_data, envp, &mut loaded_shared_paths)?;
 
+    if let Some(interp_path) = read_interp_path(&elf, &elf_data)? {
         let interp_resolved = resolve_exec_path(&interp_path, envp)?;
         let interp_data = read_executable(&interp_resolved)?;
         let interp_elf =
@@ -516,7 +613,16 @@ fn prepare_exec_image_inner(
         if read_interp_path(&interp_elf, &interp_data)?.is_some() {
             return Err(ExecError::DynamicElfNotSupported);
         }
+
+        preload_shared_dependencies(
+            &interp_resolved,
+            &interp_data,
+            envp,
+            &mut loaded_shared_paths,
+        )?;
+
         let interp = ModuleLoader::load_executable(&interp_data).map_err(map_module_error)?;
+        let main = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
 
         let mut auxv = build_exec_auxv(&elf, &main, interp.load_bias);
         auxv.entry = main.entry;

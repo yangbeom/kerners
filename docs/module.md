@@ -55,14 +55,18 @@ pub extern "C" fn module_version() -> *const u8 {
 - 수집된 정보를 기반으로 `REL/RELA` baseline 재배치를 적용한다
   - aarch64: `RELATIVE`, `ABS64`, `GLOB_DAT`, `JUMP_SLOT`
   - riscv64: `RELATIVE`, `64`, `GLOB_DAT`, `JUMP_SLOT`
+- `DT_NEEDED`를 따라 공유 라이브러리 의존성을 preload한다
+  - 검색 경로: `LD_LIBRARY_PATH` 우선, 미설정 시 `/lib:/usr/lib:/lib64:/usr/lib64`
+  - preload된 실행 객체의 export 심볼은 같은 exec 준비 경로에서 전역 탐색 범위에 등록된다
 - `proc::user::prepare_exec_image()`에서 호출됨
 
 현재 제약:
 
 - `PT_LOAD`의 `p_vaddr`를 유저 페이지 테이블로 매핑한다.
 - `ET_DYN`은 실행 시 load bias를 적용해 유효 사용자 주소 범위로 이동 매핑한다.
-- `.dynamic` 처리의 현재 범위는 `DT_*` 메타데이터 수집 + baseline 재배치 적용이며,
-  `DT_NEEDED` 기반 공유 라이브러리 의존성 해석은 후속 단계다.
+- `.dynamic` 처리의 현재 범위는 `DT_*` 메타데이터 수집 + baseline 재배치 + `DT_NEEDED` preload다.
+- 외부 심볼 해석은 커널 심볼 + preload된 실행 객체의 export 심볼 범위로 제한된다.
+- 심볼 버저닝(`DT_VER*`), lazy binding, TLS 재배치(`PT_TLS`)는 아직 미구현이다.
 - 가드 범위를 벗어난 세그먼트는 로드 실패한다.
   - aarch64: `0x0010_0000..0x0800_0000`
   - riscv64: `0x4000_0000..0x8000_0000`
@@ -101,6 +105,7 @@ pub extern "C" fn module_version() -> *const u8 {
 | `ModuleLoader::list_module_symbols(module)` | 모듈 export 심볼 목록 조회 |
 | `ModuleLoader::export_symbol(module, symbol, addr)` | 런타임 export 심볼 추가 |
 | `ModuleLoader::load_executable(data)` | 실행 ELF 로드 후 `entry/load_bias/.dynamic 요약` 반환 |
+| `ModuleLoader::clear_exec_dynamic_symbols()` | 새 `execve` 준비 시작 전 실행 객체 전역 심볼 스코프 초기화 |
 
 ## 심볼/재배치/PLT
 

@@ -3,6 +3,7 @@
 //! ELF64 포맷 파싱 및 검증
 //! 참조: https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html
 
+use alloc::vec::Vec;
 use core::mem::size_of;
 
 /// ELF 매직 넘버
@@ -661,6 +662,89 @@ impl<'a> Elf64<'a> {
         }
 
         Ok(None)
+    }
+
+    fn file_slice_for_vaddr(
+        &self,
+        vaddr: usize,
+        len: usize,
+    ) -> Result<Option<&'a [u8]>, Elf64Error> {
+        if len == 0 {
+            return Ok(Some(&[]));
+        }
+
+        let end = vaddr.checked_add(len).ok_or(Elf64Error::InvalidProgramHeader)?;
+        for ph in self.load_segments() {
+            let seg_vaddr = ph.p_vaddr as usize;
+            let seg_file_size = ph.p_filesz as usize;
+            let seg_file_end = seg_vaddr
+                .checked_add(seg_file_size)
+                .ok_or(Elf64Error::InvalidProgramHeader)?;
+            if vaddr < seg_vaddr || end > seg_file_end {
+                continue;
+            }
+
+            let delta = vaddr - seg_vaddr;
+            let file_off = (ph.p_offset as usize)
+                .checked_add(delta)
+                .ok_or(Elf64Error::InvalidProgramHeader)?;
+            let file_end = file_off
+                .checked_add(len)
+                .ok_or(Elf64Error::InvalidProgramHeader)?;
+            if file_end > self.data.len() {
+                return Err(Elf64Error::InvalidProgramHeader);
+            }
+            return Ok(Some(&self.data[file_off..file_end]));
+        }
+
+        Ok(None)
+    }
+
+    /// DT_NEEDED 이름 목록 추출
+    pub fn dynamic_needed_names(&self) -> Result<Vec<&'a str>, Elf64Error> {
+        let entries = match self.dynamic_entries()? {
+            Some(entries) => entries,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut strtab_addr = None;
+        let mut strtab_size = None;
+        let mut needed_offsets: Vec<usize> = Vec::new();
+
+        for entry in entries {
+            match entry.tag() {
+                DynamicTag::Null => break,
+                DynamicTag::StrTab => strtab_addr = Some(entry.value() as usize),
+                DynamicTag::StrSz => strtab_size = Some(entry.value() as usize),
+                DynamicTag::Needed => needed_offsets.push(entry.value() as usize),
+                _ => {}
+            }
+        }
+
+        let (Some(strtab_addr), Some(strtab_size)) = (strtab_addr, strtab_size) else {
+            return Ok(Vec::new());
+        };
+
+        let Some(strtab) = self.file_slice_for_vaddr(strtab_addr, strtab_size)? else {
+            return Err(Elf64Error::InvalidProgramHeader);
+        };
+
+        let mut names = Vec::new();
+        for off in needed_offsets {
+            if off >= strtab.len() {
+                return Err(Elf64Error::InvalidProgramHeader);
+            }
+            let end = strtab[off..]
+                .iter()
+                .position(|b| *b == 0)
+                .map(|i| off + i)
+                .unwrap_or(strtab.len());
+            let name = core::str::from_utf8(&strtab[off..end]).map_err(|_| Elf64Error::InvalidProgramHeader)?;
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     /// 섹션 이름 조회
