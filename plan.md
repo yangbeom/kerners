@@ -506,7 +506,7 @@
 - [x] 2026-02-19 회귀: `make test-all` (`aarch64`/`riscv64`) PASS 유지
 - [x] 기반 구현 완료: `ET_DYN` load bias, `PT_INTERP` 체인, `PATH` 탐색, shebang, auxv(`AT_PHENT`/`AT_BASE`)
 - [x] 15-1 외부 Linux static ELF end-to-end 수용 테스트 완료 (2026-02-21, `aarch64`/`riscv64`)
-- [ ] 잔여 검증: 15-2 잔여(`/bin/ps` 포함 full 시나리오, PID1 종료 원인) + 15-3 동적 ELF 런타임 링크
+- [ ] 잔여 작업: 15-3 동적 ELF 런타임 링크
 
 #### 15-1. 외부 Linux static ELF bring-up (필수 1단계)
 - [x] 상태 메모: 외부 static ELF 실물 검증 완료. 검증 로그: `logs/phase15-1-aarch64-20260221-101515.log`, `logs/phase15-1-riscv64-20260221-101556.log`
@@ -529,6 +529,7 @@
 - [x] 2026-02-24 full rcS smoke(`ls/cat/mkdir/redirection/rm/rmdir/head/ps`) 양 아키텍처 PASS (`logs/phase15-2-full-rc-fix-aarch64-20260224-191936.log`, `logs/phase15-2-full-rc-fix-riscv64-20260224-191936.log`)
 - [x] 후속 안정화: `vfork(CLONE_VM)` 자식의 `execve` 시 공유 vm_group 격리(root clone + vm_group 분리) 적용으로 PID1 stack protector SIGSEGV 제거
 - [x] 2026-02-24 full rcS 재검증 PASS (`logs/phase15-2-full-vforkfix-aarch64-20260224-194133.log`, `logs/phase15-2-full-vforkfix-riscv64-20260224-194133.log`) — `PH15_2_RC_END` 확인, `tid=1 terminating by SIGSEGV` 미발생
+- [x] 2026-02-24 full rcS 추가 재검증 PASS (`logs/phase15-2-full-retest-20260224-195800-aarch64.log`, `logs/phase15-2-full-retest-20260224-195800-riscv64.log`) — `PH15_2_RC_*` 전 항목 0, `Bad file descriptor`/`Kernel panic`/`Unknown syscall`/`SIGSEGV` 미발생
 - [x] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)

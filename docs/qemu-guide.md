@@ -101,6 +101,79 @@ KERNERS_BOOTARGS="kerners.root=fat32" \
 - `PH15_2_END`
 - `Kernel panic`, `Bad file descriptor` 미발생
 
+### Phase 15-2 full rcS 스모크 (`ls/cat/mkdir/redirection/rm/rmdir/head/ps`)
+
+아래 시나리오는 15-2 full 경로(`/bin/ps` 포함)를 검증합니다.
+
+```bash
+ARCH=aarch64
+BUSYBOX=target/user/${ARCH}/busybox
+STAMP=$(date +%Y%m%d-%H%M%S)
+DISK=logs/phase15-2-full-${ARCH}-${STAMP}.img
+LOG=logs/phase15-2-full-${ARCH}-${STAMP}.log
+
+./scripts/prepare_user_disk.sh "$ARCH" "$BUSYBOX" "$DISK"
+mmd -i "$DISK" ::/etc/init.d
+
+cat >/tmp/rcS.full <<'EOF'
+#!/bin/sh
+echo PH15_2_RC_BEGIN
+ls /
+echo PH15_2_RC_LS_ROOT=$?
+ls /bin
+echo PH15_2_RC_LS_BIN=$?
+cat /t15.txt
+echo PH15_2_RC_CAT=$?
+mkdir /ph15dir
+echo PH15_2_RC_MKDIR=$?
+echo phase15_redir > /redir.txt
+echo PH15_2_RC_REDIR=$?
+cat /redir.txt
+echo PH15_2_RC_CAT_REDIR=$?
+rm /redir.txt
+echo PH15_2_RC_RM=$?
+rmdir /ph15dir
+echo PH15_2_RC_RMDIR=$?
+head -n 1 /proc/meminfo
+echo PH15_2_RC_PROC=$?
+ps | head -n 1
+echo PH15_2_RC_PS=$?
+echo PH15_2_RC_END
+EOF
+printf 'hello_phase15_full\n' >/tmp/t15.txt
+
+mcopy -o -i "$DISK" /tmp/rcS.full ::/etc/init.d/rcS
+mcopy -o -i "$DISK" /tmp/t15.txt ::/t15.txt
+
+KERNERS_DISK_IMG="$DISK" \
+KERNERS_BOOTARGS="kerners.root=fat32" \
+./run.sh "$ARCH" 512 1 >"$LOG" 2>&1 &
+RUN_PID=$!
+
+while ! grep -q "PH15_2_RC_END" "$LOG"; do sleep 1; done
+kill "$RUN_PID" 2>/dev/null || true
+wait "$RUN_PID" 2>/dev/null || true
+```
+
+기대 로그 마커:
+- `PH15_2_RC_BEGIN`
+- `PH15_2_RC_LS_ROOT=0`
+- `PH15_2_RC_LS_BIN=0`
+- `PH15_2_RC_CAT=0`
+- `PH15_2_RC_MKDIR=0`
+- `PH15_2_RC_REDIR=0`
+- `PH15_2_RC_CAT_REDIR=0`
+- `PH15_2_RC_RM=0`
+- `PH15_2_RC_RMDIR=0`
+- `PH15_2_RC_PROC=0`
+- `PH15_2_RC_PS=0`
+- `PH15_2_RC_END`
+- `Bad file descriptor`, `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
+
+최근 재검증 로그 (2026-02-24):
+- `logs/phase15-2-full-retest-20260224-195800-aarch64.log`
+- `logs/phase15-2-full-retest-20260224-195800-riscv64.log`
+
 ## 수동 실행 방법
 
 ### 1. 빌드
