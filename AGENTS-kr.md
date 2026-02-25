@@ -104,7 +104,9 @@ kerners/
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
 ├── modules/test_signal/     # signal syscall 회귀 테스트 모듈
 ├── modules/test_procfs/     # procfs + phase14 fs syscall 회귀 테스트 모듈
+├── scripts/build_user_dynamic_c_bins.sh  # C 툴체인 동적 유저 ELF(hello_dyn + ld-kerners) 빌더
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
+├── scripts/verify_phase15_3_cdyn.sh  # Phase 15-3 C 동적 hello 스모크 검증 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
 ├── docs/                    # 문서 (전체 목록은 docs/README.md 참조)

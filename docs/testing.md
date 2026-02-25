@@ -526,7 +526,9 @@ fn panic(_info: &PanicInfo) -> ! {
 |----------|------|
 | `scripts/build_test_modules.sh [ARCH]` | `modules/test_*/`를 순회하여 `.ko` 빌드 |
 | `scripts/prepare_test_disk.sh [ARCH]` | FAT32 `disk.img` 생성 + `.ko` 복사 (`KERNERS_DISK_IMG` 지원) |
+| `scripts/build_user_dynamic_c_bins.sh [ARCH] [OUT_DIR]` | C 계열(`clang` + `rust-lld`) 최소 동적 ELF(`hello_dyn`, `ld-kerners-*.so`) 생성 |
 | `scripts/prepare_user_disk.sh [ARCH] [BUSYBOX_PATH] [DISK_IMG]` | BusyBox 기반 `disk.img` 생성 (`/sbin/init`, `/bin/init` 포함) |
+| `scripts/verify_phase15_3_cdyn.sh [ARCH] [BUSYBOX_PATH] [TIMEOUT]` | FAT32 root + rcS에서 `/bin/hello_dyn` 실행 검증 (`PH15_3_CDYN_*` 마커) |
 | `scripts/run_busybox_smoke.sh [ARCH] [BUSYBOX_PATH] [RUNS] [TIMEOUT]` | BusyBox init 스모크 + `COW_FORK_TEST` 로그 판정 |
 | `scripts/run_tests.sh [ARCH] [TIMEOUT]` | 전체 오케스트레이션 (빌드 → 디스크 → 커널 → QEMU → 결과 파싱) |
 

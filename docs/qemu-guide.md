@@ -174,6 +174,27 @@ wait "$RUN_PID" 2>/dev/null || true
 - `logs/phase15-2-full-retest-20260224-195800-aarch64.log`
 - `logs/phase15-2-full-retest-20260224-195800-riscv64.log`
 
+### Phase 15-3 C 동적 hello 스모크 (`PT_INTERP` 체인)
+
+`zig` 없이 C 계열 툴체인(`clang` + `rust-lld`)으로 최소 동적 ELF를 생성하고,
+커스텀 인터프리터(`/lib/ld-kerners-*.so`) 경로까지 검증합니다.
+
+```bash
+# aarch64 + riscv64 모두 검증
+./scripts/verify_phase15_3_cdyn.sh all
+
+# 아키텍처별 단독 검증
+./scripts/verify_phase15_3_cdyn.sh aarch64
+./scripts/verify_phase15_3_cdyn.sh riscv64
+```
+
+기대 로그 마커:
+- `PH15_3_CDYN_BEGIN`
+- `CDYN_HELLO_OK`
+- `PH15_3_CDYN_HELLO_RC=42`
+- `PH15_3_CDYN_END`
+- `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
+
 ## 수동 실행 방법
 
 ### 1. 빌드
