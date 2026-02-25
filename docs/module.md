@@ -52,14 +52,17 @@ pub extern "C" fn module_version() -> *const u8 {
 - 입력: ELF64 executable (`ET_EXEC`/`ET_DYN` 헤더 파싱)
 - `PT_LOAD` 세그먼트를 읽어 엔트리 포인트를 반환
 - `PT_DYNAMIC`/`DT_*`를 파싱해 런타임 링크 메타데이터를 수집한다
+- 수집된 정보를 기반으로 `REL/RELA` baseline 재배치를 적용한다
+  - aarch64: `RELATIVE`, `ABS64`, `GLOB_DAT`, `JUMP_SLOT`
+  - riscv64: `RELATIVE`, `64`, `GLOB_DAT`, `JUMP_SLOT`
 - `proc::user::prepare_exec_image()`에서 호출됨
 
 현재 제약:
 
 - `PT_LOAD`의 `p_vaddr`를 유저 페이지 테이블로 매핑한다.
 - `ET_DYN`은 실행 시 load bias를 적용해 유효 사용자 주소 범위로 이동 매핑한다.
-- `.dynamic` 처리의 현재 범위는 `DT_*` 메타데이터 수집까지이며,
-  실제 `REL/RELA` 적용 및 `DT_NEEDED` 라이브러리 해석은 후속 단계다.
+- `.dynamic` 처리의 현재 범위는 `DT_*` 메타데이터 수집 + baseline 재배치 적용이며,
+  `DT_NEEDED` 기반 공유 라이브러리 의존성 해석은 후속 단계다.
 - 가드 범위를 벗어난 세그먼트는 로드 실패한다.
   - aarch64: `0x0010_0000..0x0800_0000`
   - riscv64: `0x4000_0000..0x8000_0000`

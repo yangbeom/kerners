@@ -370,11 +370,36 @@ impl Elf64Rela {
     }
 }
 
+/// ELF64 재배치 엔트리 (Rel, addend 없음, 16바이트)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Elf64Rel {
+    /// 재배치 적용 오프셋
+    pub r_offset: u64,
+    /// 재배치 정보 (심볼 + 타입)
+    pub r_info: u64,
+}
+
+impl Elf64Rel {
+    /// 심볼 인덱스 (상위 32비트)
+    pub fn symbol(&self) -> u32 {
+        (self.r_info >> 32) as u32
+    }
+
+    /// 재배치 타입 (하위 32비트)
+    pub fn rel_type(&self) -> u32 {
+        (self.r_info & 0xffffffff) as u32
+    }
+}
+
 /// AArch64 재배치 타입
 pub mod reloc_aarch64 {
     pub const R_AARCH64_NONE: u32 = 0;
     pub const R_AARCH64_ABS64: u32 = 257; // S + A
     pub const R_AARCH64_ABS32: u32 = 258; // S + A
+    pub const R_AARCH64_GLOB_DAT: u32 = 1025; // S + A
+    pub const R_AARCH64_JUMP_SLOT: u32 = 1026; // S + A
+    pub const R_AARCH64_RELATIVE: u32 = 1027; // B + A
     pub const R_AARCH64_CALL26: u32 = 283; // S + A - P (BL)
     pub const R_AARCH64_JUMP26: u32 = 282; // S + A - P (B)
     pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275; // Page(S+A) - Page(P)
@@ -389,6 +414,9 @@ pub mod reloc_riscv {
     pub const R_RISCV_NONE: u32 = 0;
     pub const R_RISCV_32: u32 = 1; // S + A
     pub const R_RISCV_64: u32 = 2; // S + A
+    pub const R_RISCV_RELATIVE: u32 = 3; // B + A
+    pub const R_RISCV_JUMP_SLOT: u32 = 5; // S + A
+    pub const R_RISCV_GLOB_DAT: u32 = 6; // S + A
     pub const R_RISCV_BRANCH: u32 = 16; // S + A - P (B-type)
     pub const R_RISCV_JAL: u32 = 17; // S + A - P (J-type)
     pub const R_RISCV_CALL: u32 = 18; // S + A - P (auipc+jalr)

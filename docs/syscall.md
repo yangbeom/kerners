@@ -182,8 +182,9 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   2. 실행 경로 해석(PATH fallback) + shebang(`#!`)인 경우 인터프리터/argv 재구성
   3. (공유 vm_group일 때) `vfork(CLONE_VM)` 안전성을 위해 exec 전용 루트 테이블로 격리
   4. ELF 검증 및 `PT_LOAD` 세그먼트를 유저 가상주소로 매핑 (`ET_DYN`은 load bias 적용)
-  5. 유저 스택(`argc/argv/envp/auxv`) 구성
-  6. trap 복귀 시점에 `PC/SP`를 새 이미지로 전환
+  5. `PT_DYNAMIC` 기반 `REL/RELA` baseline 재배치 적용 (`RELATIVE/GLOB_DAT/JUMP_SLOT`)
+  6. 유저 스택(`argc/argv/envp/auxv`) 구성
+  7. trap 복귀 시점에 `PC/SP`를 새 이미지로 전환
 - 현재 제약:
   - `argv/envp`는 개수/길이 + 총량(현재 32KiB) 상한을 검사하며, 초과 시 `E2BIG`
   - aarch64/riscv64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)

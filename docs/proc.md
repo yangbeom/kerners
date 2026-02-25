@@ -203,6 +203,8 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
   인터프리터 엔트리로 진입합니다.
 - 실행 로더는 `PT_DYNAMIC`/`DT_*`를 파싱해(`strtab/symtab/rela/rel/jmprel` 등)
   향후 런타임 링크 단계에서 사용할 메타데이터를 수집합니다.
+- 로더는 수집된 메타데이터로 `REL/RELA` baseline 재배치를 선적용합니다
+  (`RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` 포함).
 - shebang(`#!`) 스크립트 실행 시 인터프리터 + 스크립트 경로로 argv를 재구성합니다.
 - ELF `PT_LOAD` 세그먼트의 가상주소가 현재 identity-mapped RAM 범위를 벗어나면 exec 준비가 실패합니다.
 - `vfork(CLONE_VM)`처럼 현재 vm_group을 다른 태스크와 공유 중일 때는 `execve` 진입 시

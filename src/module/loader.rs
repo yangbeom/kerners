@@ -8,6 +8,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::kprintln;
@@ -359,6 +360,12 @@ pub struct ExecutableDynamicInfo {
     pub flags_1: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExecPageMapping {
+    user_page: usize,
+    frame: usize,
+}
+
 /// 모듈 로더
 pub struct ModuleLoader;
 
@@ -563,6 +570,589 @@ impl ModuleLoader {
         Ok(info)
     }
 
+    fn remove_load_bias(addr: usize, load_bias: usize) -> Result<usize, ModuleError> {
+        addr.checked_sub(load_bias).ok_or(ModuleError::InvalidFormat)
+    }
+
+    fn add_signed(base: usize, addend: i64) -> Result<usize, ModuleError> {
+        let sum = (base as i128)
+            .checked_add(addend as i128)
+            .ok_or(ModuleError::InvalidFormat)?;
+        if sum < 0 || sum > usize::MAX as i128 {
+            return Err(ModuleError::InvalidFormat);
+        }
+        Ok(sum as usize)
+    }
+
+    fn file_slice_for_vaddr<'a>(
+        elf: &Elf64,
+        data: &'a [u8],
+        vaddr: usize,
+        len: usize,
+    ) -> Result<&'a [u8], ModuleError> {
+        if len == 0 {
+            return Ok(&[]);
+        }
+
+        let end = vaddr.checked_add(len).ok_or(ModuleError::InvalidFormat)?;
+        for ph in elf.load_segments() {
+            let seg_vaddr = ph.p_vaddr as usize;
+            let seg_file_size = ph.p_filesz as usize;
+            let seg_file_end = seg_vaddr
+                .checked_add(seg_file_size)
+                .ok_or(ModuleError::InvalidFormat)?;
+            if vaddr < seg_vaddr || end > seg_file_end {
+                continue;
+            }
+
+            let delta = vaddr - seg_vaddr;
+            let file_off = (ph.p_offset as usize)
+                .checked_add(delta)
+                .ok_or(ModuleError::InvalidFormat)?;
+            let file_end = file_off
+                .checked_add(len)
+                .ok_or(ModuleError::InvalidFormat)?;
+            if file_end > data.len() {
+                return Err(ModuleError::InvalidFormat);
+            }
+            return Ok(&data[file_off..file_end]);
+        }
+
+        Err(ModuleError::InvalidFormat)
+    }
+
+    fn dynamic_strtab<'a>(
+        elf: &Elf64,
+        data: &'a [u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+    ) -> Result<Option<&'a [u8]>, ModuleError> {
+        if dyn_info.strtab == 0 || dyn_info.strsz == 0 {
+            return Ok(None);
+        }
+        let strtab_vaddr = Self::remove_load_bias(dyn_info.strtab, load_bias)?;
+        let strtab = Self::file_slice_for_vaddr(elf, data, strtab_vaddr, dyn_info.strsz)?;
+        Ok(Some(strtab))
+    }
+
+    fn string_at(strtab: &[u8], offset: usize) -> &str {
+        if offset >= strtab.len() {
+            return "";
+        }
+        let end = strtab[offset..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|i| offset + i)
+            .unwrap_or(strtab.len());
+        core::str::from_utf8(&strtab[offset..end]).unwrap_or("")
+    }
+
+    fn dynamic_symbol_at(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        sym_index: u32,
+    ) -> Result<Elf64Symbol, ModuleError> {
+        if dyn_info.symtab == 0 {
+            return Err(ModuleError::InvalidFormat);
+        }
+        let sym_ent = if dyn_info.syment == 0 {
+            size_of::<Elf64Symbol>()
+        } else {
+            dyn_info.syment
+        };
+        if sym_ent < size_of::<Elf64Symbol>() {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let symtab_vaddr = Self::remove_load_bias(dyn_info.symtab, load_bias)?;
+        let sym_off = (sym_index as usize)
+            .checked_mul(sym_ent)
+            .ok_or(ModuleError::InvalidFormat)?;
+        let symbol_vaddr = symtab_vaddr
+            .checked_add(sym_off)
+            .ok_or(ModuleError::InvalidFormat)?;
+
+        let bytes = Self::file_slice_for_vaddr(elf, data, symbol_vaddr, size_of::<Elf64Symbol>())?;
+        let symbol = unsafe {
+            // SAFETY: ELF file 범위와 엔트리 크기를 검증한 뒤 unaligned read를 수행한다.
+            (bytes.as_ptr() as *const Elf64Symbol).read_unaligned()
+        };
+        Ok(symbol)
+    }
+
+    fn resolve_dynamic_symbol(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        sym_index: u32,
+        strtab: Option<&[u8]>,
+    ) -> Result<Option<usize>, ModuleError> {
+        if sym_index == 0 {
+            return Ok(Some(0));
+        }
+
+        let symbol = Self::dynamic_symbol_at(elf, data, load_bias, dyn_info, sym_index)?;
+        if symbol.st_shndx == section_index::SHN_UNDEF {
+            let name = strtab
+                .map(|tab| Self::string_at(tab, symbol.st_name as usize))
+                .unwrap_or("");
+            if !name.is_empty() {
+                if let Some(addr) = lookup_symbol(name) {
+                    return Ok(Some(addr));
+                }
+                kprintln!("[module] dynamic unresolved symbol: {}", name);
+            } else {
+                kprintln!("[module] dynamic unresolved symbol index={}", sym_index);
+            }
+            return Ok(None);
+        }
+
+        if symbol.st_shndx == section_index::SHN_ABS {
+            return Ok(Some(symbol.st_value as usize));
+        }
+
+        let value = (symbol.st_value as usize)
+            .checked_add(load_bias)
+            .ok_or(ModuleError::InvalidFormat)?;
+        Ok(Some(value))
+    }
+
+    fn translate_exec_vaddr(page_mappings: &[ExecPageMapping], vaddr: usize) -> Option<usize> {
+        let page = vaddr & !(PAGE_SIZE - 1);
+        let offset = vaddr & (PAGE_SIZE - 1);
+        page_mappings
+            .iter()
+            .rev()
+            .find(|m| m.user_page == page)
+            .map(|m| m.frame + offset)
+    }
+
+    fn read_exec_u64(page_mappings: &[ExecPageMapping], vaddr: usize) -> Result<u64, ModuleError> {
+        let mut bytes = [0u8; 8];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            let addr = vaddr.checked_add(i).ok_or(ModuleError::InvalidFormat)?;
+            let phys = Self::translate_exec_vaddr(page_mappings, addr).ok_or(ModuleError::InvalidFormat)?;
+            unsafe {
+                // SAFETY: 변환된 물리 프레임 주소는 alloc_frame으로 확보된 유효 매핑 내 바이트다.
+                *b = *(phys as *const u8);
+            }
+        }
+        Ok(u64::from_ne_bytes(bytes))
+    }
+
+    fn write_exec_u64(
+        page_mappings: &[ExecPageMapping],
+        vaddr: usize,
+        value: u64,
+    ) -> Result<(), ModuleError> {
+        let bytes = value.to_ne_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            let addr = vaddr.checked_add(i).ok_or(ModuleError::InvalidFormat)?;
+            let phys = Self::translate_exec_vaddr(page_mappings, addr).ok_or(ModuleError::InvalidFormat)?;
+            unsafe {
+                // SAFETY: 변환된 물리 프레임 주소는 alloc_frame으로 확보된 유효 매핑 내 바이트다.
+                *(phys as *mut u8) = *b;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_rela_entries(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        rela_addr: usize,
+        rela_size: usize,
+        rela_ent: usize,
+    ) -> Result<Vec<Elf64Rela>, ModuleError> {
+        if rela_addr == 0 || rela_size == 0 {
+            return Ok(Vec::new());
+        }
+        let entry_size = if rela_ent == 0 {
+            size_of::<Elf64Rela>()
+        } else {
+            rela_ent
+        };
+        if entry_size < size_of::<Elf64Rela>() || rela_size % entry_size != 0 {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let rela_vaddr = Self::remove_load_bias(rela_addr, load_bias)?;
+        let bytes = Self::file_slice_for_vaddr(elf, data, rela_vaddr, rela_size)?;
+        let mut entries = Vec::new();
+        for idx in 0..(rela_size / entry_size) {
+            let start = idx * entry_size;
+            let end = start
+                .checked_add(size_of::<Elf64Rela>())
+                .ok_or(ModuleError::InvalidFormat)?;
+            if end > bytes.len() {
+                return Err(ModuleError::InvalidFormat);
+            }
+            let entry = unsafe {
+                // SAFETY: 엔트리별 경계를 검증했고 unaligned read를 수행한다.
+                (bytes.as_ptr().add(start) as *const Elf64Rela).read_unaligned()
+            };
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn parse_rel_entries(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        rel_addr: usize,
+        rel_size: usize,
+        rel_ent: usize,
+    ) -> Result<Vec<Elf64Rel>, ModuleError> {
+        if rel_addr == 0 || rel_size == 0 {
+            return Ok(Vec::new());
+        }
+        let entry_size = if rel_ent == 0 {
+            size_of::<Elf64Rel>()
+        } else {
+            rel_ent
+        };
+        if entry_size < size_of::<Elf64Rel>() || rel_size % entry_size != 0 {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let rel_vaddr = Self::remove_load_bias(rel_addr, load_bias)?;
+        let bytes = Self::file_slice_for_vaddr(elf, data, rel_vaddr, rel_size)?;
+        let mut entries = Vec::new();
+        for idx in 0..(rel_size / entry_size) {
+            let start = idx * entry_size;
+            let end = start
+                .checked_add(size_of::<Elf64Rel>())
+                .ok_or(ModuleError::InvalidFormat)?;
+            if end > bytes.len() {
+                return Err(ModuleError::InvalidFormat);
+            }
+            let entry = unsafe {
+                // SAFETY: 엔트리별 경계를 검증했고 unaligned read를 수행한다.
+                (bytes.as_ptr().add(start) as *const Elf64Rel).read_unaligned()
+            };
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn apply_dynamic_relocations(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        page_mappings: &[ExecPageMapping],
+    ) -> Result<(), ModuleError> {
+        if dyn_info.rela == 0
+            && dyn_info.rel == 0
+            && dyn_info.jmprel == 0
+            && dyn_info.pltrelsz == 0
+        {
+            return Ok(());
+        }
+
+        let strtab = Self::dynamic_strtab(elf, data, load_bias, dyn_info)?;
+        let mut applied = 0usize;
+        let mut unresolved = 0usize;
+
+        if dyn_info.rela != 0 && dyn_info.relasz != 0 {
+            let relas = Self::parse_rela_entries(
+                elf,
+                data,
+                load_bias,
+                dyn_info.rela,
+                dyn_info.relasz,
+                dyn_info.relaent,
+            )?;
+            for rela in relas.iter() {
+                if Self::apply_rela_entry(
+                    elf,
+                    data,
+                    load_bias,
+                    dyn_info,
+                    strtab,
+                    page_mappings,
+                    rela,
+                    &mut unresolved,
+                )? {
+                    applied += 1;
+                }
+            }
+        }
+
+        if dyn_info.rel != 0 && dyn_info.relsz != 0 {
+            let rels = Self::parse_rel_entries(
+                elf,
+                data,
+                load_bias,
+                dyn_info.rel,
+                dyn_info.relsz,
+                dyn_info.relent,
+            )?;
+            for rel in rels.iter() {
+                if Self::apply_rel_entry(
+                    elf,
+                    data,
+                    load_bias,
+                    dyn_info,
+                    strtab,
+                    page_mappings,
+                    rel,
+                    &mut unresolved,
+                )? {
+                    applied += 1;
+                }
+            }
+        }
+
+        if dyn_info.jmprel != 0 && dyn_info.pltrelsz != 0 {
+            if dyn_info.pltrel == dynamic_tag::DT_RELA as usize {
+                let relas = Self::parse_rela_entries(
+                    elf,
+                    data,
+                    load_bias,
+                    dyn_info.jmprel,
+                    dyn_info.pltrelsz,
+                    dyn_info.relaent,
+                )?;
+                for rela in relas.iter() {
+                    if Self::apply_rela_entry(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        strtab,
+                        page_mappings,
+                        rela,
+                        &mut unresolved,
+                    )? {
+                        applied += 1;
+                    }
+                }
+            } else if dyn_info.pltrel == dynamic_tag::DT_REL as usize {
+                let rels = Self::parse_rel_entries(
+                    elf,
+                    data,
+                    load_bias,
+                    dyn_info.jmprel,
+                    dyn_info.pltrelsz,
+                    dyn_info.relent,
+                )?;
+                for rel in rels.iter() {
+                    if Self::apply_rel_entry(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        strtab,
+                        page_mappings,
+                        rel,
+                        &mut unresolved,
+                    )? {
+                        applied += 1;
+                    }
+                }
+            } else {
+                return Err(ModuleError::InvalidFormat);
+            }
+        }
+
+        if applied > 0 || unresolved > 0 {
+            kprintln!(
+                "[module] DYNAMIC relocation: applied={}, unresolved={}",
+                applied,
+                unresolved
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_rela_entry(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        strtab: Option<&[u8]>,
+        page_mappings: &[ExecPageMapping],
+        rela: &Elf64Rela,
+        unresolved: &mut usize,
+    ) -> Result<bool, ModuleError> {
+        let rel_type = rela.rel_type();
+        let sym = rela.symbol();
+        let place = (rela.r_offset as usize)
+            .checked_add(load_bias)
+            .ok_or(ModuleError::InvalidFormat)?;
+        let addend = rela.r_addend;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            match rel_type {
+                reloc_aarch64::R_AARCH64_NONE => return Ok(false),
+                reloc_aarch64::R_AARCH64_RELATIVE => {
+                    if sym != 0 {
+                        return Err(ModuleError::InvalidFormat);
+                    }
+                    let value = Self::add_signed(load_bias, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_aarch64::R_AARCH64_ABS64
+                | reloc_aarch64::R_AARCH64_GLOB_DAT
+                | reloc_aarch64::R_AARCH64_JUMP_SLOT => {
+                    let symbol = Self::resolve_dynamic_symbol(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                    )?;
+                    let Some(symbol_value) = symbol else {
+                        *unresolved += 1;
+                        return Ok(false);
+                    };
+                    let value = Self::add_signed(symbol_value, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
+            }
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            match rel_type {
+                reloc_riscv::R_RISCV_NONE | reloc_riscv::R_RISCV_RELAX => return Ok(false),
+                reloc_riscv::R_RISCV_RELATIVE => {
+                    if sym != 0 {
+                        return Err(ModuleError::InvalidFormat);
+                    }
+                    let value = Self::add_signed(load_bias, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_riscv::R_RISCV_64
+                | reloc_riscv::R_RISCV_GLOB_DAT
+                | reloc_riscv::R_RISCV_JUMP_SLOT => {
+                    let symbol = Self::resolve_dynamic_symbol(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                    )?;
+                    let Some(symbol_value) = symbol else {
+                        *unresolved += 1;
+                        return Ok(false);
+                    };
+                    let value = Self::add_signed(symbol_value, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Ok(false)
+    }
+
+    fn apply_rel_entry(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        strtab: Option<&[u8]>,
+        page_mappings: &[ExecPageMapping],
+        rel: &Elf64Rel,
+        unresolved: &mut usize,
+    ) -> Result<bool, ModuleError> {
+        let rel_type = rel.rel_type();
+        let sym = rel.symbol();
+        let place = (rel.r_offset as usize)
+            .checked_add(load_bias)
+            .ok_or(ModuleError::InvalidFormat)?;
+        let addend = Self::read_exec_u64(page_mappings, place)? as i64;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            match rel_type {
+                reloc_aarch64::R_AARCH64_NONE => return Ok(false),
+                reloc_aarch64::R_AARCH64_RELATIVE => {
+                    if sym != 0 {
+                        return Err(ModuleError::InvalidFormat);
+                    }
+                    let value = Self::add_signed(load_bias, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_aarch64::R_AARCH64_ABS64
+                | reloc_aarch64::R_AARCH64_GLOB_DAT
+                | reloc_aarch64::R_AARCH64_JUMP_SLOT => {
+                    let symbol = Self::resolve_dynamic_symbol(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                    )?;
+                    let Some(symbol_value) = symbol else {
+                        *unresolved += 1;
+                        return Ok(false);
+                    };
+                    let value = Self::add_signed(symbol_value, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
+            }
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            match rel_type {
+                reloc_riscv::R_RISCV_NONE | reloc_riscv::R_RISCV_RELAX => return Ok(false),
+                reloc_riscv::R_RISCV_RELATIVE => {
+                    if sym != 0 {
+                        return Err(ModuleError::InvalidFormat);
+                    }
+                    let value = Self::add_signed(load_bias, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_riscv::R_RISCV_64
+                | reloc_riscv::R_RISCV_GLOB_DAT
+                | reloc_riscv::R_RISCV_JUMP_SLOT => {
+                    let symbol = Self::resolve_dynamic_symbol(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                    )?;
+                    let Some(symbol_value) = symbol else {
+                        *unresolved += 1;
+                        return Ok(false);
+                    };
+                    let value = Self::add_signed(symbol_value, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Ok(false)
+    }
+
     /// Relocatable object (.o) 로드
     pub fn load_object(data: &[u8], name: &str) -> Result<&'static LoadedModule, ModuleError> {
         kprintln!("[module] Loading relocatable object: {}", name);
@@ -765,6 +1355,7 @@ impl ModuleLoader {
         }
 
         let mut allocated_frames: Vec<usize> = Vec::new();
+        let mut page_mappings: Vec<ExecPageMapping> = Vec::new();
 
         // LOAD 세그먼트 로드
         for ph in elf.load_segments() {
@@ -845,6 +1436,11 @@ impl ModuleLoader {
                     return Err(ModuleError::InvalidFormat);
                 }
 
+                page_mappings.push(ExecPageMapping {
+                    user_page: page_addr,
+                    frame,
+                });
+
                 // 파일 데이터 복사 (BSS는 0으로 유지)
                 let copy_start = core::cmp::max(page_addr, mapped_vaddr);
                 let file_vend = mapped_vaddr + file_size;
@@ -875,6 +1471,7 @@ impl ModuleLoader {
         crate::arch::mmu::flush_tlb_all();
 
         let dynamic_info = Self::parse_dynamic_info(&elf, load_bias)?;
+        Self::apply_dynamic_relocations(&elf, data, load_bias, &dynamic_info, &page_mappings)?;
         if dynamic_info.at_dynamic != 0 {
             kprintln!(
                 "[module] DYNAMIC: at={:#x}, needed={}, strtab={:#x}, symtab={:#x}, rela={:#x}, rel={:#x}, jmprel={:#x}",
