@@ -162,11 +162,15 @@ TEST_STATUS: PASS
 ### 실행
 
 ```bash
-# aarch64 테스트 (기본)
+# aarch64 커널 테스트 (기본)
 make test
 
-# riscv64 테스트
+# riscv64 커널 테스트
 make test ARCH=riscv64
+
+# 아키텍처별 커널 테스트 명시 실행
+make test-kernel-aarch64
+make test-kernel-riscv64
 
 # 커널 모듈 테스트만 양쪽 아키텍처 실행
 make test-all-kernel
@@ -535,8 +539,10 @@ fn panic(_info: &PanicInfo) -> ! {
 | `scripts/build_user_dynamic_c_bins.sh [ARCH] [OUT_DIR]` | C 계열(`clang` + `rust-lld`) 최소 동적 ELF(`hello_dyn`, `ld-kerners-*.so`) 생성 |
 | `scripts/prepare_user_disk.sh [ARCH] [BUSYBOX_PATH] [DISK_IMG]` | BusyBox 기반 `disk.img` 생성 (`/sbin/init`, `/bin/init` 포함) |
 | `scripts/verify_phase15_3_cdyn.sh [ARCH] [BUSYBOX_PATH] [TIMEOUT]` | FAT32 root + rcS에서 `/bin/hello_dyn` 실행 검증 (`PH15_3_CDYN_*` 마커) |
+| `scripts/run_user_tests.sh [ARCH] [TIMEOUT]` | 유저 테스트 오케스트레이션 (`verify_phase15_3_cdyn.sh` 포함, 확장 지점) |
 | `scripts/run_busybox_smoke.sh [ARCH] [BUSYBOX_PATH] [RUNS] [TIMEOUT]` | BusyBox init 스모크 + `COW_FORK_TEST` 로그 판정 |
 | `scripts/run_tests.sh [ARCH] [TIMEOUT]` | 전체 오케스트레이션 (빌드 → 디스크 → 커널 → QEMU → 결과 파싱) |
+| `make test-kernel-aarch64` / `make test-kernel-riscv64` | 커널 테스트 트랙 아키텍처별 실행 |
 | `make test-all-kernel` | 커널 모듈 테스트(`run_tests.sh`)를 aarch64/riscv64 모두 실행 |
 | `make test-user` | 유저 영역 동적 hello 스모크(`verify_phase15_3_cdyn.sh`)를 aarch64/riscv64 모두 실행 |
 | `make test-all` | `test-all-kernel` + `test-user`를 순차 실행 |

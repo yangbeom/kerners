@@ -541,6 +541,7 @@
 - [x] 2026-02-25 4차 착수: 미해결 동적 심볼 정책 확정 (강한 심볼 미해결 시 로드 실패, 약한 심볼 미해결은 0으로 해석)
 - [x] 2026-02-25 C toolchain(zig 미사용) 동적 hello 검증 경로 추가 (`scripts/build_user_dynamic_c_bins.sh`, `scripts/verify_phase15_3_cdyn.sh`)
 - [x] 2026-02-25 테스트 집계 확장: `make test-all`에 유저 영역 동적 hello 검증(`make test-user`) 연동
+- [x] 2026-02-25 테스트 트랙 분리 고정: 커널(`run_tests.sh`) / 유저(`run_user_tests.sh`) 오케스트레이션 분리
 - [x] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 로더 체인, 인터프리터 엔트리 전이)
 - [x] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함, load bias 기반 매핑)
 - [x] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석 (파싱/메타데이터 수집 + 의존성 preload baseline 완료, 심볼 버전/지연 바인딩 미지원)
