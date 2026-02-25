@@ -195,6 +195,32 @@ wait "$RUN_PID" 2>/dev/null || true
 - `PH15_3_CDYN_END`
 - `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
 
+### Phase 15-3 C 동적 busybox(init) 스모크
+
+`clang` + `rust-lld`로 생성한 동적 `busybox_dyn`를 `/sbin/init`으로 부팅하고,
+init 내부에서 `echo/cat/mkdir/head/ps/rm/rmdir` 경로를 실행합니다.
+
+```bash
+# aarch64 + riscv64 모두 검증
+./scripts/verify_phase15_3_busybox_dyn.sh all
+
+# 아키텍처별 단독 검증
+./scripts/verify_phase15_3_busybox_dyn.sh aarch64
+./scripts/verify_phase15_3_busybox_dyn.sh riscv64
+```
+
+기대 로그 마커:
+- `BBDYN_BOOT_BEGIN`
+- `BBDYN_CMD_ECHO_OK`
+- `BBDYN_CMD_CAT_OK`
+- `BBDYN_CMD_MKDIR_OK`
+- `BBDYN_CMD_HEAD_OK`
+- `BBDYN_CMD_PS_OK`
+- `BBDYN_CMD_RM_OK`
+- `BBDYN_CMD_RMDIR_OK`
+- `BBDYN_BOOT_END`
+- `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
+
 ## 수동 실행 방법
 
 ### 1. 빌드

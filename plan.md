@@ -542,6 +542,7 @@
 - [x] 2026-02-25 C toolchain(zig 미사용) 동적 hello 검증 경로 추가 (`scripts/build_user_dynamic_c_bins.sh`, `scripts/verify_phase15_3_cdyn.sh`)
 - [x] 2026-02-25 테스트 집계 확장: `make test-all`에 유저 영역 동적 hello 검증(`make test-user`) 연동
 - [x] 2026-02-25 테스트 트랙 분리 고정: 커널(`run_tests.sh`) / 유저(`run_user_tests.sh`) 오케스트레이션 분리
+- [x] 2026-02-25 C toolchain(zig 미사용) 동적 busybox(init) 검증 경로 추가 (`busybox_dyn`, `scripts/verify_phase15_3_busybox_dyn.sh`)
 - [x] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 로더 체인, 인터프리터 엔트리 전이)
 - [x] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함, load bias 기반 매핑)
 - [x] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석 (파싱/메타데이터 수집 + 의존성 preload baseline 완료, 심볼 버전/지연 바인딩 미지원)
@@ -550,9 +551,10 @@
 - [x] 커널 회귀 테스트 보강: `modules/test_execve`에 동적 ELF `DT_NEEDED` 실패/성공 + 미해결 재배치(`ENOEXEC`) 케이스 추가
 - [x] 2026-02-25 회귀 검증: `make test-all` PASS (`aarch64`/`riscv64`, `RESULT: 16 passed, 0 failed`)
 - [x] 2026-02-25 동적 C hello 실행 검증 PASS (`aarch64`/`riscv64`, `PH15_3_CDYN_HELLO_RC=42` + `CDYN_HELLO_OK`)
+- [x] 2026-02-25 동적 busybox(init) 부팅/명령 실행 검증 PASS (`aarch64`/`riscv64`, `BBDYN_BOOT_END` + `BBDYN_CMD_*_OK`)
 - [x] 최소 런타임 ABI 정비 (TLS 제외: `AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer/TLS reloc는 Phase 15.5에서 구현)
 - [x] 수용 기준(부분): 동적 링크 hello 1종 이상
-- [ ] 수용 기준(잔여): busybox dyn 경로 부팅/명령 실행
+- [x] 수용 기준(잔여): busybox dyn 경로 부팅/명령 실행
 
 #### 15-4. (선택) 유저 ELF 빌드 환경 구축 (보조 트랙)
 - [ ] Rust `no_std` + thin syscall wrapper 기반 로컬 유저 ELF 빌드 템플릿 제공

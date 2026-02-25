@@ -11,6 +11,7 @@
 #
 # Current suite:
 #   - Phase 15-3 dynamic C hello smoke (`verify_phase15_3_cdyn.sh`)
+#   - Phase 15-3 dynamic busybox(init) smoke (`verify_phase15_3_busybox_dyn.sh`)
 
 set -euo pipefail
 
@@ -33,6 +34,7 @@ run_one() {
     local arch="$1"
     print_info "running user-space suite for $arch"
     "$SCRIPT_DIR/verify_phase15_3_cdyn.sh" "$arch" "" "$TIMEOUT_SEC"
+    "$SCRIPT_DIR/verify_phase15_3_busybox_dyn.sh" "$arch" "" "$TIMEOUT_SEC"
 }
 
 case "$ARCH" in
