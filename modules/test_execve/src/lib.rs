@@ -4,12 +4,14 @@
 //! 1. 존재하지 않는 파일 → ENOENT(-2)
 //! 2. ELF가 아닌 파일 → ENOEXEC(-8)
 //! 3. DT_NEEDED 의존성 누락 → ENOENT(-2)
-//! 4. DT_NEEDED 의존성 존재 시 동적 ELF 준비 성공
+//! 4. 미해결 동적 심볼 재배치 → ENOEXEC(-8)
+//! 5. DT_NEEDED 의존성 존재 시 동적 ELF 준비 성공
 
 #![no_std]
 #![no_main]
 
 use core::panic::PanicInfo;
+use core::ptr::{copy_nonoverlapping, write_bytes};
 
 unsafe extern "C" {
     fn kernel_print(s: *const u8, len: usize);
@@ -30,16 +32,21 @@ fn print(s: &str) {
     unsafe { kernel_print(s.as_ptr(), s.len()); }
 }
 
-const ELF_FILE_SIZE: usize = 0x200;
+const ELF_FILE_SIZE: usize = 0x300;
 const ELF_HEADER_SIZE: usize = 0x40;
 const PROGRAM_HEADER_SIZE: usize = 0x38;
 const PROGRAM_HEADER_TABLE_OFFSET: usize = ELF_HEADER_SIZE;
 
 const SEGMENT_FILE_OFFSET: usize = 0x100;
-const SEGMENT_FILE_SIZE: usize = 0x100;
+const SEGMENT_FILE_SIZE: usize = 0x200;
 const SEGMENT_VADDR: usize = 0x0020_0000;
 const DYNAMIC_OFFSET_IN_SEGMENT: usize = 0x00;
 const DYNSTR_OFFSET_IN_SEGMENT: usize = 0x80;
+const UNRESOLVED_DYNSTR_OFFSET_IN_SEGMENT: usize = 0x100;
+const HASH_OFFSET_IN_SEGMENT: usize = 0x140;
+const SYMTAB_OFFSET_IN_SEGMENT: usize = 0x148;
+const RELA_OFFSET_IN_SEGMENT: usize = 0x180;
+const RELA_TARGET_OFFSET_IN_SEGMENT: usize = 0x1a0;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -49,52 +56,83 @@ const ET_DYN: u16 = 3;
 
 const DT_NULL: u64 = 0;
 const DT_NEEDED: u64 = 1;
+const DT_HASH: u64 = 4;
 const DT_STRTAB: u64 = 5;
+const DT_SYMTAB: u64 = 6;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
 const DT_STRSZ: u64 = 10;
+const DT_SYMENT: u64 = 11;
 
 const EV_CURRENT: u32 = 1;
 
 const MISSING_DYNAMIC_PATH: &[u8] = b"/execve_dyn_missing.elf";
 const MISSING_DEP_NAME: &[u8] = b"libphase15_missing.so";
 const OK_DYNAMIC_PATH: &[u8] = b"/execve_dyn_ok.elf";
+const UNRESOLVED_DYNAMIC_PATH: &[u8] = b"/execve_dyn_unresolved.elf";
 const LIB_DIR_PATH: &[u8] = b"/lib";
 const OK_DEP_PATH: &[u8] = b"/lib/libphase15_dep.so";
 const OK_DEP_NAME: &[u8] = b"libphase15_dep.so";
+const UNRESOLVED_SYMBOL_NAME: &[u8] = b"phase15_unresolved_sym";
 
 #[cfg(target_arch = "aarch64")]
 const ELF_MACHINE: u16 = 183;
 #[cfg(target_arch = "riscv64")]
 const ELF_MACHINE: u16 = 243;
+#[cfg(target_arch = "aarch64")]
+const DYN_UNRESOLVED_RELOC_TYPE: u32 = 1025; // R_AARCH64_GLOB_DAT
+#[cfg(target_arch = "riscv64")]
+const DYN_UNRESOLVED_RELOC_TYPE: u32 = 6; // R_RISCV_GLOB_DAT
 
-fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
-    let bytes = value.to_le_bytes();
-    buf[offset] = bytes[0];
-    buf[offset + 1] = bytes[1];
+fn clear_elf_buffer(buf: &mut [u8; ELF_FILE_SIZE]) {
+    unsafe {
+        // SAFETY: `buf` points to a valid mutable buffer of exactly ELF_FILE_SIZE bytes.
+        write_bytes(buf.as_mut_ptr(), 0, ELF_FILE_SIZE);
+    }
 }
 
-fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
-    let bytes = value.to_le_bytes();
-    buf[offset..offset + 4].copy_from_slice(&bytes);
+fn write_u8(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, value: u8) {
+    unsafe {
+        // SAFETY: all offsets in this module are computed from fixed in-bounds constants.
+        *buf.as_mut_ptr().add(offset) = value;
+    }
 }
 
-fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
-    let bytes = value.to_le_bytes();
-    buf[offset..offset + 8].copy_from_slice(&bytes);
+fn write_bytes_at(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, data: &[u8]) {
+    unsafe {
+        // SAFETY: all `(offset, len)` pairs are derived from fixed in-bounds layout constants.
+        copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr().add(offset), data.len());
+    }
 }
 
-fn write_ident(buf: &mut [u8]) {
-    buf[0] = 0x7f;
-    buf[1] = b'E';
-    buf[2] = b'L';
-    buf[3] = b'F';
-    buf[4] = 2; // ELF64
-    buf[5] = 1; // little-endian
-    buf[6] = 1; // EV_CURRENT
-    buf[7] = 0; // System V ABI
+fn write_u16(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    write_bytes_at(buf, offset, &bytes);
+}
+
+fn write_u32(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, value: u32) {
+    let bytes = value.to_le_bytes();
+    write_bytes_at(buf, offset, &bytes);
+}
+
+fn write_u64(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, value: u64) {
+    let bytes = value.to_le_bytes();
+    write_bytes_at(buf, offset, &bytes);
+}
+
+fn write_i64(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, value: i64) {
+    let bytes = value.to_le_bytes();
+    write_bytes_at(buf, offset, &bytes);
+}
+
+fn write_ident(buf: &mut [u8; ELF_FILE_SIZE]) {
+    const IDENT_PREFIX: [u8; 8] = [0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+    write_bytes_at(buf, 0, &IDENT_PREFIX);
 }
 
 fn write_program_header(
-    buf: &mut [u8],
+    buf: &mut [u8; ELF_FILE_SIZE],
     offset: usize,
     p_type: u32,
     p_flags: u32,
@@ -114,17 +152,15 @@ fn write_program_header(
     write_u64(buf, offset + 48, p_align);
 }
 
-fn write_dynamic_entry(buf: &mut [u8], offset: usize, tag: u64, value: u64) {
+fn write_dynamic_entry(buf: &mut [u8; ELF_FILE_SIZE], offset: usize, tag: u64, value: u64) {
     write_u64(buf, offset, tag);
     write_u64(buf, offset + 8, value);
 }
 
 fn build_dynamic_elf(buf: &mut [u8; ELF_FILE_SIZE], needed_name: Option<&[u8]>) -> usize {
-    for byte in buf.iter_mut() {
-        *byte = 0;
-    }
+    clear_elf_buffer(buf);
 
-    write_ident(&mut buf[0..16]);
+    write_ident(buf);
     write_u16(buf, 16, ET_DYN);
     write_u16(buf, 18, ELF_MACHINE);
     write_u32(buf, 20, EV_CURRENT);
@@ -170,13 +206,13 @@ fn build_dynamic_elf(buf: &mut [u8; ELF_FILE_SIZE], needed_name: Option<&[u8]>) 
     );
 
     let dynstr_start = SEGMENT_FILE_OFFSET + DYNSTR_OFFSET_IN_SEGMENT;
-    buf[dynstr_start] = 0;
+    write_u8(buf, dynstr_start, 0);
     let mut dynstr_size = 1usize;
 
     let needed_offset = if let Some(name) = needed_name {
         let name_start = dynstr_start + 1;
-        buf[name_start..name_start + name.len()].copy_from_slice(name);
-        buf[name_start + name.len()] = 0;
+        write_bytes_at(buf, name_start, name);
+        write_u8(buf, name_start + name.len(), 0);
         dynstr_size = 1 + name.len() + 1;
         1usize
     } else {
@@ -201,6 +237,121 @@ fn build_dynamic_elf(buf: &mut [u8; ELF_FILE_SIZE], needed_name: Option<&[u8]>) 
     }
 
     write_dynamic_entry(buf, dyn_off, DT_NULL, 0);
+    ELF_FILE_SIZE
+}
+
+fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
+    clear_elf_buffer(buf);
+
+    write_ident(buf);
+    write_u16(buf, 16, ET_DYN);
+    write_u16(buf, 18, ELF_MACHINE);
+    write_u32(buf, 20, EV_CURRENT);
+    write_u64(buf, 24, (SEGMENT_VADDR + 0x40) as u64);
+    write_u64(buf, 32, PROGRAM_HEADER_TABLE_OFFSET as u64);
+    write_u64(buf, 40, 0);
+    write_u32(buf, 48, 0);
+    write_u16(buf, 52, ELF_HEADER_SIZE as u16);
+    write_u16(buf, 54, PROGRAM_HEADER_SIZE as u16);
+    write_u16(buf, 56, 2);
+    write_u16(buf, 58, 0);
+    write_u16(buf, 60, 0);
+    write_u16(buf, 62, 0);
+
+    write_program_header(
+        buf,
+        PROGRAM_HEADER_TABLE_OFFSET,
+        PT_LOAD,
+        PF_R | PF_W,
+        SEGMENT_FILE_OFFSET as u64,
+        SEGMENT_VADDR as u64,
+        SEGMENT_FILE_SIZE as u64,
+        SEGMENT_FILE_SIZE as u64,
+        0x1000,
+    );
+
+    let dynamic_size = 9 * 16; // STRTAB, STRSZ, SYMTAB, SYMENT, HASH, RELA, RELASZ, RELAENT, NULL
+    write_program_header(
+        buf,
+        PROGRAM_HEADER_TABLE_OFFSET + PROGRAM_HEADER_SIZE,
+        PT_DYNAMIC,
+        PF_R,
+        (SEGMENT_FILE_OFFSET + DYNAMIC_OFFSET_IN_SEGMENT) as u64,
+        (SEGMENT_VADDR + DYNAMIC_OFFSET_IN_SEGMENT) as u64,
+        dynamic_size as u64,
+        dynamic_size as u64,
+        8,
+    );
+
+    let strtab_start = SEGMENT_FILE_OFFSET + UNRESOLVED_DYNSTR_OFFSET_IN_SEGMENT;
+    write_u8(buf, strtab_start, 0);
+    let sym_name_start = strtab_start + 1;
+    write_bytes_at(buf, sym_name_start, UNRESOLVED_SYMBOL_NAME);
+    write_u8(buf, sym_name_start + UNRESOLVED_SYMBOL_NAME.len(), 0);
+    let strtab_size = 1 + UNRESOLVED_SYMBOL_NAME.len() + 1;
+
+    let hash_start = SEGMENT_FILE_OFFSET + HASH_OFFSET_IN_SEGMENT;
+    write_u32(buf, hash_start, 1); // nbucket
+    write_u32(buf, hash_start + 4, 2); // nchain (undef + unresolved 심볼)
+
+    let symtab_start = SEGMENT_FILE_OFFSET + SYMTAB_OFFSET_IN_SEGMENT;
+    let sym1_off = symtab_start + 24;
+    write_u32(buf, sym1_off, 1); // st_name (strtab offset)
+    write_u8(buf, sym1_off + 4, 0x10); // STB_GLOBAL | STT_NOTYPE
+    write_u8(buf, sym1_off + 5, 0);
+    write_u16(buf, sym1_off + 6, 0); // SHN_UNDEF
+    write_u64(buf, sym1_off + 8, 0);
+    write_u64(buf, sym1_off + 16, 0);
+
+    let rela_start = SEGMENT_FILE_OFFSET + RELA_OFFSET_IN_SEGMENT;
+    write_u64(
+        buf,
+        rela_start,
+        (SEGMENT_VADDR + RELA_TARGET_OFFSET_IN_SEGMENT) as u64,
+    );
+    let r_info = ((1u64) << 32) | (DYN_UNRESOLVED_RELOC_TYPE as u64);
+    write_u64(buf, rela_start + 8, r_info);
+    write_i64(buf, rela_start + 16, 0);
+
+    let mut dyn_off = SEGMENT_FILE_OFFSET + DYNAMIC_OFFSET_IN_SEGMENT;
+    write_dynamic_entry(
+        buf,
+        dyn_off,
+        DT_STRTAB,
+        (SEGMENT_VADDR + UNRESOLVED_DYNSTR_OFFSET_IN_SEGMENT) as u64,
+    );
+    dyn_off += 16;
+    write_dynamic_entry(buf, dyn_off, DT_STRSZ, strtab_size as u64);
+    dyn_off += 16;
+    write_dynamic_entry(
+        buf,
+        dyn_off,
+        DT_SYMTAB,
+        (SEGMENT_VADDR + SYMTAB_OFFSET_IN_SEGMENT) as u64,
+    );
+    dyn_off += 16;
+    write_dynamic_entry(buf, dyn_off, DT_SYMENT, 24);
+    dyn_off += 16;
+    write_dynamic_entry(
+        buf,
+        dyn_off,
+        DT_HASH,
+        (SEGMENT_VADDR + HASH_OFFSET_IN_SEGMENT) as u64,
+    );
+    dyn_off += 16;
+    write_dynamic_entry(
+        buf,
+        dyn_off,
+        DT_RELA,
+        (SEGMENT_VADDR + RELA_OFFSET_IN_SEGMENT) as u64,
+    );
+    dyn_off += 16;
+    write_dynamic_entry(buf, dyn_off, DT_RELASZ, 24);
+    dyn_off += 16;
+    write_dynamic_entry(buf, dyn_off, DT_RELAENT, 24);
+    dyn_off += 16;
+    write_dynamic_entry(buf, dyn_off, DT_NULL, 0);
+
     ELF_FILE_SIZE
 }
 
@@ -277,8 +428,8 @@ pub extern "C" fn module_init() -> i32 {
     // 테스트 3: 동적 ELF + DT_NEEDED 의존성 누락
     print("[test_execve] test: ENOENT on missing DT_NEEDED dependency ... ");
     let mut dyn_missing = [0u8; ELF_FILE_SIZE];
-    let dyn_missing_len = build_dynamic_elf(&mut dyn_missing, Some(MISSING_DEP_NAME));
-    if !create_file_with_contents(MISSING_DYNAMIC_PATH, &dyn_missing[..dyn_missing_len]) {
+    let _ = build_dynamic_elf(&mut dyn_missing, Some(MISSING_DEP_NAME));
+    if !create_file_with_contents(MISSING_DYNAMIC_PATH, &dyn_missing) {
         print("FAIL (create/write)\n");
         return -5;
     }
@@ -291,23 +442,45 @@ pub extern "C" fn module_init() -> i32 {
     print("PASS\n");
     let _ = unsafe { kernel_vfs_unlink(MISSING_DYNAMIC_PATH.as_ptr(), MISSING_DYNAMIC_PATH.len()) };
 
-    // 테스트 4: 동적 ELF + DT_NEEDED 의존성 존재
+    // 테스트 4: 미해결 동적 심볼 재배치
+    print("[test_execve] test: ENOEXEC on unresolved dynamic symbol relocation ... ");
+    let mut dyn_unresolved = [0u8; ELF_FILE_SIZE];
+    let _ = build_unresolved_reloc_elf(&mut dyn_unresolved);
+    if !create_file_with_contents(UNRESOLVED_DYNAMIC_PATH, &dyn_unresolved) {
+        print("FAIL (create/write)\n");
+        return -7;
+    }
+    let unresolved_ret =
+        unsafe { kernel_exec_prepare(UNRESOLVED_DYNAMIC_PATH.as_ptr(), UNRESOLVED_DYNAMIC_PATH.len()) };
+    if unresolved_ret != -8 {
+        print("FAIL\n");
+        let _ = unsafe {
+            kernel_vfs_unlink(UNRESOLVED_DYNAMIC_PATH.as_ptr(), UNRESOLVED_DYNAMIC_PATH.len())
+        };
+        return -8;
+    }
+    print("PASS\n");
+    let _ = unsafe {
+        kernel_vfs_unlink(UNRESOLVED_DYNAMIC_PATH.as_ptr(), UNRESOLVED_DYNAMIC_PATH.len())
+    };
+
+    // 테스트 5: 동적 ELF + DT_NEEDED 의존성 존재
     print("[test_execve] test: dynamic ELF prepare succeeds with DT_NEEDED present ... ");
     let _ = unsafe { kernel_vfs_mkdir(LIB_DIR_PATH.as_ptr(), LIB_DIR_PATH.len()) };
 
     let mut dep_elf = [0u8; ELF_FILE_SIZE];
-    let dep_elf_len = build_dynamic_elf(&mut dep_elf, None);
-    if !create_file_with_contents(OK_DEP_PATH, &dep_elf[..dep_elf_len]) {
+    let _ = build_dynamic_elf(&mut dep_elf, None);
+    if !create_file_with_contents(OK_DEP_PATH, &dep_elf) {
         print("FAIL (dep create/write)\n");
-        return -7;
+        return -9;
     }
 
     let mut dyn_ok = [0u8; ELF_FILE_SIZE];
-    let dyn_ok_len = build_dynamic_elf(&mut dyn_ok, Some(OK_DEP_NAME));
-    if !create_file_with_contents(OK_DYNAMIC_PATH, &dyn_ok[..dyn_ok_len]) {
+    let _ = build_dynamic_elf(&mut dyn_ok, Some(OK_DEP_NAME));
+    if !create_file_with_contents(OK_DYNAMIC_PATH, &dyn_ok) {
         print("FAIL (main create/write)\n");
         let _ = unsafe { kernel_vfs_unlink(OK_DEP_PATH.as_ptr(), OK_DEP_PATH.len()) };
-        return -8;
+        return -10;
     }
 
     let ok_ret = unsafe { kernel_exec_prepare(OK_DYNAMIC_PATH.as_ptr(), OK_DYNAMIC_PATH.len()) };
@@ -315,7 +488,7 @@ pub extern "C" fn module_init() -> i32 {
         print("FAIL\n");
         let _ = unsafe { kernel_vfs_unlink(OK_DYNAMIC_PATH.as_ptr(), OK_DYNAMIC_PATH.len()) };
         let _ = unsafe { kernel_vfs_unlink(OK_DEP_PATH.as_ptr(), OK_DEP_PATH.len()) };
-        return -9;
+        return -11;
     }
     print("PASS\n");
 

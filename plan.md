@@ -533,17 +533,18 @@
 - [x] 수용 기준: 셸에서 파일 생성/조회/삭제 + `/proc` 조회 + 프로세스 목록 확인 시나리오 통과
 
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)
-- [ ] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
-- [ ] 상태 메모: 엔트리 체인(`PT_INTERP`)과 `ET_DYN` 매핑은 완료, 동적 심볼/재배치/so 의존성 해석이 남아 있음
+- [x] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
+- [x] 상태 메모: `PT_INTERP` 체인, `ET_DYN` 매핑, `DT_NEEDED` preload, `REL/RELA` baseline, 미해결 강한 심볼 실패 정책까지 반영 완료 (심볼 버저닝/lazy binding/TLS 미지원)
 - [x] 2026-02-25 1차 착수: `PT_DYNAMIC`/`DT_*` 파싱 baseline 추가 (`Elf64DynamicEntry`, `DynamicTag`, `ExecutableLoadInfo.dynamic`) + auxv `AT_FLAGS` 반영
 - [x] 2026-02-25 2차 착수: 런타임 재배치 baseline 추가 (`REL`/`RELA` 파서 + `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` 아키텍처별 적용 루틴)
 - [x] 2026-02-25 3차 착수: `DT_NEEDED` 의존성 preload + 실행 ELF 전역 심볼 스코프(`kernel` + preload된 실행 객체) baseline 연동
+- [x] 2026-02-25 4차 착수: 미해결 동적 심볼 정책 확정 (강한 심볼 미해결 시 로드 실패, 약한 심볼 미해결은 0으로 해석)
 - [x] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 로더 체인, 인터프리터 엔트리 전이)
 - [x] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함, load bias 기반 매핑)
-- [ ] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석 (파싱/메타데이터 수집 + 의존성 preload baseline 완료, 심볼 버전/지연 바인딩 미지원)
-- [ ] 런타임 재배치 (`REL`/`RELA`, `JUMP_SLOT`, `GLOB_DAT`) — baseline 완료, 미해결 외부 심볼 정책/검증 보강 필요
+- [x] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석 (파싱/메타데이터 수집 + 의존성 preload baseline 완료, 심볼 버전/지연 바인딩 미지원)
+- [x] 런타임 재배치 (`REL`/`RELA`, `JUMP_SLOT`, `GLOB_DAT`) — baseline + 미해결 강한 외부 심볼 실패 정책/약한 심볼 0 해석 반영
 - [x] 공유 라이브러리 의존성 로딩 baseline (`DT_NEEDED`, `LD_LIBRARY_PATH` 또는 `/lib:/usr/lib:/lib64:/usr/lib64`)
-- [x] 커널 회귀 테스트 보강: `modules/test_execve`에 동적 ELF `DT_NEEDED` 실패/성공 케이스 추가
+- [x] 커널 회귀 테스트 보강: `modules/test_execve`에 동적 ELF `DT_NEEDED` 실패/성공 + 미해결 재배치(`ENOEXEC`) 케이스 추가
 - [x] 2026-02-25 회귀 검증: `make test-all` PASS (`aarch64`/`riscv64`, `RESULT: 16 passed, 0 failed`)
 - [x] 최소 런타임 ABI 정비 (TLS 제외: `AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer/TLS reloc는 Phase 15.5에서 구현)
 - [ ] 수용 기준: 동적 링크 hello 1종 이상 + busybox dyn 경로 부팅/명령 실행

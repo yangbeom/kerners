@@ -189,6 +189,8 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   - `argv/envp`는 개수/길이 + 총량(현재 32KiB) 상한을 검사하며, 초과 시 `E2BIG`
   - aarch64/riscv64에서는 `path/argv/envp`가 유저 VA 범위인지 선검증(범위 밖은 `EFAULT`)
   - 유저 포인터 fault 복구는 제한적이며, 현재는 COW write fault 경로 중심으로만 복구
+  - 동적 재배치에서 강한 외부 심볼 미해결 또는 미지원 재배치 타입은 `ENOEXEC`으로 반환
+  - 약한(weak) 외부 심볼 미해결은 값 `0`으로 해석
   - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE/AT_FLAGS`)를 스택에 제공
   - 공유 vm_group 격리 중 `prepare_exec_image`가 실패하면 기존 루트 테이블로 롤백 후 에러를 반환
   - TLS(`PT_TLS`, TLS relocation, thread pointer)는 별도 phase에서 지원 예정

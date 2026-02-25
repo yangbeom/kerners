@@ -328,7 +328,10 @@ fn map_module_error(err: ModuleError) -> ExecError {
     match err {
         ModuleError::OutOfMemory => ExecError::OutOfMemory,
         ModuleError::NotFound => ExecError::NotFound,
-        ModuleError::InvalidFormat | ModuleError::ElfError(_) => ExecError::InvalidElf,
+        ModuleError::InvalidFormat
+        | ModuleError::ElfError(_)
+        | ModuleError::SymbolNotFound
+        | ModuleError::UnsupportedRelocation(_) => ExecError::InvalidElf,
         _ => ExecError::IoError,
     }
 }

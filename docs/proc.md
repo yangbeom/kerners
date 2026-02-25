@@ -205,6 +205,9 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
   향후 런타임 링크 단계에서 사용할 메타데이터를 수집합니다.
 - 로더는 수집된 메타데이터로 `REL/RELA` baseline 재배치를 선적용합니다
   (`RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` 포함).
+- `ABS64`/`GLOB_DAT`/`JUMP_SLOT`에서 강한 외부 심볼이 끝내 해석되지 않거나
+  미지원 재배치 타입이 나오면 exec 준비는 실패(`ENOEXEC`)합니다.
+- 약한(weak) 외부 심볼이 미해결인 경우는 값 `0`으로 해석합니다.
 - 실행 준비 경로는 `DT_NEEDED`를 재귀적으로 수집해 공유 라이브러리를 preload합니다.
   - 라이브러리 탐색은 `LD_LIBRARY_PATH`를 우선하며, 미설정 시 `/lib:/usr/lib:/lib64:/usr/lib64`를 사용합니다.
   - preload된 실행 객체의 export 심볼은 같은 `execve` 준비 단계에서 전역 해석 범위로 등록됩니다.

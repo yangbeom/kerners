@@ -276,6 +276,9 @@ make test-all
 |--------|------|
 | missing path | 존재하지 않는 경로에 대해 `kernel_exec_prepare()`가 `ENOENT(-2)` 반환 |
 | non-ELF | 일반 파일에 대해 `kernel_exec_prepare()`가 `ENOEXEC(-8)` 반환 |
+| missing `DT_NEEDED` | 동적 ELF의 의존 `.so`가 없으면 `ENOENT(-2)` 반환 |
+| unresolved dynamic symbol | 동적 재배치(`GLOB_DAT` 계열)에서 강한 심볼 미해결 시 `ENOEXEC(-8)` 반환 |
+| resolved `DT_NEEDED` | 의존 `.so`를 `/lib`에 제공하면 동적 ELF 준비가 성공(0) |
 
 ### modules/test_proc — process syscall baseline
 

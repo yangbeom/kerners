@@ -814,6 +814,7 @@ impl ModuleLoader {
             let name = strtab
                 .map(|tab| Self::string_at(tab, symbol.st_name as usize))
                 .unwrap_or("");
+            let is_weak = symbol.binding() == 2;
             if !name.is_empty() {
                 if let Some(addr) = lookup_symbol(name) {
                     return Ok(Some(addr));
@@ -821,8 +822,15 @@ impl ModuleLoader {
                 if let Some(addr) = Self::lookup_exec_dynamic_symbol(name) {
                     return Ok(Some(addr));
                 }
+                if is_weak {
+                    kprintln!("[module] dynamic weak unresolved symbol: {}", name);
+                    return Ok(Some(0));
+                }
                 kprintln!("[module] dynamic unresolved symbol: {}", name);
             } else {
+                if is_weak {
+                    return Ok(Some(0));
+                }
                 kprintln!("[module] dynamic unresolved symbol index={}", sym_index);
             }
             return Ok(None);
@@ -975,7 +983,6 @@ impl ModuleLoader {
 
         let strtab = Self::dynamic_strtab(elf, data, load_bias, dyn_info)?;
         let mut applied = 0usize;
-        let mut unresolved = 0usize;
 
         if dyn_info.rela != 0 && dyn_info.relasz != 0 {
             let relas = Self::parse_rela_entries(
@@ -995,7 +1002,6 @@ impl ModuleLoader {
                     strtab,
                     page_mappings,
                     rela,
-                    &mut unresolved,
                 )? {
                     applied += 1;
                 }
@@ -1020,7 +1026,6 @@ impl ModuleLoader {
                     strtab,
                     page_mappings,
                     rel,
-                    &mut unresolved,
                 )? {
                     applied += 1;
                 }
@@ -1046,7 +1051,6 @@ impl ModuleLoader {
                         strtab,
                         page_mappings,
                         rela,
-                        &mut unresolved,
                     )? {
                         applied += 1;
                     }
@@ -1069,7 +1073,6 @@ impl ModuleLoader {
                         strtab,
                         page_mappings,
                         rel,
-                        &mut unresolved,
                     )? {
                         applied += 1;
                     }
@@ -1079,12 +1082,8 @@ impl ModuleLoader {
             }
         }
 
-        if applied > 0 || unresolved > 0 {
-            kprintln!(
-                "[module] DYNAMIC relocation: applied={}, unresolved={}",
-                applied,
-                unresolved
-            );
+        if applied > 0 {
+            kprintln!("[module] DYNAMIC relocation: applied={}", applied);
         }
         Ok(())
     }
@@ -1097,7 +1096,6 @@ impl ModuleLoader {
         strtab: Option<&[u8]>,
         page_mappings: &[ExecPageMapping],
         rela: &Elf64Rela,
-        unresolved: &mut usize,
     ) -> Result<bool, ModuleError> {
         let rel_type = rela.rel_type();
         let sym = rela.symbol();
@@ -1130,8 +1128,7 @@ impl ModuleLoader {
                         strtab,
                     )?;
                     let Some(symbol_value) = symbol else {
-                        *unresolved += 1;
-                        return Ok(false);
+                        return Err(ModuleError::SymbolNotFound);
                     };
                     let value = Self::add_signed(symbol_value, addend)?;
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
@@ -1165,8 +1162,7 @@ impl ModuleLoader {
                         strtab,
                     )?;
                     let Some(symbol_value) = symbol else {
-                        *unresolved += 1;
-                        return Ok(false);
+                        return Err(ModuleError::SymbolNotFound);
                     };
                     let value = Self::add_signed(symbol_value, addend)?;
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
@@ -1188,7 +1184,6 @@ impl ModuleLoader {
         strtab: Option<&[u8]>,
         page_mappings: &[ExecPageMapping],
         rel: &Elf64Rel,
-        unresolved: &mut usize,
     ) -> Result<bool, ModuleError> {
         let rel_type = rel.rel_type();
         let sym = rel.symbol();
@@ -1221,8 +1216,7 @@ impl ModuleLoader {
                         strtab,
                     )?;
                     let Some(symbol_value) = symbol else {
-                        *unresolved += 1;
-                        return Ok(false);
+                        return Err(ModuleError::SymbolNotFound);
                     };
                     let value = Self::add_signed(symbol_value, addend)?;
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
@@ -1256,8 +1250,7 @@ impl ModuleLoader {
                         strtab,
                     )?;
                     let Some(symbol_value) = symbol else {
-                        *unresolved += 1;
-                        return Ok(false);
+                        return Err(ModuleError::SymbolNotFound);
                     };
                     let value = Self::add_signed(symbol_value, addend)?;
                     Self::write_exec_u64(page_mappings, place, value as u64)?;

@@ -66,6 +66,8 @@ pub extern "C" fn module_version() -> *const u8 {
 - `ET_DYN`은 실행 시 load bias를 적용해 유효 사용자 주소 범위로 이동 매핑한다.
 - `.dynamic` 처리의 현재 범위는 `DT_*` 메타데이터 수집 + baseline 재배치 + `DT_NEEDED` preload다.
 - 외부 심볼 해석은 커널 심볼 + preload된 실행 객체의 export 심볼 범위로 제한된다.
+- `ABS64`/`GLOB_DAT`/`JUMP_SLOT` 재배치에서 강한(weak 아님) 외부 심볼이 미해결이면 로드 실패(`SymbolNotFound`)로 처리한다.
+- 약한(weak) 외부 심볼이 미해결이면 값 `0`으로 해석해 계속 진행한다.
 - 심볼 버저닝(`DT_VER*`), lazy binding, TLS 재배치(`PT_TLS`)는 아직 미구현이다.
 - 가드 범위를 벗어난 세그먼트는 로드 실패한다.
   - aarch64: `0x0010_0000..0x0800_0000`
