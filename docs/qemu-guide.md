@@ -221,6 +221,32 @@ init 내부에서 `echo/cat/mkdir/head/ps/rm/rmdir` 경로를 실행합니다.
 - `BBDYN_BOOT_END`
 - `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
 
+### Phase 15-4 내부 최소 유저 init 스모크
+
+`clang` + `rust-lld`로 빌드한 내부 최소 동적 init(`uminitest_dyn`)을 `/sbin/init`으로 실행해
+핵심 syscall 경로(`open/read/write/mkdir/unlink/getdents/clock_gettime`)를 빠르게 확인합니다.
+
+```bash
+# aarch64 + riscv64 모두 검증
+./scripts/verify_phase15_4_internal_min.sh all
+
+# 아키텍처별 단독 검증
+./scripts/verify_phase15_4_internal_min.sh aarch64
+./scripts/verify_phase15_4_internal_min.sh riscv64
+```
+
+기대 로그 마커:
+- `UMIN_BEGIN`
+- `UMIN_GETPID_OK`
+- `UMIN_RW_OK`
+- `UMIN_MKDIR_OK`
+- `UMIN_GETDENTS_OK`
+- `UMIN_PROC_STATUS_OK`
+- `UMIN_CLOCK_OK`
+- `UMIN_CLEANUP_OK`
+- `UMIN_END`
+- `UMIN_FAIL_*`, `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
+
 ## 수동 실행 방법
 
 ### 1. 빌드

@@ -557,6 +557,7 @@
 - [x] 수용 기준(잔여): busybox dyn 경로 부팅/명령 실행
 
 #### 15-4. (선택) 유저 ELF 빌드 환경 구축 (보조 트랙)
+- [x] 2026-02-25 내부 최소 유저 스모크 경로 추가 (`uminitest_dyn`, `scripts/verify_phase15_4_internal_min.sh`, `make test-user` 연동)
 - [ ] Rust `no_std` + thin syscall wrapper 기반 로컬 유저 ELF 빌드 템플릿 제공
 - [ ] 최소 libc 대체 또는 wrapper 라이브러리 정리 (테스트/디버그 목적)
 - [ ] 샘플 유저 프로그램(`hello`, `syscall smoke`)과 빌드 스크립트 제공

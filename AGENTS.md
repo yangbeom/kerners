@@ -446,11 +446,12 @@ kerners/
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep regression test module
 ├── modules/test_signal/     # signal syscall regression test module
 ├── modules/test_procfs/     # procfs + phase14 fs syscall regression test module
-├── scripts/build_user_dynamic_c_bins.sh  # C toolchain dynamic user ELF builder (hello_dyn + busybox_dyn + ld-kerners)
+├── scripts/build_user_dynamic_c_bins.sh  # C toolchain dynamic user ELF builder (hello_dyn + busybox_dyn + uminitest_dyn + ld-kerners)
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
-├── scripts/run_user_tests.sh  # User-space test orchestrator (dynamic hello + dynamic busybox smoke)
+├── scripts/run_user_tests.sh  # User-space test orchestrator (dynamic hello + dynamic busybox + internal minimal smoke)
 ├── scripts/verify_phase15_3_cdyn.sh  # Phase 15-3 C dynamic hello smoke verifier
 ├── scripts/verify_phase15_3_busybox_dyn.sh  # Phase 15-3 C dynamic busybox(init) smoke verifier
+├── scripts/verify_phase15_4_internal_min.sh  # Phase 15-4 internal minimal init smoke verifier
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files
 ├── docs/                    # Documentation (see docs/README.md for full list)

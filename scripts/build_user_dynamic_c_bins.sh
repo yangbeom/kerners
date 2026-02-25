@@ -7,6 +7,7 @@
 # Outputs:
 #   <OUT_DIR>/hello_dyn
 #   <OUT_DIR>/busybox_dyn
+#   <OUT_DIR>/uminitest_dyn
 #   <OUT_DIR>/ld-kerners-<arch>.so
 
 set -euo pipefail
@@ -90,12 +91,15 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 HELLO_SRC="$TMP_DIR/hello_dyn.c"
 BB_SRC="$TMP_DIR/busybox_dyn.c"
+UMIN_SRC="$TMP_DIR/uminitest_dyn.c"
 LD_SRC="$TMP_DIR/ld_kerners.c"
 HELLO_OBJ="$TMP_DIR/hello_dyn.o"
 BB_OBJ="$TMP_DIR/busybox_dyn.o"
+UMIN_OBJ="$TMP_DIR/uminitest_dyn.o"
 LD_OBJ="$TMP_DIR/ld_kerners.o"
 HELLO_BIN="$OUT_DIR/hello_dyn"
 BB_BIN="$OUT_DIR/busybox_dyn"
+UMIN_BIN="$OUT_DIR/uminitest_dyn"
 LD_BIN="$OUT_DIR/$LD_SO_NAME"
 
 cat >"$HELLO_SRC" <<'EOF'
@@ -574,6 +578,295 @@ void bb_start(u64 *sp) {
 }
 EOF
 
+cat >"$UMIN_SRC" <<'EOF'
+typedef unsigned long u64;
+typedef long s64;
+
+#define AT_FDCWD (-100)
+#define AT_REMOVEDIR 0x200
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_CREAT 0x40
+#define O_TRUNC 0x200
+#define CLOCK_MONOTONIC 1
+
+#define SYS_OPENAT 56
+#define SYS_CLOSE 57
+#define SYS_READ 63
+#define SYS_WRITE 64
+#define SYS_GETDENTS64 61
+#define SYS_MKDIRAT 34
+#define SYS_UNLINKAT 35
+#define SYS_GETPID 172
+#define SYS_GETPPID 173
+#define SYS_CLOCK_GETTIME 113
+#define SYS_EXIT 93
+
+typedef struct {
+    s64 tv_sec;
+    s64 tv_nsec;
+} timespec_t;
+
+static u64 c_strlen(const char *s) {
+    u64 n = 0;
+    while (s[n] != '\0') {
+        n += 1;
+    }
+    return n;
+}
+
+static int c_memcmp(const char *a, const char *b, u64 n) {
+    u64 i;
+    for (i = 0; i < n; i++) {
+        if ((unsigned char)a[i] != (unsigned char)b[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void write_raw(const char *buf, u64 len);
+
+static void write_str(const char *s) {
+    write_raw(s, c_strlen(s));
+}
+
+static void write_line(const char *s) {
+    write_str(s);
+    write_raw("\n", 1);
+}
+
+static void write_u64(u64 value) {
+    char tmp[32];
+    u64 i = 0;
+
+    if (value == 0) {
+        write_raw("0", 1);
+        return;
+    }
+
+    while (value != 0 && i < (u64)sizeof(tmp)) {
+        tmp[i] = (char)('0' + (value % 10));
+        value /= 10;
+        i += 1;
+    }
+
+    while (i > 0) {
+        i -= 1;
+        write_raw(&tmp[i], 1);
+    }
+}
+
+static void write_s64(s64 value) {
+    if (value < 0) {
+        write_raw("-", 1);
+        write_u64((u64)(-value));
+        return;
+    }
+    write_u64((u64)value);
+}
+
+#if defined(__aarch64__)
+static s64 raw_syscall6(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    register u64 x0 __asm__("x0") = a0;
+    register u64 x1 __asm__("x1") = a1;
+    register u64 x2 __asm__("x2") = a2;
+    register u64 x3 __asm__("x3") = a3;
+    register u64 x4 __asm__("x4") = a4;
+    register u64 x5 __asm__("x5") = a5;
+    register u64 x8 __asm__("x8") = nr;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+                     : "memory");
+    return (s64)x0;
+}
+
+__attribute__((noreturn, naked))
+void _start(void) {
+    __asm__ volatile(
+        "mov x0, sp\n"
+        "b umin_start\n"
+    );
+}
+#elif defined(__riscv)
+static s64 raw_syscall6(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    register u64 x10 __asm__("a0") = a0;
+    register u64 x11 __asm__("a1") = a1;
+    register u64 x12 __asm__("a2") = a2;
+    register u64 x13 __asm__("a3") = a3;
+    register u64 x14 __asm__("a4") = a4;
+    register u64 x15 __asm__("a5") = a5;
+    register u64 x17 __asm__("a7") = nr;
+    __asm__ volatile("ecall"
+                     : "+r"(x10)
+                     : "r"(x11), "r"(x12), "r"(x13), "r"(x14), "r"(x15), "r"(x17)
+                     : "memory");
+    return (s64)x10;
+}
+
+__attribute__((noreturn, naked))
+void _start(void) {
+    __asm__ volatile(
+        "mv a0, sp\n"
+        "j umin_start\n"
+    );
+}
+#else
+#error unsupported arch
+#endif
+
+static s64 sys_openat(int dirfd, const char *path, u64 flags, u64 mode) {
+    return raw_syscall6(SYS_OPENAT, (u64)(s64)dirfd, (u64)path, flags, mode, 0, 0);
+}
+
+static s64 sys_close(int fd) {
+    return raw_syscall6(SYS_CLOSE, (u64)(s64)fd, 0, 0, 0, 0, 0);
+}
+
+static s64 sys_read(int fd, void *buf, u64 len) {
+    return raw_syscall6(SYS_READ, (u64)(s64)fd, (u64)buf, len, 0, 0, 0);
+}
+
+static s64 sys_write(int fd, const void *buf, u64 len) {
+    return raw_syscall6(SYS_WRITE, (u64)(s64)fd, (u64)buf, len, 0, 0, 0);
+}
+
+static s64 sys_getdents64(int fd, void *buf, u64 len) {
+    return raw_syscall6(SYS_GETDENTS64, (u64)(s64)fd, (u64)buf, len, 0, 0, 0);
+}
+
+static s64 sys_mkdirat(int dirfd, const char *path, u64 mode) {
+    return raw_syscall6(SYS_MKDIRAT, (u64)(s64)dirfd, (u64)path, mode, 0, 0, 0);
+}
+
+static s64 sys_unlinkat(int dirfd, const char *path, u64 flags) {
+    return raw_syscall6(SYS_UNLINKAT, (u64)(s64)dirfd, (u64)path, flags, 0, 0, 0);
+}
+
+static s64 sys_getpid(void) {
+    return raw_syscall6(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+}
+
+static s64 sys_getppid(void) {
+    return raw_syscall6(SYS_GETPPID, 0, 0, 0, 0, 0, 0);
+}
+
+static s64 sys_clock_gettime(int clock_id, timespec_t *ts) {
+    return raw_syscall6(SYS_CLOCK_GETTIME, (u64)(s64)clock_id, (u64)ts, 0, 0, 0, 0);
+}
+
+__attribute__((noreturn))
+static void sys_exit(int code) {
+    (void)raw_syscall6(SYS_EXIT, (u64)(s64)code, 0, 0, 0, 0, 0);
+    for (;;) {}
+}
+
+static void write_raw(const char *buf, u64 len) {
+    (void)sys_write(1, buf, len);
+}
+
+static int fail_step(const char *step, s64 rc) {
+    write_str("UMIN_FAIL_");
+    write_str(step);
+    write_str("_RC=");
+    write_s64(rc);
+    write_raw("\n", 1);
+    return 1;
+}
+
+static int run_minimal_tests(void) {
+    static const char payload[] = "umin_payload\n";
+    char io_buf[128];
+    char dent_buf[512];
+    s64 fd;
+    s64 n;
+    timespec_t ts;
+
+    write_line("UMIN_BEGIN");
+
+    if (sys_getpid() <= 0 || sys_getppid() < 0) {
+        return fail_step("PID", -1);
+    }
+    write_line("UMIN_GETPID_OK");
+
+    fd = sys_openat(AT_FDCWD, "/umin.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return fail_step("OPEN_WRITE", fd);
+    }
+    n = sys_write((int)fd, payload, sizeof(payload) - 1);
+    (void)sys_close((int)fd);
+    if (n != (s64)(sizeof(payload) - 1)) {
+        return fail_step("WRITE", n);
+    }
+    fd = sys_openat(AT_FDCWD, "/umin.txt", O_RDONLY, 0);
+    if (fd < 0) {
+        return fail_step("OPEN_READ", fd);
+    }
+    n = sys_read((int)fd, io_buf, sizeof(io_buf));
+    (void)sys_close((int)fd);
+    if (n != (s64)(sizeof(payload) - 1)) {
+        return fail_step("READ", n);
+    }
+    if (c_memcmp(io_buf, payload, sizeof(payload) - 1) != 0) {
+        return fail_step("READ_CMP", -1);
+    }
+    write_line("UMIN_RW_OK");
+
+    if (sys_mkdirat(AT_FDCWD, "/umin_dir", 0755) < 0) {
+        return fail_step("MKDIR", -1);
+    }
+    write_line("UMIN_MKDIR_OK");
+
+    fd = sys_openat(AT_FDCWD, "/proc", O_RDONLY, 0);
+    if (fd < 0) {
+        return fail_step("OPEN_PROC", fd);
+    }
+    n = sys_getdents64((int)fd, dent_buf, sizeof(dent_buf));
+    (void)sys_close((int)fd);
+    if (n <= 0) {
+        return fail_step("GETDENTS", n);
+    }
+    write_line("UMIN_GETDENTS_OK");
+
+    fd = sys_openat(AT_FDCWD, "/proc/self/status", O_RDONLY, 0);
+    if (fd < 0) {
+        return fail_step("OPEN_STATUS", fd);
+    }
+    n = sys_read((int)fd, io_buf, sizeof(io_buf));
+    (void)sys_close((int)fd);
+    if (n <= 0) {
+        return fail_step("READ_STATUS", n);
+    }
+    write_line("UMIN_PROC_STATUS_OK");
+
+    if (sys_clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+        return fail_step("CLOCK", -1);
+    }
+    if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL) {
+        return fail_step("CLOCK_RANGE", ts.tv_nsec);
+    }
+    write_line("UMIN_CLOCK_OK");
+
+    if (sys_unlinkat(AT_FDCWD, "/umin.txt", 0) < 0) {
+        return fail_step("UNLINK_FILE", -1);
+    }
+    if (sys_unlinkat(AT_FDCWD, "/umin_dir", AT_REMOVEDIR) < 0) {
+        return fail_step("UNLINK_DIR", -1);
+    }
+    write_line("UMIN_CLEANUP_OK");
+
+    write_line("UMIN_END");
+    return 0;
+}
+
+__attribute__((noreturn))
+void umin_start(u64 *sp) {
+    (void)sp;
+    sys_exit(run_minimal_tests());
+}
+EOF
+
 cat >"$LD_SRC" <<'EOF'
 typedef unsigned long u64;
 typedef long s64;
@@ -707,6 +1000,7 @@ COMMON_FLAGS=(
 print_info "building C dynamic hello for $ARCH"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$HELLO_SRC" -o "$HELLO_OBJ"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$BB_SRC" -o "$BB_OBJ"
+"$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$UMIN_SRC" -o "$UMIN_OBJ"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$LD_SRC" -o "$LD_OBJ"
 
 "$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
@@ -718,15 +1012,20 @@ print_info "building C dynamic hello for $ARCH"
     -e _start -o "$BB_BIN" "$BB_OBJ"
 
 "$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
+    --dynamic-linker "/lib/$LD_SO_NAME" \
+    -e _start -o "$UMIN_BIN" "$UMIN_OBJ"
+
+"$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
     -e _start -o "$LD_BIN" "$LD_OBJ"
 
 if command -v file >/dev/null 2>&1; then
     print_info "hello: $(file "$HELLO_BIN")"
     print_info "busybox: $(file "$BB_BIN")"
+    print_info "uminitest: $(file "$UMIN_BIN")"
     print_info "loader: $(file "$LD_BIN")"
 fi
 
-if [[ ! -x "$HELLO_BIN" || ! -x "$BB_BIN" || ! -x "$LD_BIN" ]]; then
+if [[ ! -x "$HELLO_BIN" || ! -x "$BB_BIN" || ! -x "$UMIN_BIN" || ! -x "$LD_BIN" ]]; then
     print_error "build failed: output file missing"
     exit 1
 fi
@@ -739,7 +1038,12 @@ if ! file "$BB_BIN" | grep -q "dynamically linked"; then
     print_warn "busybox_dyn is not reported as dynamically linked"
 fi
 
+if ! file "$UMIN_BIN" | grep -q "dynamically linked"; then
+    print_warn "uminitest_dyn is not reported as dynamically linked"
+fi
+
 print_info "output:"
 print_info "  $HELLO_BIN"
 print_info "  $BB_BIN"
+print_info "  $UMIN_BIN"
 print_info "  $LD_BIN"

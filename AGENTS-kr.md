@@ -104,11 +104,12 @@ kerners/
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
 ├── modules/test_signal/     # signal syscall 회귀 테스트 모듈
 ├── modules/test_procfs/     # procfs + phase14 fs syscall 회귀 테스트 모듈
-├── scripts/build_user_dynamic_c_bins.sh  # C 툴체인 동적 유저 ELF(hello_dyn + busybox_dyn + ld-kerners) 빌더
+├── scripts/build_user_dynamic_c_bins.sh  # C 툴체인 동적 유저 ELF(hello_dyn + busybox_dyn + uminitest_dyn + ld-kerners) 빌더
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
-├── scripts/run_user_tests.sh  # 유저 영역 테스트 오케스트레이션(동적 hello + 동적 busybox 스모크 포함)
+├── scripts/run_user_tests.sh  # 유저 영역 테스트 오케스트레이션(동적 hello + 동적 busybox + 내부 최소 스모크 포함)
 ├── scripts/verify_phase15_3_cdyn.sh  # Phase 15-3 C 동적 hello 스모크 검증 스크립트
 ├── scripts/verify_phase15_3_busybox_dyn.sh  # Phase 15-3 C 동적 busybox(init) 스모크 검증 스크립트
+├── scripts/verify_phase15_4_internal_min.sh  # Phase 15-4 내부 최소 init 스모크 검증 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
 ├── docs/                    # 문서 (전체 목록은 docs/README.md 참조)
