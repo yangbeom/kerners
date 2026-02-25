@@ -168,7 +168,13 @@ make test
 # riscv64 테스트
 make test ARCH=riscv64
 
-# 양쪽 아키텍처 모두
+# 커널 모듈 테스트만 양쪽 아키텍처 실행
+make test-all-kernel
+
+# 유저 영역 동적 hello 테스트만 양쪽 아키텍처 실행
+make test-user
+
+# 전체(커널 모듈 + 유저 영역 동적 hello) 양쪽 아키텍처 실행
 make test-all
 
 # 스크립트 직접 실행 (타임아웃 지정)
@@ -531,6 +537,9 @@ fn panic(_info: &PanicInfo) -> ! {
 | `scripts/verify_phase15_3_cdyn.sh [ARCH] [BUSYBOX_PATH] [TIMEOUT]` | FAT32 root + rcS에서 `/bin/hello_dyn` 실행 검증 (`PH15_3_CDYN_*` 마커) |
 | `scripts/run_busybox_smoke.sh [ARCH] [BUSYBOX_PATH] [RUNS] [TIMEOUT]` | BusyBox init 스모크 + `COW_FORK_TEST` 로그 판정 |
 | `scripts/run_tests.sh [ARCH] [TIMEOUT]` | 전체 오케스트레이션 (빌드 → 디스크 → 커널 → QEMU → 결과 파싱) |
+| `make test-all-kernel` | 커널 모듈 테스트(`run_tests.sh`)를 aarch64/riscv64 모두 실행 |
+| `make test-user` | 유저 영역 동적 hello 스모크(`verify_phase15_3_cdyn.sh`)를 aarch64/riscv64 모두 실행 |
+| `make test-all` | `test-all-kernel` + `test-user`를 순차 실행 |
 
 ## 관련 소스
 
