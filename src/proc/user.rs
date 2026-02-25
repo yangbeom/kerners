@@ -19,6 +19,7 @@ const AUXV_AT_PHENT: usize = 4;
 const AUXV_AT_PHNUM: usize = 5;
 const AUXV_AT_PAGESZ: usize = 6;
 const AUXV_AT_BASE: usize = 7;
+const AUXV_AT_FLAGS: usize = 8;
 const AUXV_AT_ENTRY: usize = 9;
 const MAX_SHEBANG_DEPTH: usize = 4;
 const DEFAULT_EXEC_PATH: &str = "/bin:/sbin:/usr/bin:/usr/sbin";
@@ -173,6 +174,7 @@ struct ExecAuxv {
     phnum: usize,
     pagesz: usize,
     base: usize,
+    flags: usize,
 }
 
 /// 부팅 시 PID 1 이미지를 전달하기 위한 단일 슬롯
@@ -516,7 +518,7 @@ fn prepare_exec_image_inner(
         }
         let interp = ModuleLoader::load_executable(&interp_data).map_err(map_module_error)?;
 
-        let mut auxv = build_exec_auxv(&elf, main.load_bias, interp.load_bias);
+        let mut auxv = build_exec_auxv(&elf, &main, interp.load_bias);
         auxv.entry = main.entry;
         let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
             build_user_stack(&resolved_path, argv, envp, &auxv)?;
@@ -531,7 +533,7 @@ fn prepare_exec_image_inner(
     }
 
     let loaded = ModuleLoader::load_executable(&elf_data).map_err(map_module_error)?;
-    let mut auxv = build_exec_auxv(&elf, loaded.load_bias, 0);
+    let mut auxv = build_exec_auxv(&elf, &loaded, 0);
     auxv.entry = loaded.entry;
     let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
         build_user_stack(&resolved_path, argv, envp, &auxv)?;
@@ -613,6 +615,8 @@ fn build_user_stack(
     words.push(auxv.pagesz);
     words.push(AUXV_AT_BASE);
     words.push(auxv.base);
+    words.push(AUXV_AT_FLAGS);
+    words.push(auxv.flags);
     words.push(AUXV_AT_NULL);
     words.push(0);
 
@@ -663,13 +667,17 @@ fn push_c_string(
     Ok(*sp)
 }
 
-fn build_exec_auxv(elf: &crate::module::Elf64<'_>, load_bias: usize, at_base: usize) -> ExecAuxv {
+fn build_exec_auxv(
+    elf: &crate::module::Elf64<'_>,
+    loaded: &crate::module::loader::ExecutableLoadInfo,
+    at_base: usize,
+) -> ExecAuxv {
     let phnum = elf.header.e_phnum as usize;
     let phdr = find_phdr_vaddr(elf)
-        .and_then(|addr| addr.checked_add(load_bias))
+        .and_then(|addr| addr.checked_add(loaded.load_bias))
         .unwrap_or(0);
     let entry = (elf.entry_point() as usize)
-        .checked_add(load_bias)
+        .checked_add(loaded.load_bias)
         .unwrap_or(0);
 
     ExecAuxv {
@@ -679,6 +687,7 @@ fn build_exec_auxv(elf: &crate::module::Elf64<'_>, load_bias: usize, at_base: us
         phnum,
         pagesz: crate::mm::page::PAGE_SIZE,
         base: at_base,
+        flags: loaded.dynamic.flags,
     }
 }
 

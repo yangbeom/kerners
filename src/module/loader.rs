@@ -329,6 +329,34 @@ static NEXT_EXEC_DYN_BASE: AtomicUsize = AtomicUsize::new(0);
 pub struct ExecutableLoadInfo {
     pub entry: usize,
     pub load_bias: usize,
+    pub dynamic: ExecutableDynamicInfo,
+}
+
+/// 실행 ELF의 .dynamic/DT_* 요약 정보
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecutableDynamicInfo {
+    pub at_dynamic: usize,
+    pub needed_count: usize,
+    pub strtab: usize,
+    pub strsz: usize,
+    pub symtab: usize,
+    pub syment: usize,
+    pub hash: usize,
+    pub gnu_hash: usize,
+    pub rela: usize,
+    pub relasz: usize,
+    pub relaent: usize,
+    pub rel: usize,
+    pub relsz: usize,
+    pub relent: usize,
+    pub jmprel: usize,
+    pub pltrelsz: usize,
+    pub pltrel: usize,
+    pub pltgot: usize,
+    pub init: usize,
+    pub fini: usize,
+    pub flags: usize,
+    pub flags_1: usize,
 }
 
 /// 모듈 로더
@@ -434,6 +462,105 @@ impl ModuleLoader {
                 page::free_frame(frame);
             }
         }
+    }
+
+    fn dyn_ptr_with_bias(raw: usize, load_bias: usize) -> Result<usize, ModuleError> {
+        raw.checked_add(load_bias).ok_or(ModuleError::InvalidFormat)
+    }
+
+    fn parse_dynamic_info(elf: &Elf64, load_bias: usize) -> Result<ExecutableDynamicInfo, ModuleError> {
+        let mut info = ExecutableDynamicInfo::default();
+
+        if let Some(dynamic_phdr) = elf.dynamic_segment() {
+            info.at_dynamic = Self::dyn_ptr_with_bias(dynamic_phdr.p_vaddr as usize, load_bias)?;
+        }
+
+        let entries = elf
+            .dynamic_entries()
+            .map_err(|_| ModuleError::InvalidFormat)?;
+        let Some(entries) = entries else {
+            return Ok(info);
+        };
+
+        for entry in entries {
+            let value = entry.value() as usize;
+            match entry.tag() {
+                DynamicTag::Null => break,
+                DynamicTag::Needed => {
+                    info.needed_count = info.needed_count.saturating_add(1);
+                }
+                DynamicTag::PltRelSz => {
+                    info.pltrelsz = value;
+                }
+                DynamicTag::PltGot => {
+                    info.pltgot = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Hash => {
+                    info.hash = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::StrTab => {
+                    info.strtab = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::SymTab => {
+                    info.symtab = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Rela => {
+                    info.rela = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::RelaSz => {
+                    info.relasz = value;
+                }
+                DynamicTag::RelaEnt => {
+                    info.relaent = value;
+                }
+                DynamicTag::StrSz => {
+                    info.strsz = value;
+                }
+                DynamicTag::SymEnt => {
+                    info.syment = value;
+                }
+                DynamicTag::Init => {
+                    info.init = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Fini => {
+                    info.fini = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Rel => {
+                    info.rel = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::RelSz => {
+                    info.relsz = value;
+                }
+                DynamicTag::RelEnt => {
+                    info.relent = value;
+                }
+                DynamicTag::PltRel => {
+                    info.pltrel = value;
+                }
+                DynamicTag::JmpRel => {
+                    info.jmprel = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Flags => {
+                    info.flags = value;
+                }
+                DynamicTag::Flags1 => {
+                    info.flags_1 = value;
+                }
+                DynamicTag::GnuHash => {
+                    info.gnu_hash = Self::dyn_ptr_with_bias(value, load_bias)?;
+                }
+                DynamicTag::Other(_)
+                | DynamicTag::SoName
+                | DynamicTag::RPath
+                | DynamicTag::Symbolic
+                | DynamicTag::Debug
+                | DynamicTag::TextRel
+                | DynamicTag::BindNow
+                | DynamicTag::RunPath => {}
+            }
+        }
+
+        Ok(info)
     }
 
     /// Relocatable object (.o) 로드
@@ -747,13 +874,31 @@ impl ModuleLoader {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         crate::arch::mmu::flush_tlb_all();
 
+        let dynamic_info = Self::parse_dynamic_info(&elf, load_bias)?;
+        if dynamic_info.at_dynamic != 0 {
+            kprintln!(
+                "[module] DYNAMIC: at={:#x}, needed={}, strtab={:#x}, symtab={:#x}, rela={:#x}, rel={:#x}, jmprel={:#x}",
+                dynamic_info.at_dynamic,
+                dynamic_info.needed_count,
+                dynamic_info.strtab,
+                dynamic_info.symtab,
+                dynamic_info.rela,
+                dynamic_info.rel,
+                dynamic_info.jmprel
+            );
+        }
+
         // 엔트리 포인트 반환
         let entry = (elf.entry_point() as usize)
             .checked_add(load_bias)
             .ok_or(ModuleError::InvalidFormat)?;
         kprintln!("[module] Entry point: 0x{:x}", entry);
 
-        Ok(ExecutableLoadInfo { entry, load_bias })
+        Ok(ExecutableLoadInfo {
+            entry,
+            load_bias,
+            dynamic: dynamic_info,
+        })
     }
 
     /// 섹션들을 메모리에 로드

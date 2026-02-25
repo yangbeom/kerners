@@ -182,6 +182,133 @@ pub mod program_type {
     pub const PT_PHDR: u32 = 6; // 프로그램 헤더 테이블
 }
 
+/// ELF64 동적 섹션 엔트리 (16바이트)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Elf64DynamicEntry {
+    /// 동적 태그 (DT_*)
+    pub d_tag: i64,
+    /// 값 또는 포인터 (태그에 따라 의미가 다름)
+    pub d_val: u64,
+}
+
+impl Elf64DynamicEntry {
+    /// 동적 태그 해석
+    pub fn tag(&self) -> DynamicTag {
+        DynamicTag::from_raw(self.d_tag)
+    }
+
+    /// 값(raw) 반환
+    pub fn value(&self) -> u64 {
+        self.d_val
+    }
+}
+
+/// 동적 태그 상수
+pub mod dynamic_tag {
+    pub const DT_NULL: i64 = 0;
+    pub const DT_NEEDED: i64 = 1;
+    pub const DT_PLTRELSZ: i64 = 2;
+    pub const DT_PLTGOT: i64 = 3;
+    pub const DT_HASH: i64 = 4;
+    pub const DT_STRTAB: i64 = 5;
+    pub const DT_SYMTAB: i64 = 6;
+    pub const DT_RELA: i64 = 7;
+    pub const DT_RELASZ: i64 = 8;
+    pub const DT_RELAENT: i64 = 9;
+    pub const DT_STRSZ: i64 = 10;
+    pub const DT_SYMENT: i64 = 11;
+    pub const DT_INIT: i64 = 12;
+    pub const DT_FINI: i64 = 13;
+    pub const DT_SONAME: i64 = 14;
+    pub const DT_RPATH: i64 = 15;
+    pub const DT_SYMBOLIC: i64 = 16;
+    pub const DT_REL: i64 = 17;
+    pub const DT_RELSZ: i64 = 18;
+    pub const DT_RELENT: i64 = 19;
+    pub const DT_PLTREL: i64 = 20;
+    pub const DT_DEBUG: i64 = 21;
+    pub const DT_TEXTREL: i64 = 22;
+    pub const DT_JMPREL: i64 = 23;
+    pub const DT_BIND_NOW: i64 = 24;
+    pub const DT_RUNPATH: i64 = 29;
+    pub const DT_FLAGS: i64 = 30;
+    pub const DT_GNU_HASH: i64 = 0x6ffffef5;
+    pub const DT_FLAGS_1: i64 = 0x6ffffffb;
+}
+
+/// 해석된 동적 태그
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicTag {
+    Null,
+    Needed,
+    PltRelSz,
+    PltGot,
+    Hash,
+    StrTab,
+    SymTab,
+    Rela,
+    RelaSz,
+    RelaEnt,
+    StrSz,
+    SymEnt,
+    Init,
+    Fini,
+    SoName,
+    RPath,
+    Symbolic,
+    Rel,
+    RelSz,
+    RelEnt,
+    PltRel,
+    Debug,
+    TextRel,
+    JmpRel,
+    BindNow,
+    RunPath,
+    Flags,
+    GnuHash,
+    Flags1,
+    Other(i64),
+}
+
+impl DynamicTag {
+    pub fn from_raw(tag: i64) -> Self {
+        match tag {
+            dynamic_tag::DT_NULL => Self::Null,
+            dynamic_tag::DT_NEEDED => Self::Needed,
+            dynamic_tag::DT_PLTRELSZ => Self::PltRelSz,
+            dynamic_tag::DT_PLTGOT => Self::PltGot,
+            dynamic_tag::DT_HASH => Self::Hash,
+            dynamic_tag::DT_STRTAB => Self::StrTab,
+            dynamic_tag::DT_SYMTAB => Self::SymTab,
+            dynamic_tag::DT_RELA => Self::Rela,
+            dynamic_tag::DT_RELASZ => Self::RelaSz,
+            dynamic_tag::DT_RELAENT => Self::RelaEnt,
+            dynamic_tag::DT_STRSZ => Self::StrSz,
+            dynamic_tag::DT_SYMENT => Self::SymEnt,
+            dynamic_tag::DT_INIT => Self::Init,
+            dynamic_tag::DT_FINI => Self::Fini,
+            dynamic_tag::DT_SONAME => Self::SoName,
+            dynamic_tag::DT_RPATH => Self::RPath,
+            dynamic_tag::DT_SYMBOLIC => Self::Symbolic,
+            dynamic_tag::DT_REL => Self::Rel,
+            dynamic_tag::DT_RELSZ => Self::RelSz,
+            dynamic_tag::DT_RELENT => Self::RelEnt,
+            dynamic_tag::DT_PLTREL => Self::PltRel,
+            dynamic_tag::DT_DEBUG => Self::Debug,
+            dynamic_tag::DT_TEXTREL => Self::TextRel,
+            dynamic_tag::DT_JMPREL => Self::JmpRel,
+            dynamic_tag::DT_BIND_NOW => Self::BindNow,
+            dynamic_tag::DT_RUNPATH => Self::RunPath,
+            dynamic_tag::DT_FLAGS => Self::Flags,
+            dynamic_tag::DT_GNU_HASH => Self::GnuHash,
+            dynamic_tag::DT_FLAGS_1 => Self::Flags1,
+            other => Self::Other(other),
+        }
+    }
+}
+
 /// ELF64 심볼 테이블 엔트리 (24바이트)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -432,6 +559,80 @@ impl<'a> Elf64<'a> {
     /// 프로그램 헤더 목록
     pub fn program_headers(&self) -> Option<&[Elf64ProgramHeader]> {
         self.program_headers
+    }
+
+    /// PT_DYNAMIC 프로그램 헤더 조회
+    pub fn dynamic_segment(&self) -> Option<&Elf64ProgramHeader> {
+        self.program_headers
+            .into_iter()
+            .flatten()
+            .find(|ph| ph.p_type == program_type::PT_DYNAMIC)
+    }
+
+    /// 동적 엔트리 테이블 조회
+    ///
+    /// 우선순위:
+    /// 1) PT_DYNAMIC (실행 파일 경로)
+    /// 2) SHT_DYNAMIC (fallback)
+    pub fn dynamic_entries(&self) -> Result<Option<&[Elf64DynamicEntry]>, Elf64Error> {
+        if let Some(ph) = self.dynamic_segment() {
+            let start = ph.p_offset as usize;
+            let size = ph.p_filesz as usize;
+            if size == 0 {
+                return Ok(Some(&[]));
+            }
+            if size % size_of::<Elf64DynamicEntry>() != 0 {
+                return Err(Elf64Error::InvalidProgramHeader);
+            }
+            let end = start.checked_add(size).ok_or(Elf64Error::InvalidProgramHeader)?;
+            if end > self.data.len() {
+                return Err(Elf64Error::InvalidProgramHeader);
+            }
+            let entries = unsafe {
+                // SAFETY: PT_DYNAMIC가 가리키는 파일 범위를 경계 검사했고 엔트리 단위 크기 정렬을 확인했다.
+                core::slice::from_raw_parts(
+                    self.data.as_ptr().add(start) as *const Elf64DynamicEntry,
+                    size / size_of::<Elf64DynamicEntry>(),
+                )
+            };
+            return Ok(Some(entries));
+        }
+
+        if let Some(sh) = self
+            .section_headers
+            .iter()
+            .find(|sh| sh.sh_type == section_type::SHT_DYNAMIC)
+        {
+            let start = sh.sh_offset as usize;
+            let size = sh.sh_size as usize;
+            if size == 0 {
+                return Ok(Some(&[]));
+            }
+            let entsize = if sh.sh_entsize == 0 {
+                size_of::<Elf64DynamicEntry>()
+            } else {
+                sh.sh_entsize as usize
+            };
+            if entsize != size_of::<Elf64DynamicEntry>()
+                || size % size_of::<Elf64DynamicEntry>() != 0
+            {
+                return Err(Elf64Error::InvalidSectionHeader);
+            }
+            let end = start.checked_add(size).ok_or(Elf64Error::InvalidSectionHeader)?;
+            if end > self.data.len() {
+                return Err(Elf64Error::InvalidSectionHeader);
+            }
+            let entries = unsafe {
+                // SAFETY: SHT_DYNAMIC가 가리키는 파일 범위를 경계 검사했고 엔트리 크기 일치를 확인했다.
+                core::slice::from_raw_parts(
+                    self.data.as_ptr().add(start) as *const Elf64DynamicEntry,
+                    size / size_of::<Elf64DynamicEntry>(),
+                )
+            };
+            return Ok(Some(entries));
+        }
+
+        Ok(None)
     }
 
     /// 섹션 이름 조회

@@ -535,9 +535,10 @@
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)
 - [ ] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
 - [ ] 상태 메모: 엔트리 체인(`PT_INTERP`)과 `ET_DYN` 매핑은 완료, 동적 심볼/재배치/so 의존성 해석이 남아 있음
+- [x] 2026-02-25 1차 착수: `PT_DYNAMIC`/`DT_*` 파싱 baseline 추가 (`Elf64DynamicEntry`, `DynamicTag`, `ExecutableLoadInfo.dynamic`) + auxv `AT_FLAGS` 반영
 - [x] `PT_INTERP` 지원 (`/lib/ld-linux-*.so.*` 로더 체인, 인터프리터 엔트리 전이)
 - [x] 동적 링크 ELF 실행 경로 (`ET_DYN`/PIE 포함, load bias 기반 매핑)
-- [ ] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석
+- [ ] `.dynamic` / `DT_*` 처리 및 런타임 링크 정보 해석 (파싱/메타데이터 수집 완료, 심볼 해석 연계 미완)
 - [ ] 런타임 재배치 (`REL`/`RELA`, `JUMP_SLOT`, `GLOB_DAT`)
 - [ ] 공유 라이브러리 의존성 로딩 (`/lib`, `/usr/lib`)
 - [x] 최소 런타임 ABI 정비 (TLS 제외: `AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer/TLS reloc는 Phase 15.5에서 구현)
