@@ -559,8 +559,8 @@
 #### 15-4. (선택) 유저 ELF 빌드 환경 구축 (보조 트랙)
 - [x] 2026-02-25 내부 최소 유저 스모크 경로 추가 (`uminitest_dyn`, `scripts/verify_phase15_4_internal_min.sh`, `make test-user` 연동)
 - [ ] Rust `no_std` + thin syscall wrapper 기반 로컬 유저 ELF 빌드 템플릿 제공
-- [ ] 최소 libc 대체 또는 wrapper 라이브러리 정리 (테스트/디버그 목적)
-- [ ] 샘플 유저 프로그램(`hello`, `syscall smoke`)과 빌드 스크립트 제공
+- [x] 2026-03-02 최소 libc 대체/wrapper 라이브러리 정리 (`userland/common/minilibc.h`, `userland/common/minilibc.c`, `userland/common/crt0.c`)
+- [x] 2026-03-02 샘플 유저 프로그램(`sample_hello.c`, `sample_syscall_smoke.c`) + 빌드/검증 스크립트 제공 (`scripts/build_user_minilibc_samples.sh`, `scripts/verify_phase15_4_minilibc_samples.sh`)
 - [ ] CI 회귀용으로만 사용하고, 외부 Linux ELF 호환의 선행조건으로 강제하지 않음
 
 ### Phase 15.5: TLS (Thread Local Storage) 지원 (중기, 별도 phase)

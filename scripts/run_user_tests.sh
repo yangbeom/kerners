@@ -13,6 +13,7 @@
 #   - Phase 15-3 dynamic C hello smoke (`verify_phase15_3_cdyn.sh`)
 #   - Phase 15-3 dynamic busybox(init) smoke (`verify_phase15_3_busybox_dyn.sh`)
 #   - Phase 15-4 internal minimal init smoke (`verify_phase15_4_internal_min.sh`)
+#   - Phase 15-4 minilibc + sample program smoke (`verify_phase15_4_minilibc_samples.sh`)
 
 set -euo pipefail
 
@@ -37,6 +38,7 @@ run_one() {
     "$SCRIPT_DIR/verify_phase15_3_cdyn.sh" "$arch" "" "$TIMEOUT_SEC"
     "$SCRIPT_DIR/verify_phase15_3_busybox_dyn.sh" "$arch" "" "$TIMEOUT_SEC"
     "$SCRIPT_DIR/verify_phase15_4_internal_min.sh" "$arch" "" "$TIMEOUT_SEC"
+    "$SCRIPT_DIR/verify_phase15_4_minilibc_samples.sh" "$arch" "" "$TIMEOUT_SEC"
 }
 
 case "$ARCH" in

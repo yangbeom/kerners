@@ -104,12 +104,22 @@ kerners/
 ├── modules/test_timer/      # clock_gettime/gettimeofday/nanosleep 회귀 테스트 모듈
 ├── modules/test_signal/     # signal syscall 회귀 테스트 모듈
 ├── modules/test_procfs/     # procfs + phase14 fs syscall 회귀 테스트 모듈
+├── userland/common/          # 유저 영역 minilibc 대체 계층 (crt0 + syscall wrapper)
+│   ├── minilibc.h            # minilibc API (syscall wrapper + 유틸 선언)
+│   ├── minilibc.c            # minilibc 구현
+│   └── crt0.c                # 최소 `_start` + argc/argv/envp 부트스트랩
+├── userland/hello/
+│   └── sample_hello.c        # minilibc 기반 샘플 유저 프로그램
+├── userland/init/
+│   └── sample_syscall_smoke.c # minilibc 기반 syscall 스모크 샘플
 ├── scripts/build_user_dynamic_c_bins.sh  # C 툴체인 동적 유저 ELF(hello_dyn + busybox_dyn + uminitest_dyn + ld-kerners) 빌더
+├── scripts/build_user_minilibc_samples.sh  # Phase 15-4 minilibc 샘플 ELF 빌더
 ├── scripts/prepare_user_disk.sh  # BusyBox 유저 디스크 이미지 준비 스크립트
-├── scripts/run_user_tests.sh  # 유저 영역 테스트 오케스트레이션(동적 hello + 동적 busybox + 내부 최소 스모크 포함)
+├── scripts/run_user_tests.sh  # 유저 영역 테스트 오케스트레이션(동적 hello + 동적 busybox + 내부 최소 + minilibc 샘플 포함)
 ├── scripts/verify_phase15_3_cdyn.sh  # Phase 15-3 C 동적 hello 스모크 검증 스크립트
 ├── scripts/verify_phase15_3_busybox_dyn.sh  # Phase 15-3 C 동적 busybox(init) 스모크 검증 스크립트
 ├── scripts/verify_phase15_4_internal_min.sh  # Phase 15-4 내부 최소 init 스모크 검증 스크립트
+├── scripts/verify_phase15_4_minilibc_samples.sh  # Phase 15-4 minilibc 샘플 스모크 검증 스크립트
 ├── scripts/run_busybox_smoke.sh  # BusyBox init 스모크 실행(로그 수집/실패 분류)
 ├── targets/                 # 커스텀 타겟 JSON 파일
 ├── docs/                    # 문서 (전체 목록은 docs/README.md 참조)

@@ -247,6 +247,30 @@ init 내부에서 `echo/cat/mkdir/head/ps/rm/rmdir` 경로를 실행합니다.
 - `UMIN_END`
 - `UMIN_FAIL_*`, `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
 
+### Phase 15-4 minilibc + 샘플 유저 프로그램 스모크
+
+15-4 보조 트랙으로 추가된 `minilibc`(`crt0 + syscall wrapper + 문자열/출력 유틸`)를 사용해
+샘플 동적 ELF 2종을 실행합니다.
+
+```bash
+# aarch64 + riscv64 모두 검증
+./scripts/verify_phase15_4_minilibc_samples.sh all
+
+# 아키텍처별 단독 검증
+./scripts/verify_phase15_4_minilibc_samples.sh aarch64
+./scripts/verify_phase15_4_minilibc_samples.sh riscv64
+```
+
+기대 로그 마커:
+- `PH15_4_MINI_BEGIN`
+- `MINILIBC_HELLO_OK`
+- `PH15_4_HELLO_RC=42`
+- `MINILIBC_SMOKE_BEGIN`
+- `MINILIBC_SMOKE_OK`
+- `PH15_4_SMOKE_RC=0`
+- `PH15_4_MINI_END`
+- `MINILIBC_SMOKE_FAIL_*`, `Kernel panic`, `Unknown syscall`, `terminating by SIGSEGV` 미발생
+
 ## 수동 실행 방법
 
 ### 1. 빌드
