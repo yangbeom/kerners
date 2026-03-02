@@ -118,6 +118,25 @@ struct ProcessInfo {
     sigaltstack_flags: i32,
     sigaltstack_enabled: bool,
     exit_signal: u32,
+    tls_pointer: usize,
+}
+
+#[derive(Clone)]
+struct VmTlsTemplate {
+    vm_group: u64,
+    mem_size: usize,
+    align: usize,
+    tcb_size: usize,
+    template: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct VmTlsAllocation {
+    vm_group: u64,
+    tid: proc::Tid,
+    map_start: usize,
+    map_size: usize,
+    tp: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +240,8 @@ static COW_PAGES: Mutex<Vec<CowMeta>> = Mutex::new(Vec::new());
 static FILE_PAGE_CACHE: Mutex<Vec<FilePageCacheEntry>> = Mutex::new(Vec::new());
 static ZOMBIE_CHILDREN: Mutex<Vec<ZombieChild>> = Mutex::new(Vec::new());
 static PROCESS_INFOS: Mutex<Vec<ProcessInfo>> = Mutex::new(Vec::new());
+static VM_TLS_TEMPLATES: Mutex<Vec<VmTlsTemplate>> = Mutex::new(Vec::new());
+static VM_TLS_ALLOCATIONS: Mutex<Vec<VmTlsAllocation>> = Mutex::new(Vec::new());
 static SIGNAL_ACTION_GROUPS: Mutex<Vec<SignalActionGroup>> = Mutex::new(Vec::new());
 static VFORK_WAITS: Mutex<Vec<VforkWait>> = Mutex::new(Vec::new());
 static NEXT_FAKE_CHILD_TID: AtomicUsize = AtomicUsize::new(1000);
@@ -684,6 +705,7 @@ fn ensure_process_info_for_tid_locked(processes: &mut Vec<ProcessInfo>, tid: pro
         sigaltstack_flags: 0,
         sigaltstack_enabled: false,
         exit_signal: 0,
+        tls_pointer: 0,
     });
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
@@ -711,6 +733,18 @@ fn current_vm_group() -> u64 {
     vm_group_for_tid(current_tid_or_zero())
 }
 
+fn tls_pointer_for_tid(tid: proc::Tid) -> usize {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].tls_pointer
+}
+
+fn set_tls_pointer_for_tid(tid: proc::Tid, tls_pointer: usize) {
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].tls_pointer = tls_pointer;
+}
+
 fn files_group_for_tid(tid: proc::Tid) -> u64 {
     let mut processes = PROCESS_INFOS.lock();
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
@@ -719,6 +753,296 @@ fn files_group_for_tid(tid: proc::Tid) -> u64 {
 
 pub fn current_files_group() -> u64 {
     files_group_for_tid(current_tid_or_zero())
+}
+
+#[inline]
+const fn align_down_to(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+#[derive(Clone, Copy)]
+struct ComputedTlsLayout {
+    tp: usize,
+    map_start: usize,
+    map_size: usize,
+    data_start: usize,
+    data_size: usize,
+}
+
+fn clear_vm_tls_state(vm_group: u64) {
+    {
+        let mut templates = VM_TLS_TEMPLATES.lock();
+        templates.retain(|item| item.vm_group != vm_group);
+    }
+    {
+        let mut allocations = VM_TLS_ALLOCATIONS.lock();
+        allocations.retain(|item| item.vm_group != vm_group);
+    }
+}
+
+fn install_exec_tls_state(vm_group: u64, tid: proc::Tid, image: &proc::user::PreparedExecImage) {
+    clear_vm_tls_state(vm_group);
+    set_tls_pointer_for_tid(tid, image.tls_pointer);
+
+    let Some(tls) = image.tls_info.as_ref() else {
+        return;
+    };
+    if tls.mem_size == 0 || tls.map_size == 0 {
+        return;
+    }
+
+    VM_TLS_TEMPLATES.lock().push(VmTlsTemplate {
+        vm_group,
+        mem_size: tls.mem_size,
+        align: tls.align,
+        tcb_size: tls.tcb_size,
+        template: tls.template.clone(),
+    });
+    VM_TLS_ALLOCATIONS.lock().push(VmTlsAllocation {
+        vm_group,
+        tid,
+        map_start: tls.map_start,
+        map_size: tls.map_size,
+        tp: tls.pointer,
+    });
+}
+
+pub fn install_exec_tls_state_for_current(image: &proc::user::PreparedExecImage) {
+    let tid = current_tid_or_zero();
+    ensure_process_info_for_tid(tid);
+    let vm_group = current_vm_group();
+    install_exec_tls_state(vm_group, tid, image);
+}
+
+fn vm_tls_template_for_group(vm_group: u64) -> Option<VmTlsTemplate> {
+    let templates = VM_TLS_TEMPLATES.lock();
+    templates
+        .iter()
+        .find(|item| item.vm_group == vm_group)
+        .cloned()
+}
+
+fn compute_tls_layout_for_gap(
+    gap_bottom: usize,
+    gap_end: usize,
+    tls_data_size: usize,
+    align: usize,
+    tcb_size: usize,
+) -> Option<ComputedTlsLayout> {
+    if gap_end <= gap_bottom {
+        return None;
+    }
+
+    let data_start_unaligned = gap_end.checked_sub(tls_data_size)?;
+    let data_start = align_down_to(data_start_unaligned, align);
+    let tp = data_start.checked_sub(tcb_size)?;
+    let data_end = data_start.checked_add(tls_data_size)?;
+    let map_start = align_down_to(tp, crate::mm::page::PAGE_SIZE);
+    let map_end = align_up(data_end, crate::mm::page::PAGE_SIZE);
+    if map_start < gap_bottom || map_end > gap_end || map_end <= map_start {
+        return None;
+    }
+
+    Some(ComputedTlsLayout {
+        tp,
+        map_start,
+        map_size: map_end - map_start,
+        data_start,
+        data_size: tls_data_size,
+    })
+}
+
+fn choose_tls_layout(vm_group: u64, template: &VmTlsTemplate) -> Option<ComputedTlsLayout> {
+    let align = template.align.max(core::mem::size_of::<usize>());
+    if !align.is_power_of_two() {
+        return None;
+    }
+    let tls_data_size = align_up(template.mem_size, align);
+    let region_base = crate::proc::user::USER_TLS_REGION_BASE;
+    let region_end = region_base + crate::proc::user::USER_TLS_REGION_SIZE;
+
+    let mut used = {
+        let allocations = VM_TLS_ALLOCATIONS.lock();
+        let mut items = Vec::new();
+        for allocation in allocations.iter().filter(|item| item.vm_group == vm_group) {
+            let end = allocation.map_start.checked_add(allocation.map_size)?;
+            items.push((allocation.map_start, end));
+        }
+        items
+    };
+    used.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut gap_end = region_end;
+    for (used_start, used_end) in used {
+        if used_end > gap_end {
+            continue;
+        }
+        if let Some(layout) =
+            compute_tls_layout_for_gap(used_end, gap_end, tls_data_size, align, template.tcb_size)
+        {
+            return Some(layout);
+        }
+        gap_end = used_start;
+    }
+
+    compute_tls_layout_for_gap(region_base, gap_end, tls_data_size, align, template.tcb_size)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn cleanup_mapped_user_region_for_root(
+    root: usize,
+    mapped_frames: &mut Vec<(usize, usize)>,
+) {
+    for (virt_addr, frame) in mapped_frames.drain(..) {
+        let _ = crate::arch::mmu::unmap_user_page_for_root_noflush(root, virt_addr);
+        unsafe {
+            // SAFETY: alloc_frame로 확보했던 프레임 참조를 해제한다.
+            crate::mm::page::free_frame(frame);
+        }
+    }
+    flush_user_tlb();
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn map_user_region_for_root(
+    root: usize,
+    region_base: usize,
+    region_bytes: &[u8],
+    writable: bool,
+    executable: bool,
+) -> Result<(), isize> {
+    if region_bytes.is_empty() {
+        return Ok(());
+    }
+
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let region_end = match region_base.checked_add(region_bytes.len()) {
+        Some(v) => v,
+        None => return Err(errno::ENOMEM),
+    };
+    let map_start = align_down_to(region_base, page_size);
+    let map_end = align_up(region_end, page_size);
+    let mut mapped_frames: Vec<(usize, usize)> = Vec::new();
+
+    for virt_addr in (map_start..map_end).step_by(page_size) {
+        let frame = if let Some(frame) = crate::mm::page::alloc_frame() {
+            frame
+        } else {
+            cleanup_mapped_user_region_for_root(root, &mut mapped_frames);
+            return Err(errno::ENOMEM);
+        };
+
+        if crate::arch::mmu::map_user_page_for_root_noflush(
+            root,
+            virt_addr,
+            frame,
+            writable,
+            executable,
+        )
+        .is_err()
+        {
+            unsafe {
+                // SAFETY: 방금 alloc_frame으로 확보한 프레임이다.
+                crate::mm::page::free_frame(frame);
+            }
+            cleanup_mapped_user_region_for_root(root, &mut mapped_frames);
+            return Err(errno::EIO);
+        }
+        mapped_frames.push((virt_addr, frame));
+
+        unsafe {
+            // SAFETY: frame은 유효 페이지 프레임이며 전체 페이지 zero-fill은 안전하다.
+            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+        }
+
+        let page_end = virt_addr + page_size;
+        let copy_start = core::cmp::max(virt_addr, region_base);
+        let copy_end = core::cmp::min(page_end, region_end);
+        if copy_start < copy_end {
+            let copy_len = copy_end - copy_start;
+            let src_offset = copy_start - region_base;
+            let dst_offset = copy_start - virt_addr;
+            unsafe {
+                // SAFETY: src/dst 모두 유효한 범위이며 서로 겹치지 않는다.
+                core::ptr::copy_nonoverlapping(
+                    region_bytes[src_offset..src_offset + copy_len].as_ptr(),
+                    (frame + dst_offset) as *mut u8,
+                    copy_len,
+                );
+            }
+        }
+    }
+
+    flush_user_tlb();
+    Ok(())
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn release_tls_allocation(vm_group: u64, tid: proc::Tid) {
+    let allocation = {
+        let mut allocations = VM_TLS_ALLOCATIONS.lock();
+        let Some(pos) = allocations
+            .iter()
+            .position(|item| item.vm_group == vm_group && item.tid == tid)
+        else {
+            return;
+        };
+        allocations.swap_remove(pos)
+    };
+
+    let Some(root) = vm_root_for_group_if_present(vm_group) else {
+        return;
+    };
+
+    let end = allocation.map_start.saturating_add(allocation.map_size);
+    for va in (allocation.map_start..end).step_by(crate::mm::page::PAGE_SIZE) {
+        let frame = match crate::arch::mmu::unmap_user_page_for_root_noflush(root, va) {
+            Ok(frame) => frame,
+            Err(_) => continue,
+        };
+        unsafe {
+            // SAFETY: unmap에서 반환된 프레임의 참조를 해제한다.
+            crate::mm::page::free_frame(frame);
+        }
+    }
+    flush_user_tlb();
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn allocate_tls_for_thread(
+    vm_group: u64,
+    root: usize,
+    tid: proc::Tid,
+) -> Result<Option<VmTlsAllocation>, isize> {
+    let Some(template) = vm_tls_template_for_group(vm_group) else {
+        return Ok(None);
+    };
+
+    let Some(layout) = choose_tls_layout(vm_group, &template) else {
+        return Err(errno::ENOMEM);
+    };
+
+    let mut bytes = Vec::new();
+    bytes.resize(layout.map_size, 0);
+    let copy_len = core::cmp::min(template.template.len(), layout.data_size);
+    let copy_offset = layout.data_start - layout.map_start;
+    let copy_end = match copy_offset.checked_add(copy_len) {
+        Some(v) => v,
+        None => return Err(errno::ENOMEM),
+    };
+    bytes[copy_offset..copy_end].copy_from_slice(&template.template[..copy_len]);
+
+    map_user_region_for_root(root, layout.map_start, &bytes, true, false)?;
+
+    let allocation = VmTlsAllocation {
+        vm_group,
+        tid,
+        map_start: layout.map_start,
+        map_size: layout.map_size,
+        tp: layout.tp,
+    };
+    VM_TLS_ALLOCATIONS.lock().push(allocation);
+    Ok(Some(allocation))
 }
 
 /// tid에 해당하는 프로세스 상태 스냅샷을 반환한다.
@@ -986,6 +1310,7 @@ fn cleanup_vm_group_resources(vm_group: u64) {
     }
 
     remove_cow_for_vm_group(vm_group);
+    clear_vm_tls_state(vm_group);
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
@@ -2111,6 +2436,10 @@ fn finalize_exit_with_wait_status(tid: proc::Tid, wait_status: i32) {
         )
     };
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    release_tls_allocation(vm_group, tid);
+    set_tls_pointer_for_tid(tid, 0);
+
     flush_shared_writeback_for_vm_group(vm_group);
     if process_count_in_vm_group(vm_group) == 1 {
         cleanup_vm_group_resources(vm_group);
@@ -2993,6 +3322,7 @@ pub fn sys_clone(
             sigaltstack_flags: parent_sigaltstack_flags,
             sigaltstack_enabled: parent_sigaltstack_enabled,
             exit_signal,
+            tls_pointer: 0,
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
         (parent_files_group, child_files_group)
@@ -3058,6 +3388,7 @@ fn finalize_clone_with_vm_setup(
     child_tid: proc::Tid,
     parent_tid_ptr: *mut u8,
     child_tid_ptr: *mut u8,
+    child_tls_pointer: usize,
 ) -> isize {
     let exit_signal = (flags & CLONE_CSIGNAL_MASK) as u32;
     let (parent_vm_group, child_vm_group, parent_files_group, child_files_group) = {
@@ -3105,6 +3436,7 @@ fn finalize_clone_with_vm_setup(
             sigaltstack_flags: parent_sigaltstack_flags,
             sigaltstack_enabled: parent_sigaltstack_enabled,
             exit_signal,
+            tls_pointer: child_tls_pointer,
         });
         clone_signal_actions_if_needed(parent_sighand_group, child_sighand_group);
 
@@ -3161,6 +3493,7 @@ fn finalize_clone_with_vm_setup(
         wait_vfork_release(parent_tid, child_tid);
     }
 
+    set_tls_pointer_for_tid(child_tid, child_tls_pointer);
     child_tid as isize
 }
 
@@ -3181,14 +3514,32 @@ pub fn sys_clone_with_user_context_riscv(
 
     let parent_tid = current_tid_or_zero();
     ensure_process_info_for_tid(parent_tid);
+    let parent_vm_group = current_vm_group();
 
     let child_tid = proc::spawn("fork-child", fork_child_entry);
     if child_stack != 0 {
         gpr[2] = child_stack as u64; // child user sp
     }
-    if flags & CLONE_SETTLS != 0 {
-        gpr[4] = tls as u64; // tp
-    }
+    let root = vm_root_for_group(parent_vm_group);
+    let auto_tls_allocation = if flags & CLONE_SETTLS == 0 && flags & CLONE_VM != 0 {
+        match allocate_tls_for_thread(parent_vm_group, root, child_tid) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    let tracked_parent_tp = tls_pointer_for_tid(parent_tid);
+    let child_tp = if flags & CLONE_SETTLS != 0 {
+        tls as u64
+    } else if let Some(allocation) = auto_tls_allocation {
+        allocation.tp as u64
+    } else if tracked_parent_tp != 0 {
+        tracked_parent_tp as u64
+    } else {
+        gpr[4]
+    };
+    gpr[4] = child_tp; // tp
     gpr[10] = 0; // child syscall return value (a0)
     // RISC-V는 trap 진입 시 mepc가 `ecall` 자체를 가리키므로,
     // 자식은 syscall 다음 명령으로 복귀하도록 +4를 저장해야 한다.
@@ -3204,7 +3555,21 @@ pub fn sys_clone_with_user_context_riscv(
         },
     });
 
-    finalize_clone_with_vm_setup(flags, parent_tid, child_tid, parent_tid_ptr, child_tid_ptr)
+    let result = finalize_clone_with_vm_setup(
+        flags,
+        parent_tid,
+        child_tid,
+        parent_tid_ptr,
+        child_tid_ptr,
+        child_tp as usize,
+    );
+    if result < 0 {
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if auto_tls_allocation.is_some() {
+            release_tls_allocation(parent_vm_group, child_tid);
+        }
+    }
+    result
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3225,6 +3590,7 @@ pub fn sys_clone_with_user_context(
 
     let parent_tid = current_tid_or_zero();
     ensure_process_info_for_tid(parent_tid);
+    let parent_vm_group = current_vm_group();
 
     let child_tid = proc::spawn("fork-child", fork_child_entry);
     let child_sp = if child_stack == 0 {
@@ -3232,8 +3598,22 @@ pub fn sys_clone_with_user_context(
     } else {
         child_stack as u64
     };
+    let root = vm_root_for_group(parent_vm_group);
+    let auto_tls_allocation = if flags & CLONE_SETTLS == 0 && flags & CLONE_VM != 0 {
+        match allocate_tls_for_thread(parent_vm_group, root, child_tid) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    let tracked_parent_tp = tls_pointer_for_tid(parent_tid);
     let child_tpidr_el0 = if flags & CLONE_SETTLS != 0 {
         tls as u64
+    } else if let Some(allocation) = auto_tls_allocation {
+        allocation.tp as u64
+    } else if tracked_parent_tp != 0 {
+        tracked_parent_tp as u64
     } else {
         let mut tp: u64 = 0;
         unsafe {
@@ -3261,7 +3641,21 @@ pub fn sys_clone_with_user_context(
         },
     });
 
-    finalize_clone_with_vm_setup(flags, parent_tid, child_tid, parent_tid_ptr, child_tid_ptr)
+    let result = finalize_clone_with_vm_setup(
+        flags,
+        parent_tid,
+        child_tid,
+        parent_tid_ptr,
+        child_tid_ptr,
+        child_tpidr_el0 as usize,
+    );
+    if result < 0 {
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if auto_tls_allocation.is_some() {
+            release_tls_allocation(parent_vm_group, child_tid);
+        }
+    }
+    result
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -4508,6 +4902,7 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
         }
     };
 
+    let mut final_vm_group = vm_group_before_exec;
     if let Some((_, isolated_root, old_vm_group)) = exec_vm_isolation {
         let new_vm_group = next_resource_group_id();
         {
@@ -4525,7 +4920,10 @@ pub fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u
             old_vm_group,
             new_vm_group
         );
+        final_vm_group = new_vm_group;
     }
+
+    install_exec_tls_state(final_vm_group, tid, &image);
 
     {
         let mut pending = PENDING_EXECS.lock();

@@ -180,6 +180,19 @@ pub struct PreparedExecImage {
     pub envp: usize,
     /// 아키텍처별 thread pointer 초기값 (TPIDR_EL0 / tp)
     pub tls_pointer: usize,
+    /// exec 시점 TLS 메타데이터 (clone 경로의 TLS 블록 증설에 사용)
+    pub tls_info: Option<PreparedTlsInfo>,
+}
+
+#[derive(Clone)]
+pub struct PreparedTlsInfo {
+    pub pointer: usize,
+    pub map_start: usize,
+    pub map_size: usize,
+    pub mem_size: usize,
+    pub align: usize,
+    pub tcb_size: usize,
+    pub template: Vec<u8>,
 }
 
 struct ExecAuxv {
@@ -228,6 +241,8 @@ fn init_process_entry() -> ! {
         super::exit();
     };
 
+    crate::syscall::install_exec_tls_state_for_current(&image);
+
     let PreparedExecImage {
         entry,
         user_stack,
@@ -236,6 +251,7 @@ fn init_process_entry() -> ! {
         argv,
         envp,
         tls_pointer,
+        tls_info: _tls_info,
     } = image;
 
     if !super::set_current_user_stack(user_stack) {
@@ -652,7 +668,9 @@ fn prepare_exec_image_inner(
         auxv.entry = main.entry;
         let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
             build_user_stack(&resolved_path, argv, envp, &auxv)?;
-        let tls_pointer = map_initial_tls(&main.tls)?;
+        let tls_modules = ModuleLoader::exec_tls_modules();
+        let tls_info = map_initial_tls(&tls_modules)?;
+        let tls_pointer = tls_info.as_ref().map_or(0, |tls| tls.pointer);
         return Ok(PreparedExecImage {
             entry: interp.entry,
             user_stack,
@@ -661,6 +679,7 @@ fn prepare_exec_image_inner(
             argv: argv_ptr,
             envp: envp_ptr,
             tls_pointer,
+            tls_info,
         });
     }
 
@@ -669,7 +688,9 @@ fn prepare_exec_image_inner(
     auxv.entry = loaded.entry;
     let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
         build_user_stack(&resolved_path, argv, envp, &auxv)?;
-    let tls_pointer = map_initial_tls(&loaded.tls)?;
+    let tls_modules = ModuleLoader::exec_tls_modules();
+    let tls_info = map_initial_tls(&tls_modules)?;
+    let tls_pointer = tls_info.as_ref().map_or(0, |tls| tls.pointer);
     Ok(PreparedExecImage {
         entry: loaded.entry,
         user_stack,
@@ -678,6 +699,7 @@ fn prepare_exec_image_inner(
         argv: argv_ptr,
         envp: envp_ptr,
         tls_pointer,
+        tls_info,
     })
 }
 
@@ -941,17 +963,38 @@ fn align_down(value: usize, align: usize) -> usize {
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-fn map_initial_tls(tls: &crate::module::loader::ExecutableTlsInfo) -> Result<usize, ExecError> {
-    if !tls.has_tls || tls.mem_size == 0 {
-        return Ok(0);
+fn map_initial_tls(
+    modules: &[crate::module::loader::ExecutableTlsModuleInfo],
+) -> Result<Option<PreparedTlsInfo>, ExecError> {
+    if modules.is_empty() {
+        return Ok(None);
     }
 
-    let align = tls.align.max(core::mem::size_of::<usize>());
+    let mut align = core::mem::size_of::<usize>();
+    let mut tls_data_size = 0usize;
+    for module in modules.iter() {
+        if module.mem_size == 0 {
+            continue;
+        }
+        align = core::cmp::max(align, module.align.max(core::mem::size_of::<usize>()));
+        let module_offset = module
+            .tprel_base
+            .checked_sub(USER_TLS_TCB_SIZE)
+            .ok_or(ExecError::InvalidElf)?;
+        let module_end = module_offset
+            .checked_add(module.mem_size)
+            .ok_or(ExecError::OutOfMemory)?;
+        tls_data_size = core::cmp::max(tls_data_size, module_end);
+    }
+
+    if tls_data_size == 0 {
+        return Ok(None);
+    }
+
     if !align.is_power_of_two() {
         return Err(ExecError::InvalidElf);
     }
 
-    let tls_data_size = align_up(tls.mem_size, align).ok_or(ExecError::OutOfMemory)?;
     let tls_total_size = USER_TLS_TCB_SIZE
         .checked_add(tls_data_size)
         .ok_or(ExecError::OutOfMemory)?;
@@ -976,36 +1019,76 @@ fn map_initial_tls(tls: &crate::module::loader::ExecutableTlsInfo) -> Result<usi
         return Err(ExecError::OutOfMemory);
     }
 
-    let map_size = data_end
-        .checked_sub(tcb_start)
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let map_start = align_down(tcb_start, page_size);
+    let map_end = align_up(data_end, page_size).ok_or(ExecError::OutOfMemory)?;
+    let map_size = map_end
+        .checked_sub(map_start)
         .ok_or(ExecError::OutOfMemory)?;
     let mut bytes = Vec::new();
     bytes.resize(map_size, 0);
-    let copy_len = core::cmp::min(tls.template.len(), tls_data_size);
-    let copy_offset = data_start - tcb_start;
-    let dst_end = copy_offset
-        .checked_add(copy_len)
-        .ok_or(ExecError::OutOfMemory)?;
-    bytes[copy_offset..dst_end].copy_from_slice(&tls.template[..copy_len]);
-    map_user_region_pages(tcb_start, &bytes, true, false)?;
+    for module in modules.iter() {
+        if module.mem_size == 0 {
+            continue;
+        }
+        let module_offset = module
+            .tprel_base
+            .checked_sub(USER_TLS_TCB_SIZE)
+            .ok_or(ExecError::InvalidElf)?;
+        let copy_len = core::cmp::min(module.template.len(), module.mem_size);
+        let copy_addr = data_start
+            .checked_add(module_offset)
+            .ok_or(ExecError::OutOfMemory)?;
+        let copy_offset = copy_addr
+            .checked_sub(map_start)
+            .ok_or(ExecError::OutOfMemory)?;
+        let dst_end = copy_offset
+            .checked_add(copy_len)
+            .ok_or(ExecError::OutOfMemory)?;
+        if dst_end > bytes.len() {
+            return Err(ExecError::OutOfMemory);
+        }
+        bytes[copy_offset..dst_end].copy_from_slice(&module.template[..copy_len]);
+    }
+    map_user_region_pages(map_start, &bytes, true, false)?;
 
     let tp = tcb_start;
 
     kprintln!(
-        "[exec] TLS mapped: tp={:#x}, data={:#x}, memsz={}, filesz={}, align={}",
+        "[exec] TLS mapped: tp={:#x}, data={:#x}, memsz={}, modules={}, align={}",
         tp,
         data_start,
-        tls.mem_size,
-        tls.template.len(),
+        tls_data_size,
+        modules.len(),
         align
     );
 
-    Ok(tp)
+    let template_offset = data_start
+        .checked_sub(map_start)
+        .ok_or(ExecError::OutOfMemory)?;
+    let template_end = template_offset
+        .checked_add(tls_data_size)
+        .ok_or(ExecError::OutOfMemory)?;
+    if template_end > bytes.len() {
+        return Err(ExecError::OutOfMemory);
+    }
+
+    Ok(Some(PreparedTlsInfo {
+        pointer: tp,
+        map_start,
+        map_size,
+        mem_size: tls_data_size,
+        align,
+        tcb_size: USER_TLS_TCB_SIZE,
+        template: bytes[template_offset..template_end].to_vec(),
+    }))
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
-fn map_initial_tls(_tls: &crate::module::loader::ExecutableTlsInfo) -> Result<usize, ExecError> {
-    Ok(0)
+fn map_initial_tls(
+    _modules: &[crate::module::loader::ExecutableTlsModuleInfo],
+) -> Result<Option<PreparedTlsInfo>, ExecError> {
+    Ok(None)
 }
 
 /// 간단한 유저 프로그램 (커널 내에 포함)

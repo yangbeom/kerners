@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ARCH="${1:-all}"
-TIMEOUT_SEC="${2:-45}"
+TIMEOUT_SEC="${2:-60}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

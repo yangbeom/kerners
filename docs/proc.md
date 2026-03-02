@@ -225,6 +225,8 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 - aarch64/riscv64 유저 syscall 경로에서는 부모 trap context를 복사해 자식이 `sys_clone/fork/vfork`에서 0을 반환하도록 복귀합니다.
 - `sys_clone`는 `CLONE_VM/CLONE_FS/CLONE_FILES/CLONE_SIGHAND` 플래그를 리소스 그룹 메타데이터로 추적합니다.
 - `sys_clone`는 `CLONE_SETTLS`가 설정된 경우 child thread pointer를 사용자 전달값으로 초기화합니다.
+- `sys_clone`는 `CLONE_VM` + no `CLONE_SETTLS`인 경우 vm_group TLS 템플릿을 기반으로
+  child 전용 TLS 블록을 자동 할당하고 child thread pointer를 해당 블록으로 설정합니다.
 - `sys_exit`는 부모의 zombie 리스트에 종료 상태를 등록하고 `SIGCHLD`를 큐잉합니다.
 - `sys_wait4`는 zombie를 회수하고 Linux wait status(`exit_code << 8`)를 기록합니다.
 - `sys_waitid`는 `P_ALL/P_PID/P_PGID` + `WEXITED/WNOHANG/WNOWAIT` 최소 조합을 지원합니다.
@@ -256,6 +258,8 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 ## 현재 제약
 
 - aarch64/riscv64는 vm_group 기반 주소공간 분리 + file-backed `mmap` + fork COW를 지원합니다.
-- exec 초기 TLS(`PT_TLS`) 매핑 + thread pointer 설정은 지원하지만, TLS 재배치/멀티스레드 TLS 독립성은 추가 구현이 필요합니다.
+- exec 초기 TLS(`PT_TLS`) 매핑 + `clone(CLONE_VM)` 멀티스레드 TLS 블록 분리(local-exec baseline)는 지원합니다.
+- 동적 재배치는 `TPREL64`(aarch64/riscv64) baseline까지 지원하며, 미지원 TLS 재배치(`TLSDESC`, `DTPMOD*`, `DTPREL*`, `TPREL32`)는 로드 실패(`ENOEXEC`)로 처리합니다.
+- `__tls_get_addr`/DTV 기반 full TLS ABI(global/local-dynamic)는 아직 추가 구현이 필요합니다.
 - signal core는 구현되어 syscall/interrupt 복귀 직전에 pending unmasked signal 1건을 전달합니다.
 - `rt_sigtimedwait`의 완전한 timeout/blocking 모델, `SA_RESTART` 자동 재시작, job-control(`SIGSTOP/SIGCONT`)은 아직 미구현입니다.

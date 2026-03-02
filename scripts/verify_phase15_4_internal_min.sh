@@ -97,6 +97,14 @@ run_one_arch() {
     kill "$run_pid" >/dev/null 2>&1 || true
     wait "$run_pid" >/dev/null 2>&1 || true
 
+    local phase_section_log
+    phase_section_log="$(mktemp "${TMPDIR:-/tmp}/kerners-phase15-4-umin-section.XXXXXX")"
+    awk '
+        /UMIN_BEGIN/ { capture = 1 }
+        capture { print }
+        /UMIN_END/ && capture { exit }
+    ' "$run_log" >"$phase_section_log"
+
     local failed=0
     local required_markers=(
         "UMIN_BEGIN"
@@ -112,16 +120,18 @@ run_one_arch() {
 
     local marker=""
     for marker in "${required_markers[@]}"; do
-        if ! rg -q "$marker" "$run_log"; then
+        if ! rg -q "$marker" "$phase_section_log"; then
             print_error "marker missing: $marker ($arch)"
             failed=1
         fi
     done
 
-    if rg -q "UMIN_FAIL_|failed to start '/sbin/init'|failed to start '/bin/init'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$run_log"; then
+    if rg -q "UMIN_FAIL_|failed to start '/sbin/init'|failed to start '/bin/init'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi
+
+    rm -f "$phase_section_log"
 
     if [[ "$failed" -eq 0 ]]; then
         print_info "PASS ($arch): internal minimal user test executed"

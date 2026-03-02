@@ -5,7 +5,8 @@
 //! 2. ELF가 아닌 파일 → ENOEXEC(-8)
 //! 3. DT_NEEDED 의존성 누락 → ENOENT(-2)
 //! 4. 미해결 동적 심볼 재배치 → ENOEXEC(-8)
-//! 5. DT_NEEDED 의존성 존재 시 동적 ELF 준비 성공
+//! 5. 미지원 TLS 재배치 타입 → ENOEXEC(-8)
+//! 6. DT_NEEDED 의존성 존재 시 동적 ELF 준비 성공
 
 #![no_std]
 #![no_main]
@@ -71,10 +72,12 @@ const MISSING_DYNAMIC_PATH: &[u8] = b"/execve_dyn_missing.elf";
 const MISSING_DEP_NAME: &[u8] = b"libphase15_missing.so";
 const OK_DYNAMIC_PATH: &[u8] = b"/execve_dyn_ok.elf";
 const UNRESOLVED_DYNAMIC_PATH: &[u8] = b"/execve_dyn_unresolved.elf";
+const UNSUPPORTED_TLS_DYNAMIC_PATH: &[u8] = b"/execve_dyn_tls_unsupported.elf";
 const LIB_DIR_PATH: &[u8] = b"/lib";
 const OK_DEP_PATH: &[u8] = b"/lib/libphase15_dep.so";
 const OK_DEP_NAME: &[u8] = b"libphase15_dep.so";
 const UNRESOLVED_SYMBOL_NAME: &[u8] = b"phase15_unresolved_sym";
+const UNSUPPORTED_TLS_SYMBOL_NAME: &[u8] = b"phase15_tls_unsupported_sym";
 
 #[cfg(target_arch = "aarch64")]
 const ELF_MACHINE: u16 = 183;
@@ -84,6 +87,10 @@ const ELF_MACHINE: u16 = 243;
 const DYN_UNRESOLVED_RELOC_TYPE: u32 = 1025; // R_AARCH64_GLOB_DAT
 #[cfg(target_arch = "riscv64")]
 const DYN_UNRESOLVED_RELOC_TYPE: u32 = 6; // R_RISCV_GLOB_DAT
+#[cfg(target_arch = "aarch64")]
+const DYN_TLS_UNSUPPORTED_RELOC_TYPE: u32 = 1031; // R_AARCH64_TLSDESC
+#[cfg(target_arch = "riscv64")]
+const DYN_TLS_UNSUPPORTED_RELOC_TYPE: u32 = 12; // R_RISCV_TLSDESC
 
 fn clear_elf_buffer(buf: &mut [u8; ELF_FILE_SIZE]) {
     unsafe {
@@ -240,7 +247,11 @@ fn build_dynamic_elf(buf: &mut [u8; ELF_FILE_SIZE], needed_name: Option<&[u8]>) 
     ELF_FILE_SIZE
 }
 
-fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
+fn build_symbol_reloc_elf(
+    buf: &mut [u8; ELF_FILE_SIZE],
+    symbol_name: &[u8],
+    reloc_type: u32,
+) -> usize {
     clear_elf_buffer(buf);
 
     write_ident(buf);
@@ -286,9 +297,9 @@ fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
     let strtab_start = SEGMENT_FILE_OFFSET + UNRESOLVED_DYNSTR_OFFSET_IN_SEGMENT;
     write_u8(buf, strtab_start, 0);
     let sym_name_start = strtab_start + 1;
-    write_bytes_at(buf, sym_name_start, UNRESOLVED_SYMBOL_NAME);
-    write_u8(buf, sym_name_start + UNRESOLVED_SYMBOL_NAME.len(), 0);
-    let strtab_size = 1 + UNRESOLVED_SYMBOL_NAME.len() + 1;
+    write_bytes_at(buf, sym_name_start, symbol_name);
+    write_u8(buf, sym_name_start + symbol_name.len(), 0);
+    let strtab_size = 1 + symbol_name.len() + 1;
 
     let hash_start = SEGMENT_FILE_OFFSET + HASH_OFFSET_IN_SEGMENT;
     write_u32(buf, hash_start, 1); // nbucket
@@ -309,7 +320,7 @@ fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
         rela_start,
         (SEGMENT_VADDR + RELA_TARGET_OFFSET_IN_SEGMENT) as u64,
     );
-    let r_info = ((1u64) << 32) | (DYN_UNRESOLVED_RELOC_TYPE as u64);
+    let r_info = ((1u64) << 32) | (reloc_type as u64);
     write_u64(buf, rela_start + 8, r_info);
     write_i64(buf, rela_start + 16, 0);
 
@@ -353,6 +364,18 @@ fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
     write_dynamic_entry(buf, dyn_off, DT_NULL, 0);
 
     ELF_FILE_SIZE
+}
+
+fn build_unresolved_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
+    build_symbol_reloc_elf(buf, UNRESOLVED_SYMBOL_NAME, DYN_UNRESOLVED_RELOC_TYPE)
+}
+
+fn build_unsupported_tls_reloc_elf(buf: &mut [u8; ELF_FILE_SIZE]) -> usize {
+    build_symbol_reloc_elf(
+        buf,
+        UNSUPPORTED_TLS_SYMBOL_NAME,
+        DYN_TLS_UNSUPPORTED_RELOC_TYPE,
+    )
 }
 
 fn create_file_with_contents(path: &[u8], payload: &[u8]) -> bool {
@@ -464,7 +487,39 @@ pub extern "C" fn module_init() -> i32 {
         kernel_vfs_unlink(UNRESOLVED_DYNAMIC_PATH.as_ptr(), UNRESOLVED_DYNAMIC_PATH.len())
     };
 
-    // 테스트 5: 동적 ELF + DT_NEEDED 의존성 존재
+    // 테스트 5: 미지원 TLS 재배치 타입
+    print("[test_execve] test: ENOEXEC on unsupported TLS relocation ... ");
+    let mut dyn_tls_unsupported = [0u8; ELF_FILE_SIZE];
+    let _ = build_unsupported_tls_reloc_elf(&mut dyn_tls_unsupported);
+    if !create_file_with_contents(UNSUPPORTED_TLS_DYNAMIC_PATH, &dyn_tls_unsupported) {
+        print("FAIL (create/write)\n");
+        return -9;
+    }
+    let tls_unsupported_ret = unsafe {
+        kernel_exec_prepare(
+            UNSUPPORTED_TLS_DYNAMIC_PATH.as_ptr(),
+            UNSUPPORTED_TLS_DYNAMIC_PATH.len(),
+        )
+    };
+    if tls_unsupported_ret != -8 {
+        print("FAIL\n");
+        let _ = unsafe {
+            kernel_vfs_unlink(
+                UNSUPPORTED_TLS_DYNAMIC_PATH.as_ptr(),
+                UNSUPPORTED_TLS_DYNAMIC_PATH.len(),
+            )
+        };
+        return -10;
+    }
+    print("PASS\n");
+    let _ = unsafe {
+        kernel_vfs_unlink(
+            UNSUPPORTED_TLS_DYNAMIC_PATH.as_ptr(),
+            UNSUPPORTED_TLS_DYNAMIC_PATH.len(),
+        )
+    };
+
+    // 테스트 6: 동적 ELF + DT_NEEDED 의존성 존재
     print("[test_execve] test: dynamic ELF prepare succeeds with DT_NEEDED present ... ");
     let _ = unsafe { kernel_vfs_mkdir(LIB_DIR_PATH.as_ptr(), LIB_DIR_PATH.len()) };
 
@@ -472,7 +527,7 @@ pub extern "C" fn module_init() -> i32 {
     let _ = build_dynamic_elf(&mut dep_elf, None);
     if !create_file_with_contents(OK_DEP_PATH, &dep_elf) {
         print("FAIL (dep create/write)\n");
-        return -9;
+        return -11;
     }
 
     let mut dyn_ok = [0u8; ELF_FILE_SIZE];
@@ -480,7 +535,7 @@ pub extern "C" fn module_init() -> i32 {
     if !create_file_with_contents(OK_DYNAMIC_PATH, &dyn_ok) {
         print("FAIL (main create/write)\n");
         let _ = unsafe { kernel_vfs_unlink(OK_DEP_PATH.as_ptr(), OK_DEP_PATH.len()) };
-        return -10;
+        return -12;
     }
 
     let ok_ret = unsafe { kernel_exec_prepare(OK_DYNAMIC_PATH.as_ptr(), OK_DYNAMIC_PATH.len()) };
@@ -488,7 +543,7 @@ pub extern "C" fn module_init() -> i32 {
         print("FAIL\n");
         let _ = unsafe { kernel_vfs_unlink(OK_DYNAMIC_PATH.as_ptr(), OK_DYNAMIC_PATH.len()) };
         let _ = unsafe { kernel_vfs_unlink(OK_DEP_PATH.as_ptr(), OK_DEP_PATH.len()) };
-        return -11;
+        return -13;
     }
     print("PASS\n");
 

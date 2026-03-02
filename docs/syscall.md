@@ -196,7 +196,10 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   - `PT_TLS`가 있으면 초기 TLS 이미지(`.tdata` 복사 + `.tbss` zero-fill)를 유저 TLS 예약 영역에 매핑하고,
     exec trap-apply 시 아키텍처별 thread pointer(`TPIDR_EL0`/`tp`)를 함께 설정
   - `sys_clone`에서 `CLONE_SETTLS` 플래그가 설정되면 child thread pointer를 `_tls` 인자로 설정
-  - TLS 재배치(local-exec/initial-exec 고급 케이스)와 커널 주도 멀티스레드 TLS 블록 자동 할당은 미구현
+  - `sys_clone`의 `CLONE_VM` + no `CLONE_SETTLS` 경로에서는 vm_group TLS 템플릿 기반으로
+    child 전용 TLS 블록을 자동 할당하고 child thread pointer를 해당 블록으로 설정
+  - 동적 TLS 재배치는 `TPREL64`(aarch64/riscv64) baseline까지 지원하고, `TLSDESC`/`DTPMOD*`/`DTPREL*`/`TPREL32`는 `ENOEXEC`으로 실패 처리
+  - `__tls_get_addr`/DTV 기반 full TLS ABI(global/local-dynamic)는 미구현
 
 ## `mmap`/`fork` COW 동작 (aarch64/riscv64)
 

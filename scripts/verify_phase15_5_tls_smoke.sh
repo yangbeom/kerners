@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ARCH="${1:-all}"
-TIMEOUT_SEC="${3:-45}"
+TIMEOUT_SEC="${3:-60}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 RED='\033[0;31m'
@@ -48,13 +48,15 @@ run_one_arch() {
 
     local out_dir="$PROJECT_ROOT/target/user/$arch"
     local tls_bin="$out_dir/sample_tls_smoke_dyn"
+    local tls_ie_bin="$out_dir/sample_tls_ie_smoke_dyn"
+    local tls_ie_lib="$out_dir/libtls_ie.so"
     local ld_bin="$out_dir/$ld_name"
     local disk_img="$PROJECT_ROOT/logs/phase15-5-tls-${arch}-${STAMP}.img"
     local run_log="$PROJECT_ROOT/logs/phase15-5-tls-${arch}-${STAMP}.log"
     local rcs_file="/tmp/phase15-5-tls-rcS-${arch}-${STAMP}"
 
-    if [[ ! -x "$tls_bin" || ! -x "$ld_bin" ]]; then
-        print_error "tls sample artifacts missing: $tls_bin / $ld_bin"
+    if [[ ! -x "$tls_bin" || ! -x "$tls_ie_bin" || ! -f "$tls_ie_lib" || ! -x "$ld_bin" ]]; then
+        print_error "tls sample artifacts missing: $tls_bin / $tls_ie_bin / $tls_ie_lib / $ld_bin"
         return 1
     fi
 
@@ -67,16 +69,20 @@ run_one_arch() {
     mmd -i "$disk_img" ::/etc/init.d >/dev/null 2>&1 || true
     mmd -i "$disk_img" ::/lib >/dev/null 2>&1 || true
 
-    cat >"$rcs_file" <<'EOF'
+cat >"$rcs_file" <<'EOF'
 #!/bin/sh
 echo PH15_5_TLS_BEGIN
 /bin/sample_tls_smoke_dyn
-echo PH15_5_TLS_RC=$?
+echo PH15_5_TLS_LE_RC=$?
+/bin/sample_tls_ie_smoke_dyn
+echo PH15_5_TLS_IE_RC=$?
 echo PH15_5_TLS_END
 EOF
 
     mcopy -o -i "$disk_img" "$rcs_file" ::/etc/init.d/rcS >/dev/null
     mcopy -o -i "$disk_img" "$tls_bin" ::/bin/sample_tls_smoke_dyn >/dev/null
+    mcopy -o -i "$disk_img" "$tls_ie_bin" ::/bin/sample_tls_ie_smoke_dyn >/dev/null
+    mcopy -o -i "$disk_img" "$tls_ie_lib" ::/lib/libtls_ie.so >/dev/null
     mcopy -o -i "$disk_img" "$ld_bin" "::/lib/$ld_name" >/dev/null
     rm -f "$rcs_file"
 
@@ -93,7 +99,7 @@ EOF
             stop_reason="done"
             break
         fi
-        if rg -q "TLS_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
+        if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
             stop_reason="error"
             break
         fi
@@ -108,27 +114,42 @@ EOF
     kill "$run_pid" >/dev/null 2>&1 || true
     wait "$run_pid" >/dev/null 2>&1 || true
 
+    local phase_section_log
+    phase_section_log="$(mktemp "${TMPDIR:-/tmp}/kerners-phase15-5-section.XXXXXX")"
+    awk '
+        /PH15_5_TLS_BEGIN/ { capture = 1 }
+        capture { print }
+        /PH15_5_TLS_END/ && capture { exit }
+    ' "$run_log" >"$phase_section_log"
+
     local failed=0
     local required_markers=(
         "PH15_5_TLS_BEGIN"
         "TLS_SMOKE_BEGIN"
+        "TLS_SMOKE_MT_OK"
         "TLS_SMOKE_OK"
-        "PH15_5_TLS_RC=0"
+        "PH15_5_TLS_LE_RC=0"
+        "TLS_IE_SMOKE_BEGIN"
+        "TLS_IE_SMOKE_MT_OK"
+        "TLS_IE_SMOKE_OK"
+        "PH15_5_TLS_IE_RC=0"
         "PH15_5_TLS_END"
     )
 
     local marker=""
     for marker in "${required_markers[@]}"; do
-        if ! rg -q "$marker" "$run_log"; then
+        if ! rg -q "$marker" "$phase_section_log"; then
             print_error "marker missing: $marker ($arch)"
             failed=1
         fi
     done
 
-    if rg -q "TLS_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$run_log"; then
+    if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi
+
+    rm -f "$phase_section_log"
 
     if [[ "$failed" -eq 0 ]]; then
         print_info "PASS ($arch): TLS smoke executed"

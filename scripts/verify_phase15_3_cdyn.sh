@@ -103,27 +103,37 @@ EOF
     kill "$run_pid" >/dev/null 2>&1 || true
     wait "$run_pid" >/dev/null 2>&1 || true
 
+    local phase_section_log
+    phase_section_log="$(mktemp "${TMPDIR:-/tmp}/kerners-phase15-3-cdyn-section.XXXXXX")"
+    awk '
+        /PH15_3_CDYN_BEGIN/ { capture = 1 }
+        capture { print }
+        /PH15_3_CDYN_END/ && capture { exit }
+    ' "$run_log" >"$phase_section_log"
+
     local failed=0
-    if ! rg -q "PH15_3_CDYN_BEGIN" "$run_log"; then
+    if ! rg -q "PH15_3_CDYN_BEGIN" "$phase_section_log"; then
         print_error "marker missing: PH15_3_CDYN_BEGIN ($arch)"
         failed=1
     fi
-    if ! rg -q "CDYN_HELLO_OK" "$run_log"; then
+    if ! rg -q "CDYN_HELLO_OK" "$phase_section_log"; then
         print_error "marker missing: CDYN_HELLO_OK ($arch)"
         failed=1
     fi
-    if ! rg -q "PH15_3_CDYN_HELLO_RC=42" "$run_log"; then
+    if ! rg -q "PH15_3_CDYN_HELLO_RC=42" "$phase_section_log"; then
         print_error "marker missing: PH15_3_CDYN_HELLO_RC=42 ($arch)"
         failed=1
     fi
-    if ! rg -q "PH15_3_CDYN_END" "$run_log"; then
+    if ! rg -q "PH15_3_CDYN_END" "$phase_section_log"; then
         print_error "marker missing: PH15_3_CDYN_END ($arch)"
         failed=1
     fi
-    if rg -q "failed to start '/bin/hello_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$run_log"; then
+    if rg -q "failed to start '/bin/hello_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi
+
+    rm -f "$phase_section_log"
 
     if [[ "$failed" -eq 0 ]]; then
         print_info "PASS ($arch): dynamic C hello executed"

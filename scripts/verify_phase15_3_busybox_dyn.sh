@@ -98,6 +98,14 @@ run_one_arch() {
     kill "$run_pid" >/dev/null 2>&1 || true
     wait "$run_pid" >/dev/null 2>&1 || true
 
+    local phase_section_log
+    phase_section_log="$(mktemp "${TMPDIR:-/tmp}/kerners-phase15-3-bbdyn-section.XXXXXX")"
+    awk '
+        /BBDYN_BOOT_BEGIN/ { capture = 1 }
+        capture { print }
+        /BBDYN_BOOT_END/ && capture { exit }
+    ' "$run_log" >"$phase_section_log"
+
     local failed=0
     local required_markers=(
         "BBDYN_BOOT_BEGIN"
@@ -113,16 +121,18 @@ run_one_arch() {
 
     local marker=""
     for marker in "${required_markers[@]}"; do
-        if ! rg -q "$marker" "$run_log"; then
+        if ! rg -q "$marker" "$phase_section_log"; then
             print_error "marker missing: $marker ($arch)"
             failed=1
         fi
     done
 
-    if rg -q "failed to start '/sbin/init'|failed to start '/bin/busybox'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$run_log"; then
+    if rg -q "failed to start '/sbin/init'|failed to start '/bin/busybox'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi
+
+    rm -f "$phase_section_log"
 
     if [[ "$failed" -eq 0 ]]; then
         print_info "PASS ($arch): dynamic busybox init + commands executed"

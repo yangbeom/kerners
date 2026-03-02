@@ -348,6 +348,12 @@ pub mod section_index {
     pub const SHN_COMMON: u16 = 0xfff2; // 공통
 }
 
+/// ELF 심볼 타입
+pub mod symbol_type {
+    pub const STT_NOTYPE: u8 = 0;
+    pub const STT_TLS: u8 = 6;
+}
+
 /// ELF64 재배치 엔트리 (Rela, 24바이트)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -402,6 +408,10 @@ pub mod reloc_aarch64 {
     pub const R_AARCH64_GLOB_DAT: u32 = 1025; // S + A
     pub const R_AARCH64_JUMP_SLOT: u32 = 1026; // S + A
     pub const R_AARCH64_RELATIVE: u32 = 1027; // B + A
+    pub const R_AARCH64_TLS_DTPMOD64: u32 = 1028;
+    pub const R_AARCH64_TLS_DTPREL64: u32 = 1029;
+    pub const R_AARCH64_TLS_TPREL64: u32 = 1030;
+    pub const R_AARCH64_TLSDESC: u32 = 1031;
     pub const R_AARCH64_CALL26: u32 = 283; // S + A - P (BL)
     pub const R_AARCH64_JUMP26: u32 = 282; // S + A - P (B)
     pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275; // Page(S+A) - Page(P)
@@ -419,6 +429,12 @@ pub mod reloc_riscv {
     pub const R_RISCV_RELATIVE: u32 = 3; // B + A
     pub const R_RISCV_JUMP_SLOT: u32 = 5; // S + A
     pub const R_RISCV_GLOB_DAT: u32 = 6; // S + A
+    pub const R_RISCV_TLS_DTPMOD64: u32 = 7;
+    pub const R_RISCV_TLS_DTPREL32: u32 = 8;
+    pub const R_RISCV_TLS_DTPREL64: u32 = 9;
+    pub const R_RISCV_TLS_TPREL32: u32 = 10;
+    pub const R_RISCV_TLS_TPREL64: u32 = 11;
+    pub const R_RISCV_TLSDESC: u32 = 12;
     pub const R_RISCV_BRANCH: u32 = 16; // S + A - P (B-type)
     pub const R_RISCV_JAL: u32 = 17; // S + A - P (J-type)
     pub const R_RISCV_CALL: u32 = 18; // S + A - P (auipc+jalr)

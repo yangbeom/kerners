@@ -9,7 +9,10 @@
 #define KU_SYS_UNLINKAT 35
 #define KU_SYS_GETPID 172
 #define KU_SYS_GETPPID 173
+#define KU_SYS_GETTID 178
 #define KU_SYS_CLOCK_GETTIME 113
+#define KU_SYS_CLONE 220
+#define KU_SYS_WAIT4 260
 #define KU_SYS_EXIT 93
 
 #if defined(__aarch64__)
@@ -96,6 +99,40 @@ ku_s64 ku_getpid(void) {
 
 ku_s64 ku_getppid(void) {
     return ku_raw_syscall6(KU_SYS_GETPPID, 0, 0, 0, 0, 0, 0);
+}
+
+ku_s64 ku_gettid(void) {
+    return ku_raw_syscall6(KU_SYS_GETTID, 0, 0, 0, 0, 0, 0);
+}
+
+ku_s64 ku_clone(
+    ku_u64 flags,
+    void *child_stack,
+    void *parent_tid_ptr,
+    ku_u64 tls,
+    void *child_tid_ptr
+) {
+    return ku_raw_syscall6(
+        KU_SYS_CLONE,
+        flags,
+        (ku_u64)child_stack,
+        (ku_u64)parent_tid_ptr,
+        tls,
+        (ku_u64)child_tid_ptr,
+        0
+    );
+}
+
+ku_s64 ku_wait4(ku_s64 pid, int *status, int options, void *rusage) {
+    return ku_raw_syscall6(
+        KU_SYS_WAIT4,
+        (ku_u64)pid,
+        (ku_u64)status,
+        (ku_u64)(ku_s64)options,
+        (ku_u64)rusage,
+        0,
+        0
+    );
 }
 
 ku_s64 ku_clock_gettime(int clock_id, struct ku_timespec *ts) {

@@ -26,6 +26,15 @@ enum {
     KU_CLOCK_MONOTONIC = 1,
 };
 
+enum {
+    KU_SIGCHLD = 17,
+    KU_CLONE_VM = 0x00000100,
+    KU_CLONE_FS = 0x00000200,
+    KU_CLONE_FILES = 0x00000400,
+    KU_CLONE_SIGHAND = 0x00000800,
+    KU_CLONE_SETTLS = 0x00080000,
+};
+
 ku_s64 ku_raw_syscall6(
     ku_u64 nr,
     ku_u64 a0,
@@ -45,6 +54,15 @@ ku_s64 ku_mkdirat(int dirfd, const char *path, ku_u64 mode);
 ku_s64 ku_unlinkat(int dirfd, const char *path, ku_u64 flags);
 ku_s64 ku_getpid(void);
 ku_s64 ku_getppid(void);
+ku_s64 ku_gettid(void);
+ku_s64 ku_clone(
+    ku_u64 flags,
+    void *child_stack,
+    void *parent_tid_ptr,
+    ku_u64 tls,
+    void *child_tid_ptr
+);
+ku_s64 ku_wait4(ku_s64 pid, int *status, int options, void *rusage);
 ku_s64 ku_clock_gettime(int clock_id, struct ku_timespec *ts);
 void ku_exit(int code) __attribute__((noreturn));
 

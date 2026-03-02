@@ -326,6 +326,8 @@ impl LoadedModule {
 static LOADED_MODULES: RwLock<Vec<Box<LoadedModule>>> = RwLock::new(Vec::new());
 static NEXT_EXEC_DYN_BASE: AtomicUsize = AtomicUsize::new(0);
 static EXEC_DYNAMIC_SYMBOLS: RwLock<Vec<(String, usize)>> = RwLock::new(Vec::new());
+static EXEC_DYNAMIC_TLS_SYMBOLS: RwLock<Vec<(String, usize)>> = RwLock::new(Vec::new());
+static EXEC_DYNAMIC_TLS_MODULES: RwLock<Vec<ExecDynamicTlsModule>> = RwLock::new(Vec::new());
 
 /// 실행 ELF 로드 결과
 pub struct ExecutableLoadInfo {
@@ -370,6 +372,24 @@ pub struct ExecutableTlsInfo {
     pub mem_size: usize,
     pub align: usize,
     pub template: Vec<u8>,
+    pub tprel_base: usize,
+}
+
+/// 현재 exec 체인(메인 + preload된 .so) TLS 모듈 요약
+#[derive(Debug, Clone)]
+pub struct ExecutableTlsModuleInfo {
+    pub tprel_base: usize,
+    pub mem_size: usize,
+    pub align: usize,
+    pub template: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecDynamicTlsModule {
+    tprel_base: usize,
+    mem_size: usize,
+    align: usize,
+    template: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -403,6 +423,13 @@ impl ModuleLoader {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const EXEC_DYN_BASE_START: usize = 0x4800_0000;
     const EXEC_DYN_GUARD_SIZE: usize = 2 * 1024 * 1024;
+
+    #[cfg(target_arch = "aarch64")]
+    const EXEC_TLS_TCB_SIZE: usize = 16;
+    #[cfg(target_arch = "riscv64")]
+    const EXEC_TLS_TCB_SIZE: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    const EXEC_TLS_TCB_SIZE: usize = 0;
 
     fn align_up(value: usize, align: usize) -> Result<usize, ModuleError> {
         let plus = value.checked_add(align - 1).ok_or(ModuleError::InvalidFormat)?;
@@ -476,8 +503,18 @@ impl ModuleLoader {
     }
 
     pub fn clear_exec_dynamic_symbols() {
-        let mut symbols = EXEC_DYNAMIC_SYMBOLS.write();
-        symbols.clear();
+        {
+            let mut symbols = EXEC_DYNAMIC_SYMBOLS.write();
+            symbols.clear();
+        }
+        {
+            let mut tls_symbols = EXEC_DYNAMIC_TLS_SYMBOLS.write();
+            tls_symbols.clear();
+        }
+        {
+            let mut tls_modules = EXEC_DYNAMIC_TLS_MODULES.write();
+            tls_modules.clear();
+        }
     }
 
     fn register_exec_dynamic_symbols(symbols: &[(String, usize)]) {
@@ -502,6 +539,86 @@ impl ModuleLoader {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, addr)| *addr)
+    }
+
+    pub fn exec_tls_modules() -> Vec<ExecutableTlsModuleInfo> {
+        let modules = EXEC_DYNAMIC_TLS_MODULES.read();
+        modules
+            .iter()
+            .map(|item| ExecutableTlsModuleInfo {
+                tprel_base: item.tprel_base,
+                mem_size: item.mem_size,
+                align: item.align,
+                template: item.template.clone(),
+            })
+            .collect()
+    }
+
+    fn register_exec_dynamic_tls_symbols(symbols: &[(String, usize)]) {
+        if symbols.is_empty() {
+            return;
+        }
+
+        let mut global = EXEC_DYNAMIC_TLS_SYMBOLS.write();
+        for (name, offset) in symbols.iter() {
+            if let Some(pos) = global.iter().position(|(n, _)| n == name) {
+                global[pos] = (name.clone(), *offset);
+            } else {
+                global.push((name.clone(), *offset));
+            }
+        }
+    }
+
+    fn lookup_exec_dynamic_tls_symbol(name: &str) -> Option<usize> {
+        let global = EXEC_DYNAMIC_TLS_SYMBOLS.read();
+        global
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, offset)| *offset)
+    }
+
+    fn normalize_tls_align(align: usize) -> Result<usize, ModuleError> {
+        let normalized = align.max(core::mem::size_of::<usize>());
+        if !normalized.is_power_of_two() {
+            return Err(ModuleError::InvalidFormat);
+        }
+        Ok(normalized)
+    }
+
+    fn next_tls_tprel_base(align: usize) -> Result<usize, ModuleError> {
+        let mut cursor = Self::EXEC_TLS_TCB_SIZE;
+        let modules = EXEC_DYNAMIC_TLS_MODULES.read();
+        for module in modules.iter() {
+            let module_align = Self::normalize_tls_align(module.align)?;
+            cursor = Self::align_up(cursor, module_align)?;
+            cursor = cursor
+                .checked_add(module.mem_size)
+                .ok_or(ModuleError::InvalidFormat)?;
+        }
+        Self::align_up(cursor, align)
+    }
+
+    fn assign_tls_tprel_base(mut tls: ExecutableTlsInfo) -> Result<ExecutableTlsInfo, ModuleError> {
+        if !tls.has_tls || tls.mem_size == 0 {
+            return Ok(tls);
+        }
+        let align = Self::normalize_tls_align(tls.align)?;
+        tls.align = align;
+        tls.tprel_base = Self::next_tls_tprel_base(align)?;
+        Ok(tls)
+    }
+
+    fn register_exec_tls_module(tls: &ExecutableTlsInfo) {
+        if !tls.has_tls || tls.mem_size == 0 {
+            return;
+        }
+        EXEC_DYNAMIC_TLS_MODULES.write().push(ExecDynamicTlsModule {
+            tprel_base: tls.tprel_base,
+            mem_size: tls.mem_size,
+            align: tls.align,
+            template: tls.template.clone(),
+        });
     }
 
     fn cleanup_exec_frames(frames: &mut Vec<usize>) {
@@ -807,6 +924,64 @@ impl ModuleLoader {
         Ok(exports)
     }
 
+    fn collect_dynamic_tls_exports(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        tls_info: &ExecutableTlsInfo,
+    ) -> Result<Vec<(String, usize)>, ModuleError> {
+        if !tls_info.has_tls || tls_info.mem_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let strtab = Self::dynamic_strtab(elf, data, load_bias, dyn_info)?;
+        let Some(strtab) = strtab else {
+            return Ok(Vec::new());
+        };
+
+        let symbol_count = Self::dynamic_symbol_count(elf, data, load_bias, dyn_info)?;
+        if symbol_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut exports = Vec::new();
+        for sym_index in 1..(symbol_count as u32) {
+            let sym = match Self::dynamic_symbol_at(elf, data, load_bias, dyn_info, sym_index) {
+                Ok(sym) => sym,
+                Err(_) => break,
+            };
+
+            let binding = sym.binding();
+            if binding != 1 && binding != 2 {
+                continue;
+            }
+            if sym.sym_type() != symbol_type::STT_TLS {
+                continue;
+            }
+            if sym.st_shndx == section_index::SHN_UNDEF {
+                continue;
+            }
+
+            let name = Self::string_at(strtab, sym.st_name as usize);
+            if name.is_empty() {
+                continue;
+            }
+
+            let symbol_offset = sym.st_value as usize;
+            if symbol_offset > tls_info.mem_size {
+                return Err(ModuleError::InvalidFormat);
+            }
+            let tprel = tls_info
+                .tprel_base
+                .checked_add(symbol_offset)
+                .ok_or(ModuleError::InvalidFormat)?;
+            exports.push((String::from(name), tprel));
+        }
+
+        Ok(exports)
+    }
+
     fn resolve_dynamic_symbol(
         elf: &Elf64,
         data: &[u8],
@@ -854,6 +1029,60 @@ impl ModuleLoader {
             .checked_add(load_bias)
             .ok_or(ModuleError::InvalidFormat)?;
         Ok(Some(value))
+    }
+
+    fn resolve_dynamic_tls_tprel(
+        elf: &Elf64,
+        data: &[u8],
+        load_bias: usize,
+        dyn_info: &ExecutableDynamicInfo,
+        sym_index: u32,
+        strtab: Option<&[u8]>,
+        current_tls: &ExecutableTlsInfo,
+    ) -> Result<Option<usize>, ModuleError> {
+        if sym_index == 0 {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let symbol = Self::dynamic_symbol_at(elf, data, load_bias, dyn_info, sym_index)?;
+        let is_weak = symbol.binding() == 2;
+        if symbol.sym_type() != symbol_type::STT_TLS {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        if symbol.st_shndx == section_index::SHN_UNDEF {
+            let name = strtab
+                .map(|tab| Self::string_at(tab, symbol.st_name as usize))
+                .unwrap_or("");
+            if !name.is_empty() {
+                if let Some(offset) = Self::lookup_exec_dynamic_tls_symbol(name) {
+                    return Ok(Some(offset));
+                }
+                if is_weak {
+                    kprintln!("[module] dynamic weak unresolved TLS symbol: {}", name);
+                    return Ok(Some(0));
+                }
+                kprintln!("[module] dynamic unresolved TLS symbol: {}", name);
+            } else if is_weak {
+                return Ok(Some(0));
+            } else {
+                kprintln!("[module] dynamic unresolved TLS symbol index={}", sym_index);
+            }
+            return Ok(None);
+        }
+
+        if !current_tls.has_tls || current_tls.mem_size == 0 {
+            return Err(ModuleError::InvalidFormat);
+        }
+        let symbol_offset = symbol.st_value as usize;
+        if symbol_offset > current_tls.mem_size {
+            return Err(ModuleError::InvalidFormat);
+        }
+        let tprel = current_tls
+            .tprel_base
+            .checked_add(symbol_offset)
+            .ok_or(ModuleError::InvalidFormat)?;
+        Ok(Some(tprel))
     }
 
     fn translate_exec_vaddr(page_mappings: &[ExecPageMapping], vaddr: usize) -> Option<usize> {
@@ -944,6 +1173,7 @@ impl ModuleLoader {
             mem_size,
             align,
             template,
+            tprel_base: 0,
         })
     }
 
@@ -1049,6 +1279,7 @@ impl ModuleLoader {
         data: &[u8],
         load_bias: usize,
         dyn_info: &ExecutableDynamicInfo,
+        current_tls: &ExecutableTlsInfo,
         page_mappings: &[ExecPageMapping],
     ) -> Result<(), ModuleError> {
         if dyn_info.rela == 0
@@ -1077,6 +1308,7 @@ impl ModuleLoader {
                     data,
                     load_bias,
                     dyn_info,
+                    current_tls,
                     strtab,
                     page_mappings,
                     rela,
@@ -1101,6 +1333,7 @@ impl ModuleLoader {
                     data,
                     load_bias,
                     dyn_info,
+                    current_tls,
                     strtab,
                     page_mappings,
                     rel,
@@ -1126,6 +1359,7 @@ impl ModuleLoader {
                         data,
                         load_bias,
                         dyn_info,
+                        current_tls,
                         strtab,
                         page_mappings,
                         rela,
@@ -1148,6 +1382,7 @@ impl ModuleLoader {
                         data,
                         load_bias,
                         dyn_info,
+                        current_tls,
                         strtab,
                         page_mappings,
                         rel,
@@ -1171,6 +1406,7 @@ impl ModuleLoader {
         data: &[u8],
         load_bias: usize,
         dyn_info: &ExecutableDynamicInfo,
+        current_tls: &ExecutableTlsInfo,
         strtab: Option<&[u8]>,
         page_mappings: &[ExecPageMapping],
         rela: &Elf64Rela,
@@ -1212,6 +1448,28 @@ impl ModuleLoader {
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
                     return Ok(true);
                 }
+                reloc_aarch64::R_AARCH64_TLS_TPREL64 => {
+                    let symbol = Self::resolve_dynamic_tls_tprel(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                        current_tls,
+                    )?;
+                    let Some(tprel) = symbol else {
+                        return Err(ModuleError::SymbolNotFound);
+                    };
+                    let value = Self::add_signed(tprel, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_aarch64::R_AARCH64_TLS_DTPMOD64
+                | reloc_aarch64::R_AARCH64_TLS_DTPREL64
+                | reloc_aarch64::R_AARCH64_TLSDESC => {
+                    return Err(ModuleError::UnsupportedRelocation(rel_type));
+                }
                 _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
             }
         }
@@ -1246,6 +1504,30 @@ impl ModuleLoader {
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
                     return Ok(true);
                 }
+                reloc_riscv::R_RISCV_TLS_TPREL64 => {
+                    let symbol = Self::resolve_dynamic_tls_tprel(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                        current_tls,
+                    )?;
+                    let Some(tprel) = symbol else {
+                        return Err(ModuleError::SymbolNotFound);
+                    };
+                    let value = Self::add_signed(tprel, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_riscv::R_RISCV_TLS_DTPMOD64
+                | reloc_riscv::R_RISCV_TLS_DTPREL32
+                | reloc_riscv::R_RISCV_TLS_DTPREL64
+                | reloc_riscv::R_RISCV_TLS_TPREL32
+                | reloc_riscv::R_RISCV_TLSDESC => {
+                    return Err(ModuleError::UnsupportedRelocation(rel_type));
+                }
                 _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
             }
         }
@@ -1259,6 +1541,7 @@ impl ModuleLoader {
         data: &[u8],
         load_bias: usize,
         dyn_info: &ExecutableDynamicInfo,
+        current_tls: &ExecutableTlsInfo,
         strtab: Option<&[u8]>,
         page_mappings: &[ExecPageMapping],
         rel: &Elf64Rel,
@@ -1300,6 +1583,28 @@ impl ModuleLoader {
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
                     return Ok(true);
                 }
+                reloc_aarch64::R_AARCH64_TLS_TPREL64 => {
+                    let symbol = Self::resolve_dynamic_tls_tprel(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                        current_tls,
+                    )?;
+                    let Some(tprel) = symbol else {
+                        return Err(ModuleError::SymbolNotFound);
+                    };
+                    let value = Self::add_signed(tprel, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_aarch64::R_AARCH64_TLS_DTPMOD64
+                | reloc_aarch64::R_AARCH64_TLS_DTPREL64
+                | reloc_aarch64::R_AARCH64_TLSDESC => {
+                    return Err(ModuleError::UnsupportedRelocation(rel_type));
+                }
                 _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
             }
         }
@@ -1333,6 +1638,30 @@ impl ModuleLoader {
                     let value = Self::add_signed(symbol_value, addend)?;
                     Self::write_exec_u64(page_mappings, place, value as u64)?;
                     return Ok(true);
+                }
+                reloc_riscv::R_RISCV_TLS_TPREL64 => {
+                    let symbol = Self::resolve_dynamic_tls_tprel(
+                        elf,
+                        data,
+                        load_bias,
+                        dyn_info,
+                        sym,
+                        strtab,
+                        current_tls,
+                    )?;
+                    let Some(tprel) = symbol else {
+                        return Err(ModuleError::SymbolNotFound);
+                    };
+                    let value = Self::add_signed(tprel, addend)?;
+                    Self::write_exec_u64(page_mappings, place, value as u64)?;
+                    return Ok(true);
+                }
+                reloc_riscv::R_RISCV_TLS_DTPMOD64
+                | reloc_riscv::R_RISCV_TLS_DTPREL32
+                | reloc_riscv::R_RISCV_TLS_DTPREL64
+                | reloc_riscv::R_RISCV_TLS_TPREL32
+                | reloc_riscv::R_RISCV_TLSDESC => {
+                    return Err(ModuleError::UnsupportedRelocation(rel_type));
                 }
                 _ => return Err(ModuleError::UnsupportedRelocation(rel_type)),
             }
@@ -1660,10 +1989,25 @@ impl ModuleLoader {
         crate::arch::mmu::flush_tlb_all();
 
         let dynamic_info = Self::parse_dynamic_info(&elf, load_bias)?;
-        Self::apply_dynamic_relocations(&elf, data, load_bias, &dynamic_info, &page_mappings)?;
-        let tls_info = Self::collect_tls_info(&elf, load_bias, &page_mappings)?;
+        let tls_info = Self::assign_tls_tprel_base(Self::collect_tls_info(
+            &elf,
+            load_bias,
+            &page_mappings,
+        )?)?;
+        Self::apply_dynamic_relocations(
+            &elf,
+            data,
+            load_bias,
+            &dynamic_info,
+            &tls_info,
+            &page_mappings,
+        )?;
         let exported_symbols = Self::collect_dynamic_exports(&elf, data, load_bias, &dynamic_info)?;
+        let exported_tls_symbols =
+            Self::collect_dynamic_tls_exports(&elf, data, load_bias, &dynamic_info, &tls_info)?;
         Self::register_exec_dynamic_symbols(&exported_symbols);
+        Self::register_exec_dynamic_tls_symbols(&exported_tls_symbols);
+        Self::register_exec_tls_module(&tls_info);
         if dynamic_info.at_dynamic != 0 {
             kprintln!(
                 "[module] DYNAMIC: at={:#x}, needed={}, strtab={:#x}, symtab={:#x}, rela={:#x}, rel={:#x}, jmprel={:#x}",
@@ -1678,10 +2022,11 @@ impl ModuleLoader {
         }
         if tls_info.has_tls {
             kprintln!(
-                "[module] TLS: memsz={}, filesz={}, align={}",
+                "[module] TLS: memsz={}, filesz={}, align={}, tprel_base={:#x}",
                 tls_info.mem_size,
                 tls_info.template.len(),
-                tls_info.align
+                tls_info.align,
+                tls_info.tprel_base
             );
         }
 

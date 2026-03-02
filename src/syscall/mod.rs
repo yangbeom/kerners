@@ -461,6 +461,10 @@ pub fn take_exec_transition_for_current() -> Option<process::ExecTransition> {
     process::take_exec_transition_for_current()
 }
 
+pub fn install_exec_tls_state_for_current(image: &crate::proc::user::PreparedExecImage) {
+    process::install_exec_tls_state_for_current(image);
+}
+
 /// `/proc/[pid]/status` 조회용 프로세스 스냅샷
 pub type ProcStatusSnapshot = process::ProcStatusSnapshot;
 

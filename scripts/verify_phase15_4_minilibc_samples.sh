@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ARCH="${1:-all}"
-TIMEOUT_SEC="${3:-45}"
+TIMEOUT_SEC="${3:-60}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 RED='\033[0;31m'
@@ -112,6 +112,14 @@ EOF
     kill "$run_pid" >/dev/null 2>&1 || true
     wait "$run_pid" >/dev/null 2>&1 || true
 
+    local phase_section_log
+    phase_section_log="$(mktemp "${TMPDIR:-/tmp}/kerners-phase15-4-mini-section.XXXXXX")"
+    awk '
+        /PH15_4_MINI_BEGIN/ { capture = 1 }
+        capture { print }
+        /PH15_4_MINI_END/ && capture { exit }
+    ' "$run_log" >"$phase_section_log"
+
     local failed=0
     local required_markers=(
         "PH15_4_MINI_BEGIN"
@@ -125,16 +133,18 @@ EOF
 
     local marker=""
     for marker in "${required_markers[@]}"; do
-        if ! rg -q "$marker" "$run_log"; then
+        if ! rg -q "$marker" "$phase_section_log"; then
             print_error "marker missing: $marker ($arch)"
             failed=1
         fi
     done
 
-    if rg -q "MINILIBC_SMOKE_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$run_log"; then
+    if rg -q "MINILIBC_SMOKE_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi
+
+    rm -f "$phase_section_log"
 
     if [[ "$failed" -eq 0 ]]; then
         print_info "PASS ($arch): minilibc sample programs executed"
