@@ -34,6 +34,18 @@ pub const USER_STACK_BASE: usize = 0x0000_0000_8000_0000; // 2GB
 #[cfg(target_arch = "riscv64")]
 pub const USER_STACK_BASE: usize = 0x0000_0000_C000_0000; // 3GB
 
+/// 유저 TLS 예약 영역 크기 (64KB)
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLS_REGION_SIZE: usize = 64 * 1024;
+/// 유저 TLS 예약 영역 베이스 (스택 바로 아래)
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLS_REGION_BASE: usize = USER_STACK_BASE - USER_STACK_SIZE - USER_TLS_REGION_SIZE;
+
+#[cfg(target_arch = "aarch64")]
+const USER_TLS_TCB_SIZE: usize = 16;
+#[cfg(target_arch = "riscv64")]
+const USER_TLS_TCB_SIZE: usize = 0;
+
 /// 유저 프로세스 구조체
 pub struct UserProcess {
     /// 유저 스택 (커널에서 할당)
@@ -166,6 +178,8 @@ pub struct PreparedExecImage {
     pub argv: usize,
     /// envp 포인터
     pub envp: usize,
+    /// 아키텍처별 thread pointer 초기값 (TPIDR_EL0 / tp)
+    pub tls_pointer: usize,
 }
 
 struct ExecAuxv {
@@ -221,6 +235,7 @@ fn init_process_entry() -> ! {
         argc,
         argv,
         envp,
+        tls_pointer,
     } = image;
 
     if !super::set_current_user_stack(user_stack) {
@@ -238,7 +253,7 @@ fn init_process_entry() -> ! {
     unsafe {
         // SAFETY: init_process_entry는 준비된 유저 이미지/스택을 현재 스레드에 바인딩한 뒤
         // 아키텍처별 예외 복귀 경로(eret/mret)로 유저 모드에 진입한다.
-        enter_user_image(entry, stack_top, argc, argv, envp);
+        enter_user_image(entry, stack_top, argc, argv, envp, tls_pointer);
     }
 }
 
@@ -253,18 +268,21 @@ unsafe fn enter_user_image(
     argc: usize,
     argv: usize,
     envp: usize,
+    tls_pointer: usize,
 ) -> ! {
     unsafe {
         core::arch::asm!(
             "msr spsr_el1, xzr", // EL0t
             "msr elr_el1, {entry}",
             "msr sp_el0, {sp}",
+            "msr tpidr_el0, {tp}",
             "mov x0, {argc}",
             "mov x1, {argv}",
             "mov x2, {envp}",
             "eret",
             entry = in(reg) entry,
             sp = in(reg) stack_top,
+            tp = in(reg) tls_pointer,
             argc = in(reg) argc,
             argv = in(reg) argv,
             envp = in(reg) envp,
@@ -284,6 +302,7 @@ unsafe fn enter_user_image(
     argc: usize,
     argv: usize,
     envp: usize,
+    tls_pointer: usize,
 ) -> ! {
     unsafe {
         core::arch::asm!(
@@ -296,12 +315,14 @@ unsafe fn enter_user_image(
             "csrw mepc, {entry}",
             "csrw mscratch, sp", // trap 진입 시 사용할 현재 커널 스택
             "mv sp, {sp}",
+            "mv tp, {tp}",
             "mv a0, {argc}",
             "mv a1, {argv}",
             "mv a2, {envp}",
             "mret",
             entry = in(reg) entry,
             sp = in(reg) stack_top,
+            tp = in(reg) tls_pointer,
             argc = in(reg) argc,
             argv = in(reg) argv,
             envp = in(reg) envp,
@@ -631,6 +652,7 @@ fn prepare_exec_image_inner(
         auxv.entry = main.entry;
         let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
             build_user_stack(&resolved_path, argv, envp, &auxv)?;
+        let tls_pointer = map_initial_tls(&main.tls)?;
         return Ok(PreparedExecImage {
             entry: interp.entry,
             user_stack,
@@ -638,6 +660,7 @@ fn prepare_exec_image_inner(
             argc,
             argv: argv_ptr,
             envp: envp_ptr,
+            tls_pointer,
         });
     }
 
@@ -646,6 +669,7 @@ fn prepare_exec_image_inner(
     auxv.entry = loaded.entry;
     let (user_stack, stack_top, argc, argv_ptr, envp_ptr) =
         build_user_stack(&resolved_path, argv, envp, &auxv)?;
+    let tls_pointer = map_initial_tls(&loaded.tls)?;
     Ok(PreparedExecImage {
         entry: loaded.entry,
         user_stack,
@@ -653,6 +677,7 @@ fn prepare_exec_image_inner(
         argc,
         argv: argv_ptr,
         envp: envp_ptr,
+        tls_pointer,
     })
 }
 
@@ -827,33 +852,65 @@ fn find_phdr_vaddr(elf: &crate::module::Elf64<'_>) -> Option<usize> {
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn map_user_stack_pages(stack_base: usize, stack_bytes: &[u8]) -> Result<(), ExecError> {
-    let page_size = crate::mm::page::PAGE_SIZE;
-    let mut frames: Vec<usize> = Vec::new();
+    map_user_region_pages(stack_base, stack_bytes, true, false)
+}
 
-    for offset in (0..stack_bytes.len()).step_by(page_size) {
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn map_user_region_pages(
+    region_base: usize,
+    region_bytes: &[u8],
+    writable: bool,
+    executable: bool,
+) -> Result<(), ExecError> {
+    if region_bytes.is_empty() {
+        return Ok(());
+    }
+
+    let page_size = crate::mm::page::PAGE_SIZE;
+    let region_end = region_base
+        .checked_add(region_bytes.len())
+        .ok_or(ExecError::OutOfMemory)?;
+    let map_start = align_down(region_base, page_size);
+    let map_end = align_up(region_end, page_size).ok_or(ExecError::OutOfMemory)?;
+    let mut mapped_frames: Vec<(usize, usize)> = Vec::new();
+
+    for virt_addr in (map_start..map_end).step_by(page_size) {
         let frame = if let Some(frame) = crate::mm::page::alloc_frame() {
             frame
         } else {
-            cleanup_stack_frames(&mut frames);
+            cleanup_user_region(&mut mapped_frames);
             return Err(ExecError::OutOfMemory);
         };
-        frames.push(frame);
 
-        if crate::arch::mmu::map_user_page_noflush(stack_base + offset, frame, true, false).is_err()
-        {
-            cleanup_stack_frames(&mut frames);
+        if crate::arch::mmu::map_user_page_noflush(virt_addr, frame, writable, executable).is_err() {
+            unsafe {
+                crate::mm::page::free_frame(frame);
+            }
+            cleanup_user_region(&mut mapped_frames);
             return Err(ExecError::OutOfMemory);
         }
+        mapped_frames.push((virt_addr, frame));
 
-        let end = core::cmp::min(offset + page_size, stack_bytes.len());
-        let copy_len = end - offset;
         unsafe {
-            // SAFETY: frame은 alloc_frame()으로 확보한 유효 페이지이고 src 범위는 stack_bytes 내부다.
-            core::ptr::copy_nonoverlapping(
-                stack_bytes[offset..end].as_ptr(),
-                frame as *mut u8,
-                copy_len,
-            );
+            // SAFETY: frame은 alloc_frame()으로 확보한 유효 페이지다.
+            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+        }
+
+        let page_end = virt_addr + page_size;
+        let copy_start = core::cmp::max(virt_addr, region_base);
+        let copy_end = core::cmp::min(page_end, region_end);
+        if copy_start < copy_end {
+            let copy_len = copy_end - copy_start;
+            let src_offset = copy_start - region_base;
+            let dst_offset = copy_start - virt_addr;
+            unsafe {
+                // SAFETY: src/dst 범위는 모두 매핑된 페이지와 region_bytes 내부다.
+                core::ptr::copy_nonoverlapping(
+                    region_bytes[src_offset..src_offset + copy_len].as_ptr(),
+                    (frame + dst_offset) as *mut u8,
+                    copy_len,
+                );
+            }
         }
     }
 
@@ -862,12 +919,93 @@ fn map_user_stack_pages(stack_base: usize, stack_bytes: &[u8]) -> Result<(), Exe
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-fn cleanup_stack_frames(frames: &mut Vec<usize>) {
-    for frame in frames.drain(..) {
+fn cleanup_user_region(mapped_frames: &mut Vec<(usize, usize)>) {
+    for (virt_addr, frame) in mapped_frames.drain(..) {
+        let _ = crate::arch::mmu::unmap_user_page_noflush(virt_addr);
         unsafe {
             crate::mm::page::free_frame(frame);
         }
     }
+    crate::arch::mmu::flush_tlb_all();
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    let plus = value.checked_add(align.checked_sub(1)?)?;
+    Some(plus & !(align - 1))
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn map_initial_tls(tls: &crate::module::loader::ExecutableTlsInfo) -> Result<usize, ExecError> {
+    if !tls.has_tls || tls.mem_size == 0 {
+        return Ok(0);
+    }
+
+    let align = tls.align.max(core::mem::size_of::<usize>());
+    if !align.is_power_of_two() {
+        return Err(ExecError::InvalidElf);
+    }
+
+    let tls_data_size = align_up(tls.mem_size, align).ok_or(ExecError::OutOfMemory)?;
+    let tls_total_size = USER_TLS_TCB_SIZE
+        .checked_add(tls_data_size)
+        .ok_or(ExecError::OutOfMemory)?;
+    if tls_total_size > USER_TLS_REGION_SIZE {
+        return Err(ExecError::OutOfMemory);
+    }
+
+    let region_end = USER_TLS_REGION_BASE
+        .checked_add(USER_TLS_REGION_SIZE)
+        .ok_or(ExecError::OutOfMemory)?;
+    let data_start_unaligned = region_end
+        .checked_sub(tls_data_size)
+        .ok_or(ExecError::OutOfMemory)?;
+    let data_start = align_down(data_start_unaligned, align);
+    let data_end = data_start
+        .checked_add(tls_data_size)
+        .ok_or(ExecError::OutOfMemory)?;
+    let tcb_start = data_start
+        .checked_sub(USER_TLS_TCB_SIZE)
+        .ok_or(ExecError::OutOfMemory)?;
+    if tcb_start < USER_TLS_REGION_BASE || data_end > region_end {
+        return Err(ExecError::OutOfMemory);
+    }
+
+    let map_size = data_end
+        .checked_sub(tcb_start)
+        .ok_or(ExecError::OutOfMemory)?;
+    let mut bytes = Vec::new();
+    bytes.resize(map_size, 0);
+    let copy_len = core::cmp::min(tls.template.len(), tls_data_size);
+    let copy_offset = data_start - tcb_start;
+    let dst_end = copy_offset
+        .checked_add(copy_len)
+        .ok_or(ExecError::OutOfMemory)?;
+    bytes[copy_offset..dst_end].copy_from_slice(&tls.template[..copy_len]);
+    map_user_region_pages(tcb_start, &bytes, true, false)?;
+
+    let tp = tcb_start;
+
+    kprintln!(
+        "[exec] TLS mapped: tp={:#x}, data={:#x}, memsz={}, filesz={}, align={}",
+        tp,
+        data_start,
+        tls.mem_size,
+        tls.template.len(),
+        align
+    );
+
+    Ok(tp)
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+fn map_initial_tls(_tls: &crate::module::loader::ExecutableTlsInfo) -> Result<usize, ExecError> {
+    Ok(0)
 }
 
 /// 간단한 유저 프로그램 (커널 내에 포함)

@@ -186,6 +186,7 @@ pub struct ExecTransition {
     pub argc: usize,
     pub argv: usize,
     pub envp: usize,
+    pub tls_pointer: usize,
     pub user_stack: Vec<u8>,
 }
 
@@ -238,8 +239,7 @@ const BRK_REGION_BASE: usize = 0x2000_0000;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MMAP_REGION_BASE: usize = 0x3000_0000;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-const MMAP_REGION_END: usize =
-    crate::proc::user::USER_STACK_BASE - crate::proc::user::USER_STACK_SIZE;
+const MMAP_REGION_END: usize = crate::proc::user::USER_TLS_REGION_BASE;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -254,6 +254,7 @@ const CLONE_FS: usize = 0x00000200;
 const CLONE_FILES: usize = 0x00000400;
 const CLONE_SIGHAND: usize = 0x00000800;
 const CLONE_VFORK: usize = 0x00004000;
+const CLONE_SETTLS: usize = 0x00080000;
 const CLONE_PARENT_SETTID: usize = 0x00100000;
 const CLONE_CHILD_SETTID: usize = 0x01000000;
 const CLONE_CSIGNAL_MASK: usize = 0x000000ff;
@@ -3168,7 +3169,7 @@ pub fn sys_clone_with_user_context_riscv(
     flags: usize,
     child_stack: usize,
     parent_tid_ptr: *mut u8,
-    _tls: usize,
+    tls: usize,
     child_tid_ptr: *mut u8,
     mut gpr: [u64; 32],
     mstatus: u64,
@@ -3184,6 +3185,9 @@ pub fn sys_clone_with_user_context_riscv(
     let child_tid = proc::spawn("fork-child", fork_child_entry);
     if child_stack != 0 {
         gpr[2] = child_stack as u64; // child user sp
+    }
+    if flags & CLONE_SETTLS != 0 {
+        gpr[4] = tls as u64; // tp
     }
     gpr[10] = 0; // child syscall return value (a0)
     // RISC-V는 trap 진입 시 mepc가 `ecall` 자체를 가리키므로,
@@ -3208,7 +3212,7 @@ pub fn sys_clone_with_user_context(
     flags: usize,
     child_stack: usize,
     parent_tid_ptr: *mut u8,
-    _tls: usize,
+    tls: usize,
     child_tid_ptr: *mut u8,
     mut gpr: [u64; 31],
     elr: u64,
@@ -3228,7 +3232,9 @@ pub fn sys_clone_with_user_context(
     } else {
         child_stack as u64
     };
-    let child_tpidr_el0 = {
+    let child_tpidr_el0 = if flags & CLONE_SETTLS != 0 {
+        tls as u64
+    } else {
         let mut tp: u64 = 0;
         unsafe {
             // SAFETY: EL1에서 현재 태스크의 TPIDR_EL0 값을 읽어 자식 초기 TLS 기반으로 전달한다.
@@ -4556,6 +4562,7 @@ pub fn take_exec_transition_for_current() -> Option<ExecTransition> {
         argc: item.image.argc,
         argv: item.image.argv,
         envp: item.image.envp,
+        tls_pointer: item.image.tls_pointer,
         user_stack: item.image.user_stack,
     })
 }

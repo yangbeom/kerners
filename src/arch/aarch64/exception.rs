@@ -130,17 +130,20 @@ pub extern "C" fn exception_handler(ctx: &mut ExceptionContext, exception_type: 
                 ctx.gpr[1] = exec.argv as u64;
                 ctx.gpr[2] = exec.envp as u64;
                 unsafe {
-                    // SAFETY: EL1 예외 컨텍스트에서 EL0 사용자 스택 포인터를 갱신한다.
+                    // SAFETY: EL1 예외 컨텍스트에서 EL0 사용자 스택/TLS 포인터를 갱신한다.
                     core::arch::asm!(
                         "msr sp_el0, {sp}",
+                        "msr tpidr_el0, {tp}",
                         sp = in(reg) exec.stack_top,
+                        tp = in(reg) exec.tls_pointer,
                         options(nostack, nomem)
                     );
                 }
                 kprintln!(
-                    "[syscall] execve applied: entry={:#x}, sp={:#x}, argc={}",
+                    "[syscall] execve applied: entry={:#x}, sp={:#x}, tp={:#x}, argc={}",
                     exec.entry,
                     exec.stack_top,
+                    exec.tls_pointer,
                     exec.argc
                 );
             } else {

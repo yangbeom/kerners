@@ -181,6 +181,7 @@ pub mod program_type {
     pub const PT_INTERP: u32 = 3; // 인터프리터 경로
     pub const PT_NOTE: u32 = 4; // 노트
     pub const PT_PHDR: u32 = 6; // 프로그램 헤더 테이블
+    pub const PT_TLS: u32 = 7; // TLS 초기화 이미지(.tdata/.tbss)
 }
 
 /// ELF64 동적 섹션 엔트리 (16바이트)
@@ -596,6 +597,14 @@ impl<'a> Elf64<'a> {
             .into_iter()
             .flatten()
             .find(|ph| ph.p_type == program_type::PT_DYNAMIC)
+    }
+
+    /// PT_TLS 프로그램 헤더 조회
+    pub fn tls_segment(&self) -> Option<&Elf64ProgramHeader> {
+        self.program_headers
+            .into_iter()
+            .flatten()
+            .find(|ph| ph.p_type == program_type::PT_TLS)
     }
 
     /// 동적 엔트리 테이블 조회

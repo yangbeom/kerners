@@ -332,6 +332,7 @@ pub struct ExecutableLoadInfo {
     pub entry: usize,
     pub load_bias: usize,
     pub dynamic: ExecutableDynamicInfo,
+    pub tls: ExecutableTlsInfo,
     pub exported_symbols: Vec<(String, usize)>,
 }
 
@@ -360,6 +361,15 @@ pub struct ExecutableDynamicInfo {
     pub fini: usize,
     pub flags: usize,
     pub flags_1: usize,
+}
+
+/// 실행 ELF의 PT_TLS 요약 정보
+#[derive(Debug, Clone, Default)]
+pub struct ExecutableTlsInfo {
+    pub has_tls: bool,
+    pub mem_size: usize,
+    pub align: usize,
+    pub template: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -867,6 +877,74 @@ impl ModuleLoader {
             }
         }
         Ok(u64::from_ne_bytes(bytes))
+    }
+
+    fn read_exec_bytes(
+        page_mappings: &[ExecPageMapping],
+        vaddr: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, ModuleError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| ModuleError::OutOfMemory)?;
+        out.resize(len, 0);
+
+        for (i, b) in out.iter_mut().enumerate() {
+            let addr = vaddr.checked_add(i).ok_or(ModuleError::InvalidFormat)?;
+            let phys =
+                Self::translate_exec_vaddr(page_mappings, addr).ok_or(ModuleError::InvalidFormat)?;
+            unsafe {
+                // SAFETY: 변환된 물리 프레임 주소는 alloc_frame으로 확보된 유효 매핑 내 바이트다.
+                *b = *(phys as *const u8);
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn collect_tls_info(
+        elf: &Elf64,
+        load_bias: usize,
+        page_mappings: &[ExecPageMapping],
+    ) -> Result<ExecutableTlsInfo, ModuleError> {
+        let Some(tls) = elf.tls_segment() else {
+            return Ok(ExecutableTlsInfo::default());
+        };
+
+        let mem_size = tls.p_memsz as usize;
+        if mem_size == 0 {
+            return Ok(ExecutableTlsInfo::default());
+        }
+
+        let file_size = tls.p_filesz as usize;
+        if file_size > mem_size {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let align = if tls.p_align == 0 {
+            1
+        } else {
+            tls.p_align as usize
+        };
+        if !align.is_power_of_two() {
+            return Err(ModuleError::InvalidFormat);
+        }
+
+        let tls_vaddr = (tls.p_vaddr as usize)
+            .checked_add(load_bias)
+            .ok_or(ModuleError::InvalidFormat)?;
+        let template = Self::read_exec_bytes(page_mappings, tls_vaddr, file_size)?;
+
+        Ok(ExecutableTlsInfo {
+            has_tls: true,
+            mem_size,
+            align,
+            template,
+        })
     }
 
     fn write_exec_u64(
@@ -1583,6 +1661,7 @@ impl ModuleLoader {
 
         let dynamic_info = Self::parse_dynamic_info(&elf, load_bias)?;
         Self::apply_dynamic_relocations(&elf, data, load_bias, &dynamic_info, &page_mappings)?;
+        let tls_info = Self::collect_tls_info(&elf, load_bias, &page_mappings)?;
         let exported_symbols = Self::collect_dynamic_exports(&elf, data, load_bias, &dynamic_info)?;
         Self::register_exec_dynamic_symbols(&exported_symbols);
         if dynamic_info.at_dynamic != 0 {
@@ -1597,6 +1676,14 @@ impl ModuleLoader {
                 dynamic_info.jmprel
             );
         }
+        if tls_info.has_tls {
+            kprintln!(
+                "[module] TLS: memsz={}, filesz={}, align={}",
+                tls_info.mem_size,
+                tls_info.template.len(),
+                tls_info.align
+            );
+        }
 
         // 엔트리 포인트 반환
         let entry = (elf.entry_point() as usize)
@@ -1608,6 +1695,7 @@ impl ModuleLoader {
             entry,
             load_bias,
             dynamic: dynamic_info,
+            tls: tls_info,
             exported_symbols,
         })
     }

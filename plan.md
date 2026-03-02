@@ -534,7 +534,7 @@
 
 #### 15-3. 동적 ELF 로더 (필수 3단계, 추후)
 - [x] 착수 조건: 15-1/15-2 완료 + BusyBox static init 회귀 안정화
-- [x] 상태 메모: `PT_INTERP` 체인, `ET_DYN` 매핑, `DT_NEEDED` preload, `REL/RELA` baseline, 미해결 강한 심볼 실패 정책까지 반영 완료 (심볼 버저닝/lazy binding/TLS 미지원)
+- [x] 상태 메모: `PT_INTERP` 체인, `ET_DYN` 매핑, `DT_NEEDED` preload, `REL/RELA` baseline, 미해결 강한 심볼 실패 정책까지 반영 완료 (심볼 버저닝/lazy binding/TLS 재배치 미지원)
 - [x] 2026-02-25 1차 착수: `PT_DYNAMIC`/`DT_*` 파싱 baseline 추가 (`Elf64DynamicEntry`, `DynamicTag`, `ExecutableLoadInfo.dynamic`) + auxv `AT_FLAGS` 반영
 - [x] 2026-02-25 2차 착수: 런타임 재배치 baseline 추가 (`REL`/`RELA` 파서 + `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` 아키텍처별 적용 루틴)
 - [x] 2026-02-25 3차 착수: `DT_NEEDED` 의존성 preload + 실행 ELF 전역 심볼 스코프(`kernel` + preload된 실행 객체) baseline 연동
@@ -552,7 +552,7 @@
 - [x] 2026-02-25 회귀 검증: `make test-all` PASS (`aarch64`/`riscv64`, `RESULT: 16 passed, 0 failed`)
 - [x] 2026-02-25 동적 C hello 실행 검증 PASS (`aarch64`/`riscv64`, `PH15_3_CDYN_HELLO_RC=42` + `CDYN_HELLO_OK`)
 - [x] 2026-02-25 동적 busybox(init) 부팅/명령 실행 검증 PASS (`aarch64`/`riscv64`, `BBDYN_BOOT_END` + `BBDYN_CMD_*_OK`)
-- [x] 최소 런타임 ABI 정비 (TLS 제외: `AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer/TLS reloc는 Phase 15.5에서 구현)
+- [x] 최소 런타임 ABI 정비 (`AT_PHENT`/`AT_BASE` 포함 auxv 확장, `PT_TLS`/thread pointer baseline은 Phase 15.5에서 반영)
 - [x] 수용 기준(부분): 동적 링크 hello 1종 이상
 - [x] 수용 기준(잔여): busybox dyn 경로 부팅/명령 실행
 
@@ -565,16 +565,19 @@
 
 ### Phase 15.5: TLS (Thread Local Storage) 지원 (중기, 별도 phase)
 
+- [x] 2026-03-02 1차 구현: `PT_TLS` 파싱 + exec 초기 TLS(`.tdata` 복사/`.tbss` zero-fill) 매핑 + `aarch64/riscv64` thread pointer 설정 + `clone(CLONE_SETTLS)` baseline + TLS smoke 스크립트(`scripts/verify_phase15_5_tls_smoke.sh`) 추가
+
 #### 15.5-1. TLS 로더/메모리 모델
-- [ ] 착수 조건: Phase 15-3 완료 (동적 ELF 기본 경로 안정화)
-- [ ] ELF `PT_TLS` 파싱 및 TLS 초기 이미지(`.tdata`) + zero-fill(`.tbss`) 모델 도입
-- [ ] 프로세스/스레드별 TLS 블록 레이아웃 정의 (정렬/크기/모듈 오프셋 포함)
-- [ ] 스레드 생성/복제(`spawn`/`clone`) 시 TLS 블록 할당/초기화 경로 추가
+- [x] 착수 조건: Phase 15-3 완료 (동적 ELF 기본 경로 안정화)
+- [x] ELF `PT_TLS` 파싱 및 TLS 초기 이미지(`.tdata`) + zero-fill(`.tbss`) 모델 도입
+- [x] exec 초기 TLS 블록 레이아웃 정의 (정렬 + 아키텍처별 TP 헤더 오프셋 반영)
+- [x] `clone(CLONE_SETTLS)` 경로에서 child thread pointer 설정
+- [ ] 스레드 생성/복제(`spawn`/`clone`) 시 커널 주도 TLS 블록 신규 할당/초기화 경로 추가
 
 #### 15.5-2. 아키텍처별 thread pointer 활성화
-- [ ] aarch64: `TPIDR_EL0` 설정/복원 경로 추가
-- [ ] riscv64: `tp` 레지스터 설정/복원 경로 추가
-- [ ] 컨텍스트 스위치 시 thread pointer 일관성 보장
+- [x] aarch64: `TPIDR_EL0` 설정 경로 추가 (`enter_user_image`, `execve` trap-apply, `clone(CLONE_SETTLS)`)
+- [x] riscv64: `tp` 레지스터 설정 경로 추가 (`enter_user_image`, `execve` trap-apply, `clone(CLONE_SETTLS)`)
+- [ ] 컨텍스트 스위치 시 thread pointer 완전 일관성 보장 (멀티 유저 스레드 케이스 보강 필요)
 
 #### 15.5-3. TLS 재배치 및 동적 로더 연동
 - [ ] 최소 TLS 재배치 타입 지원(local-exec/initial-exec 우선)
@@ -582,10 +585,10 @@
 - [ ] 동적 로딩된 `.so`의 TLS metadata 등록/해제 라이프사이클 연동
 
 #### 15.5-4. 검증/수용 기준
-- [ ] `__thread`/`thread_local` 변수 읽기/쓰기 smoke (단일 스레드)
+- [x] `__thread`/`thread_local` 변수 읽기/쓰기 smoke (단일 스레드)
 - [ ] 멀티 스레드에서 TLS 독립성 검증 (스레드별 값 분리)
-- [ ] 양 아키텍처(`aarch64`, `riscv64`) 동적 ELF + TLS 샘플 실행
-- [ ] 기존 `make test`, `make test-riscv64` 회귀 PASS 유지
+- [x] 양 아키텍처(`aarch64`, `riscv64`) 동적 ELF + TLS 샘플 실행
+- [x] 2026-03-02 회귀 검증: `make test-all` PASS (커널 + 유저 테스트 트랙)
 
 ### Phase 16: I/O 멀티플렉싱 및 IPC 확장 (중기)
 

@@ -7,6 +7,7 @@
 # Outputs:
 #   <OUT_DIR>/sample_hello_dyn
 #   <OUT_DIR>/sample_syscall_smoke_dyn
+#   <OUT_DIR>/sample_tls_smoke_dyn
 #   <OUT_DIR>/ld-kerners-<arch>.so
 
 set -euo pipefail
@@ -93,8 +94,9 @@ CRT_SRC="$PROJECT_ROOT/userland/common/crt0.c"
 LIB_SRC="$PROJECT_ROOT/userland/common/minilibc.c"
 HELLO_SRC="$PROJECT_ROOT/userland/hello/sample_hello.c"
 SMOKE_SRC="$PROJECT_ROOT/userland/init/sample_syscall_smoke.c"
+TLS_SRC="$PROJECT_ROOT/userland/init/sample_tls_smoke.c"
 
-for src in "$CRT_SRC" "$LIB_SRC" "$HELLO_SRC" "$SMOKE_SRC"; do
+for src in "$CRT_SRC" "$LIB_SRC" "$HELLO_SRC" "$SMOKE_SRC" "$TLS_SRC"; do
     if [[ ! -f "$src" ]]; then
         print_error "missing source file: $src"
         exit 1
@@ -108,9 +110,11 @@ CRT_OBJ="$TMP_DIR/crt0.o"
 LIB_OBJ="$TMP_DIR/minilibc.o"
 HELLO_OBJ="$TMP_DIR/sample_hello.o"
 SMOKE_OBJ="$TMP_DIR/sample_syscall_smoke.o"
+TLS_OBJ="$TMP_DIR/sample_tls_smoke.o"
 
 HELLO_BIN="$OUT_DIR/sample_hello_dyn"
 SMOKE_BIN="$OUT_DIR/sample_syscall_smoke_dyn"
+TLS_BIN="$OUT_DIR/sample_tls_smoke_dyn"
 LD_BIN="$OUT_DIR/$LD_SO_NAME"
 
 COMMON_FLAGS=(
@@ -130,6 +134,7 @@ print_info "build minilibc objects ($ARCH)"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$LIB_SRC" -o "$LIB_OBJ"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$HELLO_SRC" -o "$HELLO_OBJ"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$SMOKE_SRC" -o "$SMOKE_OBJ"
+"$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -c "$TLS_SRC" -o "$TLS_OBJ"
 
 print_info "link sample_hello_dyn ($ARCH)"
 "$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
@@ -145,7 +150,14 @@ print_info "link sample_syscall_smoke_dyn ($ARCH)"
     -o "$SMOKE_BIN" \
     "$CRT_OBJ" "$LIB_OBJ" "$SMOKE_OBJ"
 
-if [[ ! -x "$HELLO_BIN" || ! -x "$SMOKE_BIN" || ! -x "$LD_BIN" ]]; then
+print_info "link sample_tls_smoke_dyn ($ARCH)"
+"$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
+    --dynamic-linker "/lib/$LD_SO_NAME" \
+    -e _start \
+    -o "$TLS_BIN" \
+    "$CRT_OBJ" "$LIB_OBJ" "$TLS_OBJ"
+
+if [[ ! -x "$HELLO_BIN" || ! -x "$SMOKE_BIN" || ! -x "$TLS_BIN" || ! -x "$LD_BIN" ]]; then
     print_error "build failed: output file missing"
     exit 1
 fi
@@ -153,15 +165,17 @@ fi
 if command -v file >/dev/null 2>&1; then
     print_info "sample_hello: $(file "$HELLO_BIN")"
     print_info "sample_smoke: $(file "$SMOKE_BIN")"
+    print_info "sample_tls: $(file "$TLS_BIN")"
     print_info "loader: $(file "$LD_BIN")"
 fi
 
 if command -v shasum >/dev/null 2>&1; then
     print_info "sha256:"
-    shasum -a 256 "$HELLO_BIN" "$SMOKE_BIN" "$LD_BIN"
+    shasum -a 256 "$HELLO_BIN" "$SMOKE_BIN" "$TLS_BIN" "$LD_BIN"
 fi
 
 print_info "output:"
 print_info "  $HELLO_BIN"
 print_info "  $SMOKE_BIN"
+print_info "  $TLS_BIN"
 print_info "  $LD_BIN"

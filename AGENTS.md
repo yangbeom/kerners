@@ -453,15 +453,17 @@ kerners/
 ├── userland/hello/
 │   └── sample_hello.c        # sample user program using minilibc
 ├── userland/init/
-│   └── sample_syscall_smoke.c # syscall smoke sample using minilibc
+│   ├── sample_syscall_smoke.c # syscall smoke sample using minilibc
+│   └── sample_tls_smoke.c     # TLS smoke sample using __thread
 ├── scripts/build_user_dynamic_c_bins.sh  # C toolchain dynamic user ELF builder (hello_dyn + busybox_dyn + uminitest_dyn + ld-kerners)
 ├── scripts/build_user_minilibc_samples.sh  # Phase 15-4 minilibc sample ELF builder
 ├── scripts/prepare_user_disk.sh  # BusyBox user disk image helper
-├── scripts/run_user_tests.sh  # User-space test orchestrator (dynamic hello + dynamic busybox + internal minimal + minilibc samples)
+├── scripts/run_user_tests.sh  # User-space test orchestrator (dynamic hello + dynamic busybox + internal minimal + minilibc samples + TLS smoke)
 ├── scripts/verify_phase15_3_cdyn.sh  # Phase 15-3 C dynamic hello smoke verifier
 ├── scripts/verify_phase15_3_busybox_dyn.sh  # Phase 15-3 C dynamic busybox(init) smoke verifier
 ├── scripts/verify_phase15_4_internal_min.sh  # Phase 15-4 internal minimal init smoke verifier
 ├── scripts/verify_phase15_4_minilibc_samples.sh  # Phase 15-4 minilibc sample smoke verifier
+├── scripts/verify_phase15_5_tls_smoke.sh  # Phase 15-5 TLS smoke verifier
 ├── scripts/run_busybox_smoke.sh  # BusyBox init smoke runner (log capture + failure classification)
 ├── targets/                 # Custom target JSON files
 ├── docs/                    # Documentation (see docs/README.md for full list)

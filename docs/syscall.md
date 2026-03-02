@@ -193,7 +193,10 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   - 약한(weak) 외부 심볼 미해결은 값 `0`으로 해석
   - auxv 최소 호환 키(`AT_ENTRY/AT_PHDR/AT_PHENT/AT_PHNUM/AT_PAGESZ/AT_BASE/AT_FLAGS`)를 스택에 제공
   - 공유 vm_group 격리 중 `prepare_exec_image`가 실패하면 기존 루트 테이블로 롤백 후 에러를 반환
-  - TLS(`PT_TLS`, TLS relocation, thread pointer)는 별도 phase에서 지원 예정
+  - `PT_TLS`가 있으면 초기 TLS 이미지(`.tdata` 복사 + `.tbss` zero-fill)를 유저 TLS 예약 영역에 매핑하고,
+    exec trap-apply 시 아키텍처별 thread pointer(`TPIDR_EL0`/`tp`)를 함께 설정
+  - `sys_clone`에서 `CLONE_SETTLS` 플래그가 설정되면 child thread pointer를 `_tls` 인자로 설정
+  - TLS 재배치(local-exec/initial-exec 고급 케이스)와 커널 주도 멀티스레드 TLS 블록 자동 할당은 미구현
 
 ## `mmap`/`fork` COW 동작 (aarch64/riscv64)
 
@@ -201,6 +204,7 @@ VFS 에러는 `vfs_error_to_errno()` 함수로 자동 변환됩니다.
   - `MAP_SHARED`: 파일 page cache 프레임을 공유 매핑합니다(다른 fd/open 경로 포함).
   - `MAP_PRIVATE`: 초기 RO 매핑 + write fault 시 COW 분리.
   - 검증: `fd < 0`은 `EBADF`, `offset` 비정렬/`offset+len > file_size`는 `EINVAL`.
+  - 유저 TLS 예약 영역과 충돌 방지를 위해 `mmap` 상한은 TLS 영역 시작 주소로 제한됩니다.
 - shared writeback:
   - `munmap`, `exit`, `execve` 시점에 dirty 페이지를 파일에 flush합니다.
   - `msync`는 아직 범위 밖입니다.

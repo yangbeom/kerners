@@ -264,13 +264,15 @@ fn handle_exception(ctx: &mut TrapContext, cause: u64) {
                     // execve 성공: 다음 복귀 지점을 새 엔트리로 교체
                     ctx.mepc = exec.entry as u64;
                     ctx.gpr[2] = exec.stack_top as u64; // sp
+                    ctx.gpr[4] = exec.tls_pointer as u64; // tp
                     ctx.gpr[10] = exec.argc as u64; // a0
                     ctx.gpr[11] = exec.argv as u64; // a1
                     ctx.gpr[12] = exec.envp as u64; // a2
                     kprintln!(
-                        "[syscall] execve applied: entry={:#x}, sp={:#x}, argc={}",
+                        "[syscall] execve applied: entry={:#x}, sp={:#x}, tp={:#x}, argc={}",
                         exec.entry,
                         exec.stack_top,
+                        exec.tls_pointer,
                         exec.argc
                     );
                 } else {
