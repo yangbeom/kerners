@@ -203,10 +203,13 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
   인터프리터 엔트리로 진입합니다.
 - 실행 로더는 `PT_TLS`를 파싱해 초기 TLS 이미지(`.tdata`) + zero-fill(`.tbss`) 정보를 수집하고,
   exec 준비 단계에서 유저 TLS 예약 영역에 초기 TLS 블록을 매핑합니다.
+- 유저 TLS 예약 영역 첫 페이지는 TLSDESC 정적 resolver helper로 예약되고,
+  나머지 TLS 데이터 영역에 초기 TLS 블록이 매핑됩니다.
 - 실행 로더는 `PT_DYNAMIC`/`DT_*`를 파싱해(`strtab/symtab/rela/rel/jmprel` 등)
   향후 런타임 링크 단계에서 사용할 메타데이터를 수집합니다.
 - 로더는 수집된 메타데이터로 `REL/RELA` baseline 재배치를 선적용합니다
   (`RELATIVE`, `GLOB_DAT`, `JUMP_SLOT` 포함).
+- TLS 재배치는 `TPREL64`/`DTPMOD64`/`DTPREL64`/`TLSDESC`(aarch64/riscv64)를 지원합니다.
 - `ABS64`/`GLOB_DAT`/`JUMP_SLOT`에서 강한 외부 심볼이 끝내 해석되지 않거나
   미지원 재배치 타입이 나오면 exec 준비는 실패(`ENOEXEC`)합니다.
 - 약한(weak) 외부 심볼이 미해결인 경우는 값 `0`으로 해석합니다.
@@ -259,7 +262,7 @@ pub fn enter_user_mode(entry: usize, user_sp: usize) -> ! {
 
 - aarch64/riscv64는 vm_group 기반 주소공간 분리 + file-backed `mmap` + fork COW를 지원합니다.
 - exec 초기 TLS(`PT_TLS`) 매핑 + `clone(CLONE_VM)` 멀티스레드 TLS 블록 분리(local-exec baseline)는 지원합니다.
-- 동적 재배치는 `TPREL64`(aarch64/riscv64) baseline까지 지원하며, 미지원 TLS 재배치(`TLSDESC`, `DTPMOD*`, `DTPREL*`, `TPREL32`)는 로드 실패(`ENOEXEC`)로 처리합니다.
-- `__tls_get_addr`/DTV 기반 full TLS ABI(global/local-dynamic)는 아직 추가 구현이 필요합니다.
+- 동적 TLS 재배치는 `TPREL64`/`DTPMOD64`/`DTPREL64`/`TLSDESC`를 지원합니다.
+- `__tls_get_addr`/DTV 기반 full TLS ABI(global/local-dynamic)와 32-bit TLS 재배치 계열은 아직 추가 구현이 필요합니다.
 - signal core는 구현되어 syscall/interrupt 복귀 직전에 pending unmasked signal 1건을 전달합니다.
 - `rt_sigtimedwait`의 완전한 timeout/blocking 모델, `SA_RESTART` 자동 재시작, job-control(`SIGSTOP/SIGCONT`)은 아직 미구현입니다.

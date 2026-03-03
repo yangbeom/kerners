@@ -858,8 +858,8 @@ fn choose_tls_layout(vm_group: u64, template: &VmTlsTemplate) -> Option<Computed
         return None;
     }
     let tls_data_size = align_up(template.mem_size, align);
-    let region_base = crate::proc::user::USER_TLS_REGION_BASE;
-    let region_end = region_base + crate::proc::user::USER_TLS_REGION_SIZE;
+    let region_base = crate::proc::user::USER_TLS_DATA_REGION_BASE;
+    let region_end = region_base + crate::proc::user::USER_TLS_DATA_REGION_SIZE;
 
     let mut used = {
         let allocations = VM_TLS_ALLOCATIONS.lock();

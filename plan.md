@@ -568,6 +568,7 @@
 - [x] 2026-03-02 1차 구현: `PT_TLS` 파싱 + exec 초기 TLS(`.tdata` 복사/`.tbss` zero-fill) 매핑 + `aarch64/riscv64` thread pointer 설정 + `clone(CLONE_SETTLS)` baseline + TLS smoke 스크립트(`scripts/verify_phase15_5_tls_smoke.sh`) 추가
 - [x] 2026-03-02 2차 구현: vm_group TLS 템플릿/할당 레지스트리 + `clone(CLONE_VM)`(no `CLONE_SETTLS`) 커널 주도 TLS 블록 자동 할당/해제 + 부팅 init 경로 TLS 상태 등록
 - [x] 2026-03-02 3차 구현: 동적 TLS `TPREL64` 재배치 baseline + `.so` TLS metadata/symbol 등록 연동 + 미지원 TLS 재배치 명시 실패(`ENOEXEC`) + initial-exec TLS smoke(`sample_tls_ie_smoke_dyn`, `libtls_ie.so`) 검증 추가
+- [x] 2026-03-03 4차 구현: TLSDESC 경로(`R_*_TLSDESC`) + `DTPMOD64`/`DTPREL64` 재배치 지원, 유저 TLS helper page 기반 정적 resolver 연결, `sample_tls_desc_smoke_dyn` + TLS smoke 확장 검증 추가
 
 #### 15.5-1. TLS 로더/메모리 모델
 - [x] 착수 조건: Phase 15-3 완료 (동적 ELF 기본 경로 안정화)
@@ -582,20 +583,23 @@
 - [x] 컨텍스트 스위치 시 thread pointer 완전 일관성 보장 (tid별 TP 추적 + clone fallback 정합성 보강)
 
 #### 15.5-3. TLS 재배치 및 동적 로더 연동
-- [x] 최소 TLS 재배치 타입 지원(local-exec/initial-exec 우선)
-  - [x] `R_AARCH64_TLS_TPREL64`, `R_RISCV_TLS_TPREL64` baseline 적용
+- [x] 최소 TLS 재배치 타입 지원(local-exec/initial-exec + TLSDESC 정적 resolver baseline)
+  - [x] `R_AARCH64_TLS_TPREL64`, `R_RISCV_TLS_TPREL64`
+  - [x] `R_AARCH64_TLS_DTPMOD64`, `R_AARCH64_TLS_DTPREL64`, `R_AARCH64_TLSDESC`
+  - [x] `R_RISCV_TLS_DTPMOD64`, `R_RISCV_TLS_DTPREL64`, `R_RISCV_TLSDESC`
 - [x] 미지원 TLS 재배치 타입은 명시적 실패(`ENOEXEC` 또는 `ENOTSUP`) 처리
-  - [x] `TLSDESC`, `DTPMOD*`, `DTPREL*`, `TPREL32`는 `UnsupportedRelocation`으로 실패 처리
+  - [x] `R_RISCV_TLS_TPREL32`, `R_RISCV_TLS_DTPREL32` 등 32-bit 변형은 `UnsupportedRelocation`으로 실패 처리
 - [x] 동적 로딩된 `.so`의 TLS metadata 등록/해제 라이프사이클 연동
   - [x] exec 체인 전역 TLS 심볼/모듈 레지스트리(`exec_tls_modules`) 연동
-  - [ ] 잔여: `__tls_get_addr` + DTV 기반 full TLS ABI(global/local-dynamic)
+  - [ ] 잔여: `__tls_get_addr` + DTV 기반 full TLS ABI(global/local-dynamic), 32-bit TLS 재배치 계열
 
 #### 15.5-4. 검증/수용 기준
 - [x] `__thread`/`thread_local` 변수 읽기/쓰기 smoke (단일 스레드)
 - [x] 멀티 스레드에서 TLS 독립성 검증 (스레드별 값 분리, local-exec baseline)
 - [x] initial-exec TLS(`.so`의 `__thread`) 스모크 + clone 멀티스레드 분리 검증
+- [x] TLSDESC TLS(`sample_tls_desc_smoke_dyn`) 스모크 + clone 멀티스레드 분리 검증
 - [x] 양 아키텍처(`aarch64`, `riscv64`) 동적 ELF + TLS 샘플 실행
-- [x] 2026-03-02 회귀 검증: `make test-all` PASS (커널 + 유저 테스트 트랙)
+- [x] 2026-03-03 회귀 검증: `make test-all` PASS (커널 + 유저 테스트 트랙)
 
 ### Phase 16: I/O 멀티플렉싱 및 IPC 확장 (중기)
 

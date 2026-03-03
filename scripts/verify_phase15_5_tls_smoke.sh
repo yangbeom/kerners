@@ -49,14 +49,15 @@ run_one_arch() {
     local out_dir="$PROJECT_ROOT/target/user/$arch"
     local tls_bin="$out_dir/sample_tls_smoke_dyn"
     local tls_ie_bin="$out_dir/sample_tls_ie_smoke_dyn"
+    local tls_desc_bin="$out_dir/sample_tls_desc_smoke_dyn"
     local tls_ie_lib="$out_dir/libtls_ie.so"
     local ld_bin="$out_dir/$ld_name"
     local disk_img="$PROJECT_ROOT/logs/phase15-5-tls-${arch}-${STAMP}.img"
     local run_log="$PROJECT_ROOT/logs/phase15-5-tls-${arch}-${STAMP}.log"
     local rcs_file="/tmp/phase15-5-tls-rcS-${arch}-${STAMP}"
 
-    if [[ ! -x "$tls_bin" || ! -x "$tls_ie_bin" || ! -f "$tls_ie_lib" || ! -x "$ld_bin" ]]; then
-        print_error "tls sample artifacts missing: $tls_bin / $tls_ie_bin / $tls_ie_lib / $ld_bin"
+    if [[ ! -x "$tls_bin" || ! -x "$tls_ie_bin" || ! -x "$tls_desc_bin" || ! -f "$tls_ie_lib" || ! -x "$ld_bin" ]]; then
+        print_error "tls sample artifacts missing: $tls_bin / $tls_ie_bin / $tls_desc_bin / $tls_ie_lib / $ld_bin"
         return 1
     fi
 
@@ -76,12 +77,15 @@ echo PH15_5_TLS_BEGIN
 echo PH15_5_TLS_LE_RC=$?
 /bin/sample_tls_ie_smoke_dyn
 echo PH15_5_TLS_IE_RC=$?
+/bin/sample_tls_desc_smoke_dyn
+echo PH15_5_TLS_DESC_RC=$?
 echo PH15_5_TLS_END
 EOF
 
     mcopy -o -i "$disk_img" "$rcs_file" ::/etc/init.d/rcS >/dev/null
     mcopy -o -i "$disk_img" "$tls_bin" ::/bin/sample_tls_smoke_dyn >/dev/null
     mcopy -o -i "$disk_img" "$tls_ie_bin" ::/bin/sample_tls_ie_smoke_dyn >/dev/null
+    mcopy -o -i "$disk_img" "$tls_desc_bin" ::/bin/sample_tls_desc_smoke_dyn >/dev/null
     mcopy -o -i "$disk_img" "$tls_ie_lib" ::/lib/libtls_ie.so >/dev/null
     mcopy -o -i "$disk_img" "$ld_bin" "::/lib/$ld_name" >/dev/null
     rm -f "$rcs_file"
@@ -99,7 +103,7 @@ EOF
             stop_reason="done"
             break
         fi
-        if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
+        if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|TLS_DESC_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|failed to start '/bin/sample_tls_desc_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
             stop_reason="error"
             break
         fi
@@ -133,6 +137,10 @@ EOF
         "TLS_IE_SMOKE_MT_OK"
         "TLS_IE_SMOKE_OK"
         "PH15_5_TLS_IE_RC=0"
+        "TLS_DESC_SMOKE_BEGIN"
+        "TLS_DESC_SMOKE_MT_OK"
+        "TLS_DESC_SMOKE_OK"
+        "PH15_5_TLS_DESC_RC=0"
         "PH15_5_TLS_END"
     )
 
@@ -144,7 +152,7 @@ EOF
         fi
     done
 
-    if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
+    if rg -q "TLS_SMOKE_FAIL_|TLS_IE_SMOKE_FAIL_|TLS_DESC_SMOKE_FAIL_|failed to start '/bin/sample_tls_smoke_dyn'|failed to start '/bin/sample_tls_ie_smoke_dyn'|failed to start '/bin/sample_tls_desc_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi

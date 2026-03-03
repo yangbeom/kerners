@@ -40,6 +40,18 @@ pub const USER_TLS_REGION_SIZE: usize = 64 * 1024;
 /// 유저 TLS 예약 영역 베이스 (스택 바로 아래)
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub const USER_TLS_REGION_BASE: usize = USER_STACK_BASE - USER_STACK_SIZE - USER_TLS_REGION_SIZE;
+/// TLSDESC 정적 리졸버가 위치하는 예약 페이지(유저 TLS 영역 첫 페이지)
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLSDESC_HELPER_BASE: usize = USER_TLS_REGION_BASE;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+const USER_TLSDESC_HELPER_SIZE: usize = crate::mm::page::PAGE_SIZE;
+/// 동적 로더가 TLSDESC 디스크립터에 기록하는 정적 리졸버 엔트리 주소
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLSDESC_RESOLVER_ADDR: usize = USER_TLSDESC_HELPER_BASE;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLS_DATA_REGION_BASE: usize = USER_TLS_REGION_BASE + USER_TLSDESC_HELPER_SIZE;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const USER_TLS_DATA_REGION_SIZE: usize = USER_TLS_REGION_SIZE - USER_TLSDESC_HELPER_SIZE;
 
 #[cfg(target_arch = "aarch64")]
 const USER_TLS_TCB_SIZE: usize = 16;
@@ -962,10 +974,71 @@ fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
 
+#[cfg(target_arch = "aarch64")]
+const TLSDESC_RESOLVER_STUB_BYTES: [u8; 8] = [
+    0x00, 0x04, 0x40, 0xf9, // ldr x0, [x0, #8]
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+
+#[cfg(target_arch = "riscv64")]
+const TLSDESC_RESOLVER_STUB_BYTES: [u8; 4] = [
+    0x08, 0x65, // ld a0, 8(a0)
+    0x82, 0x80, // ret
+];
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn map_tlsdesc_helper_page() -> Result<(), ExecError> {
+    let root = crate::arch::mmu::current_root_table();
+    if root == 0 {
+        return Err(ExecError::OutOfMemory);
+    }
+
+    if crate::arch::mmu::get_user_page_phys_for_root(root, USER_TLSDESC_HELPER_BASE).is_ok() {
+        return Ok(());
+    }
+
+    let frame = if let Some(frame) = crate::mm::page::alloc_frame() {
+        frame
+    } else {
+        return Err(ExecError::OutOfMemory);
+    };
+
+    if crate::arch::mmu::map_user_page_noflush(
+        USER_TLSDESC_HELPER_BASE,
+        frame,
+        false,
+        true,
+    )
+    .is_err()
+    {
+        unsafe {
+            // SAFETY: alloc_frame으로 확보한 프레임 참조를 실패 경로에서 반환한다.
+            crate::mm::page::free_frame(frame);
+        }
+        return Err(ExecError::OutOfMemory);
+    }
+
+    unsafe {
+        // SAFETY: frame은 유효한 단일 4KB 페이지 프레임이며 zero-fill이 가능하다.
+        core::ptr::write_bytes(frame as *mut u8, 0, crate::mm::page::PAGE_SIZE);
+        // SAFETY: 목적지 frame은 최소 4KB, 원본 스텁 바이트는 매우 작아 경계 내 복사가 보장된다.
+        core::ptr::copy_nonoverlapping(
+            TLSDESC_RESOLVER_STUB_BYTES.as_ptr(),
+            frame as *mut u8,
+            TLSDESC_RESOLVER_STUB_BYTES.len(),
+        );
+    }
+
+    crate::arch::mmu::flush_tlb_all();
+    Ok(())
+}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn map_initial_tls(
     modules: &[crate::module::loader::ExecutableTlsModuleInfo],
 ) -> Result<Option<PreparedTlsInfo>, ExecError> {
+    map_tlsdesc_helper_page()?;
+
     if modules.is_empty() {
         return Ok(None);
     }
@@ -998,12 +1071,12 @@ fn map_initial_tls(
     let tls_total_size = USER_TLS_TCB_SIZE
         .checked_add(tls_data_size)
         .ok_or(ExecError::OutOfMemory)?;
-    if tls_total_size > USER_TLS_REGION_SIZE {
+    if tls_total_size > USER_TLS_DATA_REGION_SIZE {
         return Err(ExecError::OutOfMemory);
     }
 
-    let region_end = USER_TLS_REGION_BASE
-        .checked_add(USER_TLS_REGION_SIZE)
+    let region_end = USER_TLS_DATA_REGION_BASE
+        .checked_add(USER_TLS_DATA_REGION_SIZE)
         .ok_or(ExecError::OutOfMemory)?;
     let data_start_unaligned = region_end
         .checked_sub(tls_data_size)
@@ -1015,7 +1088,7 @@ fn map_initial_tls(
     let tcb_start = data_start
         .checked_sub(USER_TLS_TCB_SIZE)
         .ok_or(ExecError::OutOfMemory)?;
-    if tcb_start < USER_TLS_REGION_BASE || data_end > region_end {
+    if tcb_start < USER_TLS_DATA_REGION_BASE || data_end > region_end {
         return Err(ExecError::OutOfMemory);
     }
 

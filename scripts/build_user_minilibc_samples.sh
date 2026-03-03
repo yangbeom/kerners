@@ -9,6 +9,7 @@
 #   <OUT_DIR>/sample_syscall_smoke_dyn
 #   <OUT_DIR>/sample_tls_smoke_dyn
 #   <OUT_DIR>/sample_tls_ie_smoke_dyn
+#   <OUT_DIR>/sample_tls_desc_smoke_dyn
 #   <OUT_DIR>/libtls_ie.so
 #   <OUT_DIR>/ld-kerners-<arch>.so
 
@@ -98,9 +99,10 @@ HELLO_SRC="$PROJECT_ROOT/userland/hello/sample_hello.c"
 SMOKE_SRC="$PROJECT_ROOT/userland/init/sample_syscall_smoke.c"
 TLS_SRC="$PROJECT_ROOT/userland/init/sample_tls_smoke.c"
 TLS_IE_SRC="$PROJECT_ROOT/userland/init/sample_tls_ie_smoke.c"
+TLS_DESC_SRC="$PROJECT_ROOT/userland/init/sample_tls_desc_smoke.c"
 TLS_IE_LIB_SRC="$PROJECT_ROOT/userland/init/libtls_ie.c"
 
-for src in "$CRT_SRC" "$LIB_SRC" "$HELLO_SRC" "$SMOKE_SRC" "$TLS_SRC" "$TLS_IE_SRC" "$TLS_IE_LIB_SRC"; do
+for src in "$CRT_SRC" "$LIB_SRC" "$HELLO_SRC" "$SMOKE_SRC" "$TLS_SRC" "$TLS_IE_SRC" "$TLS_DESC_SRC" "$TLS_IE_LIB_SRC"; do
     if [[ ! -f "$src" ]]; then
         print_error "missing source file: $src"
         exit 1
@@ -116,12 +118,14 @@ HELLO_OBJ="$TMP_DIR/sample_hello.o"
 SMOKE_OBJ="$TMP_DIR/sample_syscall_smoke.o"
 TLS_OBJ="$TMP_DIR/sample_tls_smoke.o"
 TLS_IE_OBJ="$TMP_DIR/sample_tls_ie_smoke.o"
+TLS_DESC_OBJ="$TMP_DIR/sample_tls_desc_smoke.o"
 TLS_IE_LIB_OBJ="$TMP_DIR/libtls_ie.o"
 
 HELLO_BIN="$OUT_DIR/sample_hello_dyn"
 SMOKE_BIN="$OUT_DIR/sample_syscall_smoke_dyn"
 TLS_BIN="$OUT_DIR/sample_tls_smoke_dyn"
 TLS_IE_BIN="$OUT_DIR/sample_tls_ie_smoke_dyn"
+TLS_DESC_BIN="$OUT_DIR/sample_tls_desc_smoke_dyn"
 TLS_IE_LIB_SO="$OUT_DIR/libtls_ie.so"
 LD_BIN="$OUT_DIR/$LD_SO_NAME"
 
@@ -146,6 +150,16 @@ print_info "build minilibc objects ($ARCH)"
 # (__tls_get_addr + DTV 기반 동적 TLS 재배치는 Phase 15.5-3 범위)
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -ftls-model=local-exec -c "$TLS_SRC" -o "$TLS_OBJ"
 "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -ftls-model=initial-exec -c "$TLS_IE_SRC" -o "$TLS_IE_OBJ"
+if [[ "$ARCH" == "aarch64" ]]; then
+    # aarch64 PIE 링크는 TLSDESC를 IE(TPREL64)로 완화하므로,
+    # TLSDESC 동작 검증용 바이너리는 PIC 객체로 별도 빌드한다.
+    "$CLANG" --target="$TARGET_TRIPLE" \
+        -O2 -fno-stack-protector -fno-builtin -ffreestanding -nostdlib -fPIC -Wall -Wextra \
+        -I"$MINILIBC_DIR" \
+        -c "$TLS_DESC_SRC" -o "$TLS_DESC_OBJ"
+else
+    "$CLANG" --target="$TARGET_TRIPLE" "${COMMON_FLAGS[@]}" -ftls-model=initial-exec -c "$TLS_DESC_SRC" -o "$TLS_DESC_OBJ"
+fi
 "$CLANG" --target="$TARGET_TRIPLE" -O2 -fno-stack-protector -fno-builtin -ffreestanding -nostdlib -fPIC -Wall -Wextra \
     -I"$MINILIBC_DIR" -ftls-model=initial-exec -c "$TLS_IE_LIB_SRC" -o "$TLS_IE_LIB_OBJ"
 
@@ -183,9 +197,33 @@ print_info "link sample_tls_ie_smoke_dyn ($ARCH)"
     -o "$TLS_IE_BIN" \
     "$CRT_OBJ" "$LIB_OBJ" "$TLS_IE_OBJ" "$TLS_IE_LIB_SO"
 
-if [[ ! -x "$HELLO_BIN" || ! -x "$SMOKE_BIN" || ! -x "$TLS_BIN" || ! -x "$TLS_IE_BIN" || ! -f "$TLS_IE_LIB_SO" || ! -x "$LD_BIN" ]]; then
+print_info "link sample_tls_desc_smoke_dyn ($ARCH)"
+if [[ "$ARCH" == "aarch64" ]]; then
+    # aarch64에서는 ET_DYN(shared) 형태로 링크해 TLSDESC 재배치를 보존한다.
+    "$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -shared \
+        -e _start \
+        -o "$TLS_DESC_BIN" \
+        "$CRT_OBJ" "$LIB_OBJ" "$TLS_DESC_OBJ" "$TLS_IE_LIB_SO"
+else
+    "$RUST_LLD" -flavor gnu -m "$LLD_EMULATION" -pie \
+        --dynamic-linker "/lib/$LD_SO_NAME" \
+        -e _start \
+        -o "$TLS_DESC_BIN" \
+        "$CRT_OBJ" "$LIB_OBJ" "$TLS_DESC_OBJ" "$TLS_IE_LIB_SO"
+fi
+
+chmod +x "$TLS_DESC_BIN"
+
+if [[ ! -x "$HELLO_BIN" || ! -x "$SMOKE_BIN" || ! -x "$TLS_BIN" || ! -x "$TLS_IE_BIN" || ! -x "$TLS_DESC_BIN" || ! -f "$TLS_IE_LIB_SO" || ! -x "$LD_BIN" ]]; then
     print_error "build failed: output file missing"
     exit 1
+fi
+
+if [[ "$ARCH" == "aarch64" ]] && command -v llvm-readelf >/dev/null 2>&1; then
+    if ! llvm-readelf -rW "$TLS_DESC_BIN" | rg -q "R_AARCH64_TLSDESC"; then
+        print_error "sample_tls_desc_smoke_dyn does not contain R_AARCH64_TLSDESC relocation"
+        exit 1
+    fi
 fi
 
 if command -v file >/dev/null 2>&1; then
@@ -193,13 +231,14 @@ if command -v file >/dev/null 2>&1; then
     print_info "sample_smoke: $(file "$SMOKE_BIN")"
     print_info "sample_tls: $(file "$TLS_BIN")"
     print_info "sample_tls_ie: $(file "$TLS_IE_BIN")"
+    print_info "sample_tls_desc: $(file "$TLS_DESC_BIN")"
     print_info "libtls_ie: $(file "$TLS_IE_LIB_SO")"
     print_info "loader: $(file "$LD_BIN")"
 fi
 
 if command -v shasum >/dev/null 2>&1; then
     print_info "sha256:"
-    shasum -a 256 "$HELLO_BIN" "$SMOKE_BIN" "$TLS_BIN" "$TLS_IE_BIN" "$TLS_IE_LIB_SO" "$LD_BIN"
+    shasum -a 256 "$HELLO_BIN" "$SMOKE_BIN" "$TLS_BIN" "$TLS_IE_BIN" "$TLS_DESC_BIN" "$TLS_IE_LIB_SO" "$LD_BIN"
 fi
 
 print_info "output:"
@@ -207,5 +246,6 @@ print_info "  $HELLO_BIN"
 print_info "  $SMOKE_BIN"
 print_info "  $TLS_BIN"
 print_info "  $TLS_IE_BIN"
+print_info "  $TLS_DESC_BIN"
 print_info "  $TLS_IE_LIB_SO"
 print_info "  $LD_BIN"
