@@ -70,6 +70,9 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 
 | Syscall | 번호 | 시그니처 | 설명 |
 |---------|------|----------|------|
+| `sys_epoll_create1` | 20 | `epoll_create1(flags) -> epfd` | baseline epoll 인스턴스 생성 (`EPOLL_CLOEXEC` 외 flags는 `EINVAL`) |
+| `sys_epoll_ctl` | 21 | `epoll_ctl(epfd, op, fd, event)` | baseline ADD/MOD/DEL (watch 등록/수정/삭제) |
+| `sys_epoll_pwait` | 22 | `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)` | baseline ready scan + timeout (`sigmask` 미사용) |
 | `sys_dup` | 23 | `dup(oldfd) -> newfd` | baseline FD 복제 |
 | `sys_dup3` | 24 | `dup3(oldfd, newfd, flags)` | baseline (`O_CLOEXEC` no-op) |
 | `sys_fcntl` | 25 | `fcntl(fd, cmd, arg)` | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`; `F_DUPFD*`는 `arg` 이상 최소 빈 FD 선택) |
@@ -85,6 +88,8 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 | `sys_lseek` | 62 | `lseek(fd, offset, whence) -> off` | 오프셋 이동 |
 | `sys_read` | 63 | `read(fd, buf, count) -> n` | 파일 읽기 |
 | `sys_write` | 64 | `write(fd, buf, count) -> n` | 파일 쓰기 |
+| `sys_pselect6` | 72 | `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)` | baseline `fd_set` ready scan + timeout (`sigmask` 미사용) |
+| `sys_ppoll` | 73 | `ppoll(fds, nfds, timeout, sigmask, sigsetsize)` | baseline `pollfd` ready scan + timeout (`sigmask` 미사용) |
 | `sys_readlinkat` | 78 | `readlinkat(dirfd, path, buf, bufsiz)` | baseline 심볼릭 링크 대상 읽기 |
 | `sys_newfstatat` | 79 | `newfstatat(dirfd, path, stat, flags)` | baseline 경로 stat |
 | `sys_fstat` | 80 | `fstat(fd, statbuf)` | 파일 상태 조회 |
@@ -97,6 +102,8 @@ Linux AArch64/RISC-V의 `asm-generic/unistd.h` 호환 시스템 콜 번호를 �
 - `getcwd`는 NUL 종료 문자열 길이를 반환하며, 버퍼 부족 시 `ERANGE`를 반환합니다.
 - `readlinkat`는 baseline에서 `dirfd`를 무시하고 경로 기반으로 동작합니다.
 - `pipe2`는 ring buffer 기반 baseline 구현이며, 블로킹/`PIPE_BUF` 원자성은 아직 범위 밖입니다.
+- `pselect6`/`ppoll`/`epoll_pwait`의 `sigmask` 인자는 현재 baseline에서 저장만 하고 실제 마스크 적용은 미구현입니다.
+- `epoll`은 baseline watch set + timeout 경로만 제공하며, 완전한 `EPOLLET`/wait queue notifier 연동은 추후 단계입니다.
 - `fcntl(F_DUPFD/F_DUPFD_CLOEXEC)`는 Linux와 동일하게 `arg` 이상 첫 빈 FD로 복제합니다 (`F_DUPFD_CLOEXEC`의 close-on-exec 비트 자체는 아직 no-op).
 - `unlinkat`는 `flags==0`(unlink)와 `flags==AT_REMOVEDIR`(rmdir)만 지원하며, 그 외 플래그는 `EINVAL`을 반환합니다.
 

@@ -27,8 +27,20 @@ pub const SYS_STATFS: usize = 43;
 /// pipe2(pipefd, flags) -> int
 pub const SYS_PIPE2: usize = 59;
 
+/// epoll_create1(flags) -> epfd
+pub const SYS_EPOLL_CREATE1: usize = 20;
+
+/// epoll_ctl(epfd, op, fd, event) -> int
+pub const SYS_EPOLL_CTL: usize = 21;
+
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) -> int
+pub const SYS_EPOLL_PWAIT: usize = 22;
+
 /// getdents64(fd, dirp, count) -> int
 pub const SYS_GETDENTS64: usize = 61;
+
+/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask) -> int
+pub const SYS_PSELECT6: usize = 72;
 
 /// ppoll(fds, nfds, timeout, sigmask, sigsetsize) -> int
 pub const SYS_PPOLL: usize = 73;
@@ -243,7 +255,30 @@ pub fn syscall_handler(syscall_num: usize, args: [usize; 6]) -> isize {
         ),
         SYS_STATFS => fs::sys_statfs(args[0] as *const u8, args[1] as *mut u8),
         SYS_PIPE2 => fs::sys_pipe2(args[0] as *mut i32, args[1] as u32),
+        SYS_EPOLL_CREATE1 => fs::sys_epoll_create1(args[0] as u32),
+        SYS_EPOLL_CTL => fs::sys_epoll_ctl(
+            args[0] as i32,
+            args[1] as i32,
+            args[2] as i32,
+            args[3] as *const u8,
+        ),
+        SYS_EPOLL_PWAIT => fs::sys_epoll_pwait(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as i32,
+            args[3] as i32,
+            args[4] as *const u8,
+            args[5],
+        ),
         SYS_GETDENTS64 => fs::sys_getdents64(args[0] as i32, args[1] as *mut u8, args[2]),
+        SYS_PSELECT6 => fs::sys_pselect6(
+            args[0] as i32,
+            args[1] as *mut u8,
+            args[2] as *mut u8,
+            args[3] as *mut u8,
+            args[4] as *const u8,
+            args[5] as *const u8,
+        ),
         SYS_PPOLL => fs::sys_ppoll(
             args[0] as *mut u8,
             args[1],

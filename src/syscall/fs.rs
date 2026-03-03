@@ -58,8 +58,23 @@ const TCSETSF: usize = 0x5404;
 const PIPE_ALLOWED_FLAGS: u32 = 0x800 | 0x80000; // O_NONBLOCK | O_CLOEXEC
 const AT_REMOVEDIR: u32 = 0x200;
 const PPOLL_MAX_FDS: usize = 1024;
+const PSELECT_MAX_FDS: usize = 1024;
 const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
 const IOV_MAX: usize = 1024;
+const EPOLL_MAX_EVENTS: usize = 1024;
+
+const EPOLL_CLOEXEC: u32 = 0x80000;
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLL_CTL_MOD: i32 = 3;
+
+const EPOLLIN: u32 = 0x0001;
+const EPOLLPRI: u32 = 0x0002;
+const EPOLLOUT: u32 = 0x0004;
+const EPOLLERR: u32 = 0x0008;
+const EPOLLHUP: u32 = 0x0010;
+
+const LINUX_EPOLL_EVENT_SIZE: usize = 12;
 
 const POLLIN: i16 = 0x0001;
 const POLLPRI: i16 = 0x0002;
@@ -153,6 +168,19 @@ struct LinuxIovec {
     iov_len: usize,
 }
 
+#[derive(Clone, Copy)]
+struct EpollRegistration {
+    fd: i32,
+    events: u32,
+    data: u64,
+}
+
+struct EpollInstance {
+    watches: Vec<EpollRegistration>,
+}
+
+static EPOLL_INSTANCES: Mutex<Vec<(u64, i32, EpollInstance)>> = Mutex::new(Vec::new());
+
 const DT_UNKNOWN: u8 = 0;
 const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
@@ -194,6 +222,107 @@ fn current_cwd() -> String {
     match cwd.as_ref() {
         Some(path) if !path.is_empty() => path.clone(),
         _ => String::from("/"),
+    }
+}
+
+struct EpollVNode;
+
+impl fs::VNode for EpollVNode {
+    fn node_type(&self) -> VNodeType {
+        VNodeType::File
+    }
+
+    fn stat(&self) -> fs::VfsResult<fs::Stat> {
+        Ok(fs::Stat {
+            node_type: VNodeType::File,
+            mode: FileMode::new(0o600),
+            ..fs::Stat::default()
+        })
+    }
+}
+
+fn alloc_zeroed_user_buffer(len: usize) -> Result<Vec<u8>, isize> {
+    let mut out = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        return Err(errno::ENOMEM);
+    }
+    out.resize(len, 0);
+    Ok(out)
+}
+
+fn fdset_byte_len(nfds: usize) -> Result<usize, isize> {
+    nfds.checked_add(7)
+        .map(|v| v / 8)
+        .ok_or(errno::EINVAL)
+}
+
+fn fdset_is_set(set: &[u8], fd: usize) -> bool {
+    let byte = fd / 8;
+    let bit = fd % 8;
+    if byte >= set.len() {
+        return false;
+    }
+    set[byte] & (1u8 << bit) != 0
+}
+
+fn fdset_set(set: &mut [u8], fd: usize) {
+    let byte = fd / 8;
+    let bit = fd % 8;
+    if byte < set.len() {
+        set[byte] |= 1u8 << bit;
+    }
+}
+
+fn parse_timeout_timespec_deadline(timeout: *const u8) -> Result<Option<u64>, isize> {
+    if timeout.is_null() {
+        return Ok(None);
+    }
+
+    let ts = uaccess::read_unaligned(timeout as *const LinuxTimespec)?;
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(errno::EINVAL);
+    }
+    let timeout_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    Ok(Some(
+        crate::time::monotonic_now_ns().saturating_add(timeout_ns),
+    ))
+}
+
+fn read_linux_epoll_event(event: *const u8) -> Result<(u32, u64), isize> {
+    if event.is_null() {
+        return Err(errno::EFAULT);
+    }
+    let mut raw = [0u8; LINUX_EPOLL_EVENT_SIZE];
+    uaccess::copy_from_user(&mut raw, event)?;
+    let events = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let data = u64::from_ne_bytes([
+        raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+    ]);
+    Ok((events, data))
+}
+
+fn write_linux_epoll_event(dst: *mut u8, events: u32, data: u64) -> Result<(), isize> {
+    let mut raw = [0u8; LINUX_EPOLL_EVENT_SIZE];
+    raw[0..4].copy_from_slice(&events.to_ne_bytes());
+    raw[4..12].copy_from_slice(&data.to_ne_bytes());
+    uaccess::copy_to_user(dst, &raw)
+}
+
+fn epoll_instance_index(instances: &[(u64, i32, EpollInstance)], files_group: u64, epfd: i32) -> Option<usize> {
+    instances
+        .iter()
+        .position(|(group, owned_epfd, _)| *group == files_group && *owned_epfd == epfd)
+}
+
+fn epoll_cleanup_for_closed_fd(files_group: u64, fd: i32) {
+    let mut instances = EPOLL_INSTANCES.lock();
+    instances.retain(|(group, epfd, _)| !(*group == files_group && *epfd == fd));
+    for (group, _epfd, instance) in instances.iter_mut() {
+        if *group == files_group {
+            instance.watches.retain(|watch| watch.fd != fd);
+        }
     }
 }
 
@@ -691,7 +820,11 @@ pub fn sys_close(fd: i32) -> isize {
     match current_fd_table() {
         Ok(table) => {
             match table.close(fd) {
-                Ok(()) => 0,
+                Ok(()) => {
+                    let files_group = super::process::current_files_group();
+                    epoll_cleanup_for_closed_fd(files_group, fd);
+                    0
+                }
                 Err(e) => vfs_error_to_errno(e),
             }
         }
@@ -1230,20 +1363,9 @@ pub fn sys_ppoll(
         return errno::EFAULT;
     }
 
-    let timeout_deadline_ns = if timeout.is_null() {
-        None
-    } else {
-        let ts = match uaccess::read_unaligned(timeout as *const LinuxTimespec) {
-            Ok(ts) => ts,
-            Err(e) => return e,
-        };
-        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return errno::EINVAL;
-        }
-        let timeout_ns = (ts.tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec as u64);
-        Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
+    let timeout_deadline_ns = match parse_timeout_timespec_deadline(timeout) {
+        Ok(deadline) => deadline,
+        Err(e) => return e,
     };
 
     let pollfds = fds as usize;
@@ -1294,6 +1416,436 @@ pub fn sys_ppoll(
 
         if ready > 0 {
             return ready;
+        }
+
+        match timeout_deadline_ns {
+            Some(deadline_ns) => {
+                let now_ns = crate::time::monotonic_now_ns();
+                if now_ns >= deadline_ns {
+                    return 0;
+                }
+                let wake_reason = proc::sleep_current_until(deadline_ns);
+                if wake_reason == proc::SleepWakeReason::Signal {
+                    return errno::EINTR;
+                }
+            }
+            None => return 0,
+        }
+    }
+}
+
+/// sys_pselect6 - fd_set 기반 이벤트 대기
+///
+/// baseline:
+/// - readfds/writefds/exceptfds 모두 "요청된 valid FD는 즉시 ready" 모델을 사용한다.
+/// - invalid FD가 포함되면 `EBADF`를 반환한다.
+/// - sigmask(6번째 인자)는 현재 미사용이다.
+pub fn sys_pselect6(
+    nfds: i32,
+    readfds: *mut u8,
+    writefds: *mut u8,
+    exceptfds: *mut u8,
+    timeout: *const u8,
+    _sigmask_with_len: *const u8,
+) -> isize {
+    if nfds < 0 {
+        return errno::EINVAL;
+    }
+    let nfds = nfds as usize;
+    if nfds > PSELECT_MAX_FDS {
+        return errno::EINVAL;
+    }
+
+    let set_len = match fdset_byte_len(nfds) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+
+    let read_in = if readfds.is_null() {
+        None
+    } else {
+        let mut set = match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Err(e) = uaccess::copy_from_user(&mut set, readfds as *const u8) {
+            return e;
+        }
+        Some(set)
+    };
+    let write_in = if writefds.is_null() {
+        None
+    } else {
+        let mut set = match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Err(e) = uaccess::copy_from_user(&mut set, writefds as *const u8) {
+            return e;
+        }
+        Some(set)
+    };
+    let except_in = if exceptfds.is_null() {
+        None
+    } else {
+        let mut set = match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if let Err(e) = uaccess::copy_from_user(&mut set, exceptfds as *const u8) {
+            return e;
+        }
+        Some(set)
+    };
+
+    let mut read_out = if read_in.is_some() {
+        match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    let mut write_out = if write_in.is_some() {
+        match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    let mut except_out = if except_in.is_some() {
+        match alloc_zeroed_user_buffer(set_len) {
+            Ok(v) => Some(v),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+
+    let timeout_deadline_ns = match parse_timeout_timespec_deadline(timeout) {
+        Ok(deadline) => deadline,
+        Err(e) => return e,
+    };
+
+    loop {
+        if let Some(set) = read_out.as_mut() {
+            set.fill(0);
+        }
+        if let Some(set) = write_out.as_mut() {
+            set.fill(0);
+        }
+        if let Some(set) = except_out.as_mut() {
+            set.fill(0);
+        }
+
+        let table = match current_fd_table() {
+            Ok(t) => t,
+            Err(_) => return errno::EIO,
+        };
+
+        let mut ready = 0isize;
+        for fd in 0..nfds {
+            let watch_read = read_in
+                .as_ref()
+                .map(|set| fdset_is_set(set, fd))
+                .unwrap_or(false);
+            let watch_write = write_in
+                .as_ref()
+                .map(|set| fdset_is_set(set, fd))
+                .unwrap_or(false);
+            let watch_except = except_in
+                .as_ref()
+                .map(|set| fdset_is_set(set, fd))
+                .unwrap_or(false);
+
+            if !watch_read && !watch_write && !watch_except {
+                continue;
+            }
+
+            if table.get(fd as i32).is_err() {
+                return errno::EBADF;
+            }
+
+            let mut fd_ready = false;
+            if watch_read {
+                if let Some(set) = read_out.as_mut() {
+                    fdset_set(set, fd);
+                }
+                fd_ready = true;
+            }
+            if watch_write {
+                if let Some(set) = write_out.as_mut() {
+                    fdset_set(set, fd);
+                }
+                fd_ready = true;
+            }
+            if watch_except {
+                if let Some(set) = except_out.as_mut() {
+                    fdset_set(set, fd);
+                }
+                fd_ready = true;
+            }
+
+            if fd_ready {
+                ready += 1;
+            }
+        }
+
+        if ready > 0 {
+            if let Some(set) = read_out.as_ref() {
+                if let Err(e) = uaccess::copy_to_user(readfds, set) {
+                    return e;
+                }
+            }
+            if let Some(set) = write_out.as_ref() {
+                if let Err(e) = uaccess::copy_to_user(writefds, set) {
+                    return e;
+                }
+            }
+            if let Some(set) = except_out.as_ref() {
+                if let Err(e) = uaccess::copy_to_user(exceptfds, set) {
+                    return e;
+                }
+            }
+            return ready;
+        }
+
+        match timeout_deadline_ns {
+            Some(deadline_ns) => {
+                let now_ns = crate::time::monotonic_now_ns();
+                if now_ns >= deadline_ns {
+                    if let Some(set) = read_out.as_ref() {
+                        if let Err(e) = uaccess::copy_to_user(readfds, set) {
+                            return e;
+                        }
+                    }
+                    if let Some(set) = write_out.as_ref() {
+                        if let Err(e) = uaccess::copy_to_user(writefds, set) {
+                            return e;
+                        }
+                    }
+                    if let Some(set) = except_out.as_ref() {
+                        if let Err(e) = uaccess::copy_to_user(exceptfds, set) {
+                            return e;
+                        }
+                    }
+                    return 0;
+                }
+                let wake_reason = proc::sleep_current_until(deadline_ns);
+                if wake_reason == proc::SleepWakeReason::Signal {
+                    return errno::EINTR;
+                }
+            }
+            None => {
+                if let Some(set) = read_out.as_ref() {
+                    if let Err(e) = uaccess::copy_to_user(readfds, set) {
+                        return e;
+                    }
+                }
+                if let Some(set) = write_out.as_ref() {
+                    if let Err(e) = uaccess::copy_to_user(writefds, set) {
+                        return e;
+                    }
+                }
+                if let Some(set) = except_out.as_ref() {
+                    if let Err(e) = uaccess::copy_to_user(exceptfds, set) {
+                        return e;
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+}
+
+/// sys_epoll_create1 - epoll 인스턴스 생성
+pub fn sys_epoll_create1(flags: u32) -> isize {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return errno::EINVAL;
+    }
+
+    let table = match current_fd_table() {
+        Ok(t) => t,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let epoll_vnode: Arc<dyn fs::VNode> = Arc::new(EpollVNode);
+    let epoll_file = Arc::new(fd::OpenFile::new(
+        epoll_vnode,
+        OpenFlags::new(OpenFlags::O_RDWR),
+    ));
+    let epfd = match table.insert(epoll_file) {
+        Ok(fd) => fd,
+        Err(e) => return vfs_error_to_errno(e),
+    };
+
+    let files_group = super::process::current_files_group();
+    let mut instances = EPOLL_INSTANCES.lock();
+    instances.push((
+        files_group,
+        epfd,
+        EpollInstance {
+            watches: Vec::new(),
+        },
+    ));
+
+    epfd as isize
+}
+
+/// sys_epoll_ctl - epoll 관심 FD 등록/수정/삭제
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
+    if epfd < 0 || fd < 0 {
+        return errno::EBADF;
+    }
+    if epfd == fd {
+        return errno::EINVAL;
+    }
+
+    let table = match current_fd_table() {
+        Ok(t) => t,
+        Err(_) => return errno::EIO,
+    };
+    if table.get(epfd).is_err() || table.get(fd).is_err() {
+        return errno::EBADF;
+    }
+
+    let files_group = super::process::current_files_group();
+    let mut instances = EPOLL_INSTANCES.lock();
+    let idx = match epoll_instance_index(&instances, files_group, epfd) {
+        Some(idx) => idx,
+        None => return errno::EINVAL,
+    };
+    let instance = &mut instances[idx].2;
+
+    match op {
+        EPOLL_CTL_ADD => {
+            let (events, data) = match read_linux_epoll_event(event) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if instance.watches.iter().any(|watch| watch.fd == fd) {
+                return errno::EBUSY;
+            }
+            instance.watches.push(EpollRegistration { fd, events, data });
+            0
+        }
+        EPOLL_CTL_MOD => {
+            let (events, data) = match read_linux_epoll_event(event) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if let Some(watch) = instance.watches.iter_mut().find(|watch| watch.fd == fd) {
+                watch.events = events;
+                watch.data = data;
+                0
+            } else {
+                errno::ENOENT
+            }
+        }
+        EPOLL_CTL_DEL => {
+            let prev_len = instance.watches.len();
+            instance.watches.retain(|watch| watch.fd != fd);
+            if instance.watches.len() == prev_len {
+                errno::ENOENT
+            } else {
+                0
+            }
+        }
+        _ => errno::EINVAL,
+    }
+}
+
+/// sys_epoll_pwait - epoll 이벤트 대기
+///
+/// baseline:
+/// - `EPOLLIN/EPOLLPRI/EPOLLOUT` 요청 시 valid FD를 즉시 ready로 간주한다.
+/// - `sigmask/sigsetsize`는 현재 미사용이다.
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout: i32,
+    _sigmask: *const u8,
+    _sigsetsize: usize,
+) -> isize {
+    if epfd < 0 {
+        return errno::EBADF;
+    }
+    if events.is_null() {
+        return errno::EFAULT;
+    }
+    if maxevents <= 0 || maxevents as usize > EPOLL_MAX_EVENTS {
+        return errno::EINVAL;
+    }
+    if timeout < -1 {
+        return errno::EINVAL;
+    }
+
+    let maxevents = maxevents as usize;
+    let timeout_deadline_ns = if timeout == -1 {
+        None
+    } else {
+        let timeout_ns = (timeout as u64).saturating_mul(1_000_000);
+        Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
+    };
+
+    loop {
+        let table = match current_fd_table() {
+            Ok(t) => t,
+            Err(_) => return errno::EIO,
+        };
+
+        let files_group = super::process::current_files_group();
+        let watches = {
+            let instances = EPOLL_INSTANCES.lock();
+            let idx = match epoll_instance_index(&instances, files_group, epfd) {
+                Some(idx) => idx,
+                None => return errno::EINVAL,
+            };
+            instances[idx].2.watches.clone()
+        };
+
+        let mut ready = 0usize;
+        for watch in watches.iter() {
+            if ready >= maxevents {
+                break;
+            }
+
+            let mut revents = 0u32;
+            if table.get(watch.fd).is_err() {
+                revents |= EPOLLERR;
+            } else {
+                if watch.events & EPOLLIN != 0 {
+                    revents |= EPOLLIN;
+                }
+                if watch.events & EPOLLPRI != 0 {
+                    revents |= EPOLLPRI;
+                }
+                if watch.events & EPOLLOUT != 0 {
+                    revents |= EPOLLOUT;
+                }
+                if watch.events & EPOLLHUP != 0 {
+                    revents |= EPOLLHUP;
+                }
+            }
+
+            if revents == 0 {
+                continue;
+            }
+
+            let event_addr = match (events as usize).checked_add(ready * LINUX_EPOLL_EVENT_SIZE) {
+                Some(addr) => addr as *mut u8,
+                None => return errno::EFAULT,
+            };
+            if let Err(e) = write_linux_epoll_event(event_addr, revents, watch.data) {
+                return e;
+            }
+            ready += 1;
+        }
+
+        if ready > 0 {
+            return ready as isize;
         }
 
         match timeout_deadline_ns {

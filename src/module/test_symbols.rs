@@ -533,6 +533,70 @@ pub extern "C" fn kernel_sys_ppoll(
     ) as i64
 }
 
+/// pselect6 syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_pselect6(
+    nfds: i32,
+    readfds: *mut u8,
+    writefds: *mut u8,
+    exceptfds: *mut u8,
+    timeout: *const u8,
+    sigmask: *const u8,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_PSELECT6,
+        [
+            nfds as usize,
+            readfds as usize,
+            writefds as usize,
+            exceptfds as usize,
+            timeout as usize,
+            sigmask as usize,
+        ],
+    ) as i64
+}
+
+/// epoll_create1 syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_epoll_create1(flags: u32) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_EPOLL_CREATE1,
+        [flags as usize, 0, 0, 0, 0, 0],
+    ) as i64
+}
+
+/// epoll_ctl syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_EPOLL_CTL,
+        [epfd as usize, op as usize, fd as usize, event as usize, 0, 0],
+    ) as i64
+}
+
+/// epoll_pwait syscall 래퍼
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_sys_epoll_pwait(
+    epfd: i32,
+    events: *mut u8,
+    maxevents: i32,
+    timeout: i32,
+    sigmask: *const u8,
+    sigsetsize: usize,
+) -> i64 {
+    crate::syscall::syscall_handler(
+        crate::syscall::SYS_EPOLL_PWAIT,
+        [
+            epfd as usize,
+            events as usize,
+            maxevents as usize,
+            timeout as usize,
+            sigmask as usize,
+            sigsetsize,
+        ],
+    ) as i64
+}
+
 /// clock_gettime syscall 래퍼
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_sys_clock_gettime(clock_id: i32, tp: *mut u8) -> i64 {
@@ -861,6 +925,10 @@ pub fn register_test_symbols() {
     register_symbol("kernel_sys_readlinkat", kernel_sys_readlinkat as usize);
     register_symbol("kernel_sys_statfs", kernel_sys_statfs as usize);
     register_symbol("kernel_sys_ppoll", kernel_sys_ppoll as usize);
+    register_symbol("kernel_sys_pselect6", kernel_sys_pselect6 as usize);
+    register_symbol("kernel_sys_epoll_create1", kernel_sys_epoll_create1 as usize);
+    register_symbol("kernel_sys_epoll_ctl", kernel_sys_epoll_ctl as usize);
+    register_symbol("kernel_sys_epoll_pwait", kernel_sys_epoll_pwait as usize);
     register_symbol("kernel_sys_clock_gettime", kernel_sys_clock_gettime as usize);
     register_symbol("kernel_sys_clock_getres", kernel_sys_clock_getres as usize);
     register_symbol("kernel_sys_gettimeofday", kernel_sys_gettimeofday as usize);
@@ -899,5 +967,5 @@ pub fn register_test_symbols() {
     // Logging
     register_symbol("kernel_log", kernel_log as usize);
 
-    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 58);
+    crate::kprintln!("[symbol] Test symbols registered ({} symbols)", 62);
 }

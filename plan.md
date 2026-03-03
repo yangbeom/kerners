@@ -116,6 +116,9 @@
 | 번호 | 이름 | 상태 | 비고 |
 |------|------|------|------|
 | 17 | `getcwd` | ✅ 구현 | baseline 전역 cwd 반환 (NUL 포함 길이 반환, 버퍼 부족 시 `ERANGE`) |
+| 20 | `epoll_create1` | ✅ 구현 | baseline epoll 인스턴스 생성 (`EPOLL_CLOEXEC` 외 flags는 `EINVAL`) |
+| 21 | `epoll_ctl` | ✅ 구현 | baseline ADD/MOD/DEL (`epoll` 인스턴스 + watch set 관리) |
+| 22 | `epoll_pwait` | ✅ 구현 | baseline ready scan + timeout, `sigmask` 미사용 |
 | 23 | `dup` | ✅ 구현 | baseline FD 복제 |
 | 24 | `dup3` | ✅ 구현 | baseline, `O_CLOEXEC` no-op |
 | 25 | `fcntl` | ✅ 구현 | baseline (`F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD*`) |
@@ -132,6 +135,8 @@
 | 62 | `lseek` | ✅ 구현 | SEEK_SET/CUR/END |
 | 63 | `read` | ✅ 구현 | VFS + stdin 폴백 |
 | 64 | `write` | ✅ 구현 | VFS + stdout/stderr 폴백 |
+| 72 | `pselect6` | ✅ 구현 | baseline `fd_set` ready scan + timeout, `sigmask` 미사용 |
+| 73 | `ppoll` | ✅ 구현 | baseline `pollfd` ready scan + timeout, `sigmask` 미사용 |
 | 78 | `readlinkat` | ✅ 구현 | baseline: dirfd 무시, 경로 기반 symlink 대상 복사 |
 | 79 | `newfstatat` | ✅ 구현 | baseline 경로 stat (dirfd/flags 제한적) |
 | 80 | `fstat` | ✅ 구현 | Linux 호환 `struct stat` baseline |
@@ -604,14 +609,15 @@
 ### Phase 16: I/O 멀티플렉싱 및 IPC 확장 (중기)
 
 #### 16-1. I/O 멀티플렉싱
-- [ ] `sys_ppoll` (NR 73) — poll with timeout
-  - [ ] POLLIN, POLLOUT, POLLERR, POLLHUP 이벤트
-  - [ ] 파일/파이프/소켓 대기 큐
-- [ ] `sys_pselect6` (NR 72)
-- [ ] `sys_epoll_create1` (NR 20) / `sys_epoll_ctl` (NR 21) / `sys_epoll_pwait` (NR 22)
-  - [ ] epoll 인스턴스 (레드블랙 트리 또는 해시맵)
-  - [ ] Edge-triggered / Level-triggered 모드
-  - [ ] 대기 큐 연동
+- [x] `sys_ppoll` (NR 73) — poll with timeout (baseline ready scan)
+  - [x] POLLIN, POLLPRI, POLLOUT, POLLNVAL 이벤트 baseline
+  - [ ] 파일/파이프/소켓 대기 큐 (wakeup source 연동)
+- [x] `sys_pselect6` (NR 72) baseline 구현 (`fd_set` + timeout + `EBADF` 검증)
+- [x] `sys_epoll_create1` (NR 20) / `sys_epoll_ctl` (NR 21) / `sys_epoll_pwait` (NR 22) baseline 구현
+  - [x] epoll 인스턴스 + watch set 관리 (파일 그룹별)
+  - [ ] 완전한 edge-triggered/level-triggered 의미론 (`EPOLLET`, one-shot 등)
+  - [ ] 대기 큐 연동 (fd backend notifier 기반)
+  - [ ] `sigmask` 실사용/마스크 적용 (`pselect6`, `epoll_pwait`)
 
 #### 16-2. IPC 확장
 - [ ] `sys_pipe2` (NR 59) — 익명 파이프
@@ -626,6 +632,14 @@
   - [ ] FUTEX_WAKE — 대기자 깨우기
   - [ ] 유저스페이스 뮤텍스/컨디션변수의 기반
 - [ ] 테스트: `modules/test_pipe`, `modules/test_futex`
+
+#### 16-3. io_uring (별도 트랙)
+- [ ] `sys_io_uring_setup` (NR 425), `sys_io_uring_enter` (NR 426), `sys_io_uring_register` (NR 427) 최소 골격
+- [ ] SQ/CQ 링 버퍼 메모리 모델 (mmap 기반 공유 링)
+- [ ] 최소 opcode: `IORING_OP_NOP`, `IORING_OP_READV`, `IORING_OP_WRITEV`
+- [ ] 폴링/타임아웃 연동: `IORING_OP_POLL_ADD`, `IORING_OP_TIMEOUT`
+- [ ] 완료 경로(CQE) + 유저 wakeup 모델(eventfd/interruptless poll 중 1개 먼저 선택)
+- [ ] 수용 기준: 단일 스레드 submit/complete smoke + aarch64/riscv64 회귀
 
 ### Phase 17: 네트워킹 (장기)
 
