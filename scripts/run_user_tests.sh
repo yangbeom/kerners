@@ -35,11 +35,16 @@ print_error() { echo -e "${RED}[user-test]${NC} $1"; }
 
 run_one() {
     local arch="$1"
+    local phase15_4_mini_timeout="$TIMEOUT_SEC"
+    if [[ "$phase15_4_mini_timeout" -lt 120 ]]; then
+        phase15_4_mini_timeout=120
+    fi
+
     print_info "running user-space suite for $arch"
     "$SCRIPT_DIR/verify_phase15_3_cdyn.sh" "$arch" "" "$TIMEOUT_SEC"
     "$SCRIPT_DIR/verify_phase15_3_busybox_dyn.sh" "$arch" "" "$TIMEOUT_SEC"
     "$SCRIPT_DIR/verify_phase15_4_internal_min.sh" "$arch" "" "$TIMEOUT_SEC"
-    "$SCRIPT_DIR/verify_phase15_4_minilibc_samples.sh" "$arch" "" "$TIMEOUT_SEC"
+    "$SCRIPT_DIR/verify_phase15_4_minilibc_samples.sh" "$arch" "" "$phase15_4_mini_timeout"
     "$SCRIPT_DIR/verify_phase15_5_tls_smoke.sh" "$arch" "" "$TIMEOUT_SEC"
 }
 

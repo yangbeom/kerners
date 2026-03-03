@@ -1985,6 +1985,10 @@ fn has_unmasked_pending_signal(tid: proc::Tid) -> bool {
         .any(|signum| !signal_is_blocked(mask, signum))
 }
 
+pub fn has_unmasked_pending_signal_current() -> bool {
+    has_unmasked_pending_signal(current_tid_or_zero())
+}
+
 fn pop_pending_unmasked_signal(tid: proc::Tid) -> Option<u32> {
     let mut processes = PROCESS_INFOS.lock();
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
@@ -2001,6 +2005,17 @@ fn set_signal_mask_for_tid(tid: proc::Tid, mask: u64) {
     let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
     let unmaskable = signal_to_mask(SIGNAL_SIGKILL) | signal_to_mask(SIGNAL_SIGSTOP);
     processes[idx].signal_mask = mask & !unmaskable;
+}
+
+pub fn current_signal_mask_value() -> u64 {
+    let tid = current_tid_or_zero();
+    let mut processes = PROCESS_INFOS.lock();
+    let idx = ensure_process_info_for_tid_locked(&mut processes, tid);
+    processes[idx].signal_mask
+}
+
+pub fn set_current_signal_mask_value(mask: u64) {
+    set_signal_mask_for_tid(current_tid_or_zero(), mask);
 }
 
 fn reset_sigaltstack_for_tid(tid: proc::Tid) {

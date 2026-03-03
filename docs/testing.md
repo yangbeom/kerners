@@ -175,15 +175,20 @@ make test-kernel-riscv64
 # 커널 모듈 테스트만 양쪽 아키텍처 실행
 make test-all-kernel
 
-# 유저 영역 동적 hello 테스트만 양쪽 아키텍처 실행
+# 유저 테스트 스위트(phase15-3/15-4/15-5, iomux 포함) 양쪽 아키텍처 실행
 make test-user
 
-# 전체(커널 모듈 + 유저 영역 동적 hello) 양쪽 아키텍처 실행
+# 전체(커널 모듈 + 유저 테스트 스위트) 양쪽 아키텍처 실행
 make test-all
 
 # 스크립트 직접 실행 (타임아웃 지정)
 ./scripts/run_tests.sh aarch64 60   # 60초 타임아웃
 ```
+
+`make test-user`/`make test-all`의 유저 스위트에는 다음이 포함됩니다.
+- `phase15-3-cdyn` / `phase15-3-bbdyn`
+- `phase15-4-umin` / `phase15-4-mini` (`sample_iomux_smoke_dyn` 포함)
+- `phase15-5-tls`
 
 ### 결과 판정
 

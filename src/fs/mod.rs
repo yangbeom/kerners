@@ -22,6 +22,14 @@ pub mod fd;
 pub mod pipe;
 pub mod procfs;
 
+/// poll/epoll 이벤트 비트 (Linux 호환 공통 subset)
+pub type PollEvents = u32;
+pub const POLL_EVENT_IN: PollEvents = 0x0001;
+pub const POLL_EVENT_PRI: PollEvents = 0x0002;
+pub const POLL_EVENT_OUT: PollEvents = 0x0004;
+pub const POLL_EVENT_ERR: PollEvents = 0x0008;
+pub const POLL_EVENT_HUP: PollEvents = 0x0010;
+
 /// VFS 에러
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsError {
@@ -224,6 +232,30 @@ pub trait VNode: Send + Sync {
     /// 반환: 쓴 바이트 수
     fn write(&self, offset: usize, buf: &[u8]) -> VfsResult<usize> {
         Err(VfsError::NotSupported)
+    }
+
+    /// poll 이벤트 조회
+    ///
+    /// 기본 구현은 일반 파일/디렉토리/디바이스에 대해 요청된 읽기/쓰기 이벤트를
+    /// 즉시 준비 상태로 보고하고, 특수 동작이 필요한 노드는 override한다.
+    fn poll_events(&self, requested: PollEvents) -> VfsResult<PollEvents> {
+        let mut ready = 0;
+        match self.node_type() {
+            VNodeType::File
+            | VNodeType::Directory
+            | VNodeType::Symlink
+            | VNodeType::BlockDevice
+            | VNodeType::CharDevice => {
+                if requested & (POLL_EVENT_IN | POLL_EVENT_PRI) != 0 {
+                    ready |= requested & (POLL_EVENT_IN | POLL_EVENT_PRI);
+                }
+                if requested & POLL_EVENT_OUT != 0 {
+                    ready |= POLL_EVENT_OUT;
+                }
+            }
+            _ => {}
+        }
+        Ok(ready)
     }
 
     /// 파일 크기 조절

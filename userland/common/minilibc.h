@@ -9,6 +9,22 @@ struct ku_timespec {
     ku_s64 tv_nsec;
 };
 
+struct ku_pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+
+struct __attribute__((packed)) ku_epoll_event {
+    unsigned int events;
+    ku_u64 data;
+};
+
+struct ku_pselect_sigmask_arg {
+    ku_u64 sigmask;
+    ku_u64 sigsetsize;
+};
+
 enum {
     KU_AT_FDCWD = -100,
     KU_AT_REMOVEDIR = 0x200,
@@ -24,6 +40,21 @@ enum {
 
 enum {
     KU_CLOCK_MONOTONIC = 1,
+};
+
+enum {
+    KU_POLLIN = 0x0001,
+    KU_POLLOUT = 0x0004,
+};
+
+enum {
+    KU_EPOLL_CTL_ADD = 1,
+    KU_EPOLL_CTL_DEL = 2,
+    KU_EPOLL_CTL_MOD = 3,
+    KU_EPOLLIN = 0x0001,
+    KU_EPOLLOUT = 0x0004,
+    KU_EPOLLONESHOT = (1u << 30),
+    KU_EPOLLET = (1u << 31),
 };
 
 enum {
@@ -49,9 +80,35 @@ ku_s64 ku_openat(int dirfd, const char *path, ku_u64 flags, ku_u64 mode);
 ku_s64 ku_close(int fd);
 ku_s64 ku_read(int fd, void *buf, ku_u64 len);
 ku_s64 ku_write(int fd, const void *buf, ku_u64 len);
+ku_s64 ku_pipe2(int pipefd[2], ku_u64 flags);
 ku_s64 ku_getdents64(int fd, void *buf, ku_u64 len);
 ku_s64 ku_mkdirat(int dirfd, const char *path, ku_u64 mode);
 ku_s64 ku_unlinkat(int dirfd, const char *path, ku_u64 flags);
+ku_s64 ku_ppoll(
+    struct ku_pollfd *fds,
+    ku_u64 nfds,
+    const struct ku_timespec *timeout,
+    const ku_u64 *sigmask,
+    ku_u64 sigsetsize
+);
+ku_s64 ku_pselect6(
+    int nfds,
+    void *readfds,
+    void *writefds,
+    void *exceptfds,
+    const struct ku_timespec *timeout,
+    const struct ku_pselect_sigmask_arg *sigmask_arg
+);
+ku_s64 ku_epoll_create1(ku_u64 flags);
+ku_s64 ku_epoll_ctl(int epfd, int op, int fd, const struct ku_epoll_event *event);
+ku_s64 ku_epoll_pwait(
+    int epfd,
+    struct ku_epoll_event *events,
+    int maxevents,
+    int timeout_ms,
+    const ku_u64 *sigmask,
+    ku_u64 sigsetsize
+);
 ku_s64 ku_getpid(void);
 ku_s64 ku_getppid(void);
 ku_s64 ku_gettid(void);

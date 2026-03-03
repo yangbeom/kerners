@@ -50,6 +50,7 @@ pub struct ThreadSnapshot {
 pub enum SleepWakeReason {
     Timer,
     Signal,
+    Event,
 }
 
 /// sleep 대기 항목
@@ -507,6 +508,15 @@ pub fn wake_sleepers_by_timer(now_ns: u64) -> usize {
 
 /// 지정 스레드를 시그널 사유로 깨운다.
 pub fn wake_thread_for_signal(tid: Tid) -> bool {
+    wake_thread_with_reason(tid, SleepWakeReason::Signal)
+}
+
+/// 지정 스레드를 이벤트 사유로 깨운다.
+pub fn wake_thread_for_event(tid: Tid) -> bool {
+    wake_thread_with_reason(tid, SleepWakeReason::Event)
+}
+
+fn wake_thread_with_reason(tid: Tid, reason: SleepWakeReason) -> bool {
     let mut removed_from_sleep_queue = false;
     {
         let mut queue = SLEEP_QUEUE.lock();
@@ -524,7 +534,7 @@ pub fn wake_thread_for_signal(tid: Tid) -> bool {
             woke = true;
         }
         if woke {
-            record_sleep_wake_reason(tid, SleepWakeReason::Signal);
+            record_sleep_wake_reason(tid, reason);
         }
         woke
     } else {

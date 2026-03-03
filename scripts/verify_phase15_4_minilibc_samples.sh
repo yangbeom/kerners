@@ -49,13 +49,14 @@ run_one_arch() {
     local out_dir="$PROJECT_ROOT/target/user/$arch"
     local hello_bin="$out_dir/sample_hello_dyn"
     local smoke_bin="$out_dir/sample_syscall_smoke_dyn"
+    local iomux_bin="$out_dir/sample_iomux_smoke_dyn"
     local ld_bin="$out_dir/$ld_name"
     local disk_img="$PROJECT_ROOT/logs/phase15-4-mini-${arch}-${STAMP}.img"
     local run_log="$PROJECT_ROOT/logs/phase15-4-mini-${arch}-${STAMP}.log"
     local rcs_file="/tmp/phase15-4-mini-rcS-${arch}-${STAMP}"
 
-    if [[ ! -x "$hello_bin" || ! -x "$smoke_bin" || ! -x "$ld_bin" ]]; then
-        print_error "sample artifacts missing: $hello_bin / $smoke_bin / $ld_bin"
+    if [[ ! -x "$hello_bin" || ! -x "$smoke_bin" || ! -x "$iomux_bin" || ! -x "$ld_bin" ]]; then
+        print_error "sample artifacts missing: $hello_bin / $smoke_bin / $iomux_bin / $ld_bin"
         return 1
     fi
 
@@ -75,12 +76,15 @@ echo PH15_4_MINI_BEGIN
 echo PH15_4_HELLO_RC=$?
 /bin/sample_syscall_smoke_dyn
 echo PH15_4_SMOKE_RC=$?
+/bin/sample_iomux_smoke_dyn
+echo PH15_4_IOMUX_RC=$?
 echo PH15_4_MINI_END
 EOF
 
     mcopy -o -i "$disk_img" "$rcs_file" ::/etc/init.d/rcS >/dev/null
     mcopy -o -i "$disk_img" "$hello_bin" ::/bin/sample_hello_dyn >/dev/null
     mcopy -o -i "$disk_img" "$smoke_bin" ::/bin/sample_syscall_smoke_dyn >/dev/null
+    mcopy -o -i "$disk_img" "$iomux_bin" ::/bin/sample_iomux_smoke_dyn >/dev/null
     mcopy -o -i "$disk_img" "$ld_bin" "::/lib/$ld_name" >/dev/null
     rm -f "$rcs_file"
 
@@ -97,7 +101,7 @@ EOF
             stop_reason="done"
             break
         fi
-        if rg -q "MINILIBC_SMOKE_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
+        if rg -q "MINILIBC_SMOKE_FAIL_|MINILIBC_IOMUX_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|failed to start '/bin/sample_iomux_smoke_dyn'|Kernel panic|Kernels panic|panic|Unknown syscall|terminating by SIGSEGV" "$run_log" 2>/dev/null; then
             stop_reason="error"
             break
         fi
@@ -128,6 +132,9 @@ EOF
         "MINILIBC_SMOKE_BEGIN"
         "MINILIBC_SMOKE_OK"
         "PH15_4_SMOKE_RC=0"
+        "MINILIBC_IOMUX_BEGIN"
+        "MINILIBC_IOMUX_OK"
+        "PH15_4_IOMUX_RC=0"
         "PH15_4_MINI_END"
     )
 
@@ -139,7 +146,7 @@ EOF
         fi
     done
 
-    if rg -q "MINILIBC_SMOKE_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
+    if rg -q "MINILIBC_SMOKE_FAIL_|MINILIBC_IOMUX_FAIL_|failed to start '/bin/sample_hello_dyn'|failed to start '/bin/sample_syscall_smoke_dyn'|failed to start '/bin/sample_iomux_smoke_dyn'|Kernel panic|Kernels panic|Unknown syscall|terminating by SIGSEGV" "$phase_section_log"; then
         print_error "fatal marker detected in log ($arch)"
         failed=1
     fi

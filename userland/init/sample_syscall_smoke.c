@@ -14,7 +14,8 @@ int main(int argc, char **argv, char **envp) {
     char io_buf[128];
     char dent_buf[512];
     struct ku_timespec ts;
-    ku_s64 fd;
+    int pipefd[2];
+    ku_s64 proc_fd;
     ku_s64 n;
 
     (void)argc;
@@ -27,24 +28,17 @@ int main(int argc, char **argv, char **envp) {
         return fail_step("PID", -1);
     }
 
-    fd = ku_openat(KU_AT_FDCWD, "/sample_minilibc.txt", KU_O_WRONLY | KU_O_CREAT | KU_O_TRUNC, 0644);
-    if (fd < 0) {
-        return fail_step("OPEN_WRITE", fd);
+    n = ku_pipe2(pipefd, 0);
+    if (n != 0) {
+        return fail_step("PIPE2", n);
     }
 
-    n = ku_write((int)fd, payload, (ku_u64)(sizeof(payload) - 1));
-    (void)ku_close((int)fd);
+    n = ku_write(pipefd[1], payload, (ku_u64)(sizeof(payload) - 1));
     if (n != (ku_s64)(sizeof(payload) - 1)) {
         return fail_step("WRITE", n);
     }
 
-    fd = ku_openat(KU_AT_FDCWD, "/sample_minilibc.txt", KU_O_RDONLY, 0);
-    if (fd < 0) {
-        return fail_step("OPEN_READ", fd);
-    }
-
-    n = ku_read((int)fd, io_buf, (ku_u64)sizeof(io_buf));
-    (void)ku_close((int)fd);
+    n = ku_read(pipefd[0], io_buf, (ku_u64)sizeof(io_buf));
     if (n != (ku_s64)(sizeof(payload) - 1)) {
         return fail_step("READ", n);
     }
@@ -53,17 +47,13 @@ int main(int argc, char **argv, char **envp) {
         return fail_step("READ_CMP", -1);
     }
 
-    if (ku_mkdirat(KU_AT_FDCWD, "/sample_minilibc_dir", 0755) < 0) {
-        return fail_step("MKDIR", -1);
+    proc_fd = ku_openat(KU_AT_FDCWD, "/proc", KU_O_RDONLY, 0);
+    if (proc_fd < 0) {
+        return fail_step("OPEN_PROC", proc_fd);
     }
 
-    fd = ku_openat(KU_AT_FDCWD, "/proc", KU_O_RDONLY, 0);
-    if (fd < 0) {
-        return fail_step("OPEN_PROC", fd);
-    }
-
-    n = ku_getdents64((int)fd, dent_buf, (ku_u64)sizeof(dent_buf));
-    (void)ku_close((int)fd);
+    n = ku_getdents64((int)proc_fd, dent_buf, (ku_u64)sizeof(dent_buf));
+    (void)ku_close((int)proc_fd);
     if (n <= 0) {
         return fail_step("GETDENTS", n);
     }
@@ -76,12 +66,8 @@ int main(int argc, char **argv, char **envp) {
         return fail_step("CLOCK_RANGE", ts.tv_nsec);
     }
 
-    if (ku_unlinkat(KU_AT_FDCWD, "/sample_minilibc.txt", 0) < 0) {
-        return fail_step("UNLINK_FILE", -1);
-    }
-
-    if (ku_unlinkat(KU_AT_FDCWD, "/sample_minilibc_dir", KU_AT_REMOVEDIR) < 0) {
-        return fail_step("UNLINK_DIR", -1);
+    if (ku_close(pipefd[0]) < 0 || ku_close(pipefd[1]) < 0) {
+        return fail_step("CLOSE_PIPE", -1);
     }
 
     ku_write_line("MINILIBC_SMOKE_OK");

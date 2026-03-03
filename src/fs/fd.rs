@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::sync::RwLock;
 
-use super::{VfsError, VfsResult, VNode};
+use super::{PollEvents, VfsError, VfsResult, VNode};
 
 /// 표준 파일 디스크립터
 pub const STDIN_FD: i32 = 0;
@@ -158,6 +158,11 @@ impl OpenFile {
     /// 현재 오프셋
     pub fn tell(&self) -> u64 {
         *self.offset.read() as u64
+    }
+
+    /// 파일 디스크립터 poll 이벤트 조회
+    pub fn poll_events(&self, requested: PollEvents) -> VfsResult<PollEvents> {
+        self.vnode.poll_events(requested)
     }
 }
 

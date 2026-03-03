@@ -7,7 +7,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::console;
-use crate::fs::{self, VfsError, VNodeType, FileMode};
+use crate::fs::{
+    self, FileMode, PollEvents, VNodeType, VfsError, POLL_EVENT_ERR, POLL_EVENT_HUP, POLL_EVENT_IN,
+    POLL_EVENT_OUT, POLL_EVENT_PRI,
+};
 use crate::fs::fd::{self, OpenFlags, SeekFrom};
 use crate::proc;
 use crate::sync::Mutex;
@@ -67,6 +70,8 @@ const EPOLL_CLOEXEC: u32 = 0x80000;
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
+const EPOLLET: u32 = 1u32 << 31;
+const EPOLLONESHOT: u32 = 1u32 << 30;
 
 const EPOLLIN: u32 = 0x0001;
 const EPOLLPRI: u32 = 0x0002;
@@ -168,11 +173,20 @@ struct LinuxIovec {
     iov_len: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxPselectSigmaskArg {
+    sigmask: usize,
+    sigsetsize: usize,
+}
+
 #[derive(Clone, Copy)]
 struct EpollRegistration {
     fd: i32,
     events: u32,
     data: u64,
+    last_ready: u32,
+    oneshot_armed: bool,
 }
 
 struct EpollInstance {
@@ -180,6 +194,7 @@ struct EpollInstance {
 }
 
 static EPOLL_INSTANCES: Mutex<Vec<(u64, i32, EpollInstance)>> = Mutex::new(Vec::new());
+static POLL_WAITERS: Mutex<Vec<proc::Tid>> = Mutex::new(Vec::new());
 
 const DT_UNKNOWN: u8 = 0;
 const DT_FIFO: u8 = 1;
@@ -290,6 +305,191 @@ fn parse_timeout_timespec_deadline(timeout: *const u8) -> Result<Option<u64>, is
     ))
 }
 
+fn parse_relative_timeout_ms_deadline(timeout_ms: i32) -> Result<Option<u64>, isize> {
+    if timeout_ms < -1 {
+        return Err(errno::EINVAL);
+    }
+    if timeout_ms == -1 {
+        return Ok(None);
+    }
+    let timeout_ns = (timeout_ms as u64).saturating_mul(1_000_000);
+    Ok(Some(
+        crate::time::monotonic_now_ns().saturating_add(timeout_ns),
+    ))
+}
+
+fn parse_ppoll_sigmask(sigmask: *const u8, sigsetsize: usize) -> Result<Option<u64>, isize> {
+    if sigmask.is_null() {
+        return Ok(None);
+    }
+    if sigsetsize < core::mem::size_of::<u64>() {
+        return Err(errno::EINVAL);
+    }
+    let mask = uaccess::read_unaligned(sigmask as *const u64)?;
+    Ok(Some(mask))
+}
+
+fn parse_pselect_sigmask(sigmask_with_len: *const u8) -> Result<Option<u64>, isize> {
+    if sigmask_with_len.is_null() {
+        return Ok(None);
+    }
+    let arg = uaccess::read_unaligned(sigmask_with_len as *const LinuxPselectSigmaskArg)?;
+    if arg.sigmask == 0 {
+        return Ok(None);
+    }
+    if arg.sigsetsize < core::mem::size_of::<u64>() {
+        return Err(errno::EINVAL);
+    }
+    let mask = uaccess::read_unaligned(arg.sigmask as *const u64)?;
+    Ok(Some(mask))
+}
+
+fn mask_requested_for_fd(read: bool, write: bool, except: bool) -> PollEvents {
+    let mut mask = 0u32;
+    if read {
+        mask |= POLL_EVENT_IN;
+    }
+    if write {
+        mask |= POLL_EVENT_OUT;
+    }
+    if except {
+        mask |= POLL_EVENT_PRI | POLL_EVENT_ERR | POLL_EVENT_HUP;
+    }
+    mask
+}
+
+fn pollfd_events_to_mask(events: i16) -> PollEvents {
+    let mut requested = 0u32;
+    if events & POLLIN != 0 {
+        requested |= POLL_EVENT_IN;
+    }
+    if events & POLLPRI != 0 {
+        requested |= POLL_EVENT_PRI;
+    }
+    if events & POLLOUT != 0 {
+        requested |= POLL_EVENT_OUT;
+    }
+    requested
+}
+
+fn poll_mask_to_revents(mask: PollEvents) -> i16 {
+    let mut revents = 0i16;
+    if mask & POLL_EVENT_IN != 0 {
+        revents |= POLLIN;
+    }
+    if mask & POLL_EVENT_PRI != 0 {
+        revents |= POLLPRI;
+    }
+    if mask & POLL_EVENT_OUT != 0 {
+        revents |= POLLOUT;
+    }
+    if mask & POLL_EVENT_ERR != 0 {
+        revents |= POLLERR;
+    }
+    if mask & POLL_EVENT_HUP != 0 {
+        revents |= POLLHUP;
+    }
+    revents
+}
+
+fn poll_mask_to_epoll(mask: PollEvents) -> u32 {
+    let mut revents = 0u32;
+    if mask & POLL_EVENT_IN != 0 {
+        revents |= EPOLLIN;
+    }
+    if mask & POLL_EVENT_PRI != 0 {
+        revents |= EPOLLPRI;
+    }
+    if mask & POLL_EVENT_OUT != 0 {
+        revents |= EPOLLOUT;
+    }
+    if mask & POLL_EVENT_ERR != 0 {
+        revents |= EPOLLERR;
+    }
+    if mask & POLL_EVENT_HUP != 0 {
+        revents |= EPOLLHUP;
+    }
+    revents
+}
+
+fn epoll_interest_to_poll_mask(events: u32) -> PollEvents {
+    let mut mask = 0u32;
+    if events & EPOLLIN != 0 {
+        mask |= POLL_EVENT_IN;
+    }
+    if events & EPOLLPRI != 0 {
+        mask |= POLL_EVENT_PRI;
+    }
+    if events & EPOLLOUT != 0 {
+        mask |= POLL_EVENT_OUT;
+    }
+    mask
+}
+
+fn query_fd_events(table: &fd::FdTable, fd_num: i32, requested: PollEvents) -> Result<PollEvents, isize> {
+    let file = match table.get(fd_num) {
+        Ok(file) => file,
+        Err(_) => return Err(errno::EBADF),
+    };
+    let ready = match file.poll_events(requested | POLL_EVENT_ERR | POLL_EVENT_HUP) {
+        Ok(mask) => mask,
+        Err(e) => return Err(vfs_error_to_errno(e)),
+    };
+    Ok(ready)
+}
+
+fn register_current_poll_waiter() -> Option<proc::Tid> {
+    let tid = proc::current_tid()?;
+    let mut waiters = POLL_WAITERS.lock();
+    if !waiters.iter().any(|item| *item == tid) {
+        waiters.push(tid);
+    }
+    Some(tid)
+}
+
+fn unregister_poll_waiter(tid: proc::Tid) {
+    let mut waiters = POLL_WAITERS.lock();
+    if let Some(pos) = waiters.iter().position(|item| *item == tid) {
+        waiters.swap_remove(pos);
+    }
+}
+
+fn wake_poll_waiters() {
+    let tids = {
+        let waiters = POLL_WAITERS.lock();
+        waiters.clone()
+    };
+    for tid in tids {
+        let _ = proc::wake_thread_for_event(tid);
+    }
+}
+
+struct TemporarySignalMaskGuard {
+    old_mask: Option<u64>,
+}
+
+impl TemporarySignalMaskGuard {
+    fn from_optional_mask(new_mask: Option<u64>) -> Self {
+        if let Some(mask) = new_mask {
+            let old = super::process::current_signal_mask_value();
+            super::process::set_current_signal_mask_value(mask);
+            Self {
+                old_mask: Some(old),
+            }
+        } else {
+            Self { old_mask: None }
+        }
+    }
+}
+
+impl Drop for TemporarySignalMaskGuard {
+    fn drop(&mut self) {
+        if let Some(old) = self.old_mask {
+            super::process::set_current_signal_mask_value(old);
+        }
+    }
+}
+
 fn read_linux_epoll_event(event: *const u8) -> Result<(u32, u64), isize> {
     if event.is_null() {
         return Err(errno::EFAULT);
@@ -322,6 +522,32 @@ fn epoll_cleanup_for_closed_fd(files_group: u64, fd: i32) {
     for (group, _epfd, instance) in instances.iter_mut() {
         if *group == files_group {
             instance.watches.retain(|watch| watch.fd != fd);
+        }
+    }
+}
+
+fn refresh_epoll_et_state_for_fd(files_group: u64, fd: i32) {
+    let table = match fd::fd_table_for_group(files_group) {
+        Ok(table) => table,
+        Err(_) => return,
+    };
+
+    let mut instances = EPOLL_INSTANCES.lock();
+    for (group, _epfd, instance) in instances.iter_mut() {
+        if *group != files_group {
+            continue;
+        }
+        for watch in instance.watches.iter_mut() {
+            if watch.fd != fd || (watch.events & EPOLLET) == 0 {
+                continue;
+            }
+            let requested = epoll_interest_to_poll_mask(watch.events);
+            let ready_mask = match query_fd_events(table.as_ref(), watch.fd, requested) {
+                Ok(mask) => mask,
+                Err(e) if e == errno::EBADF => POLL_EVENT_ERR | POLL_EVENT_HUP,
+                Err(_) => continue,
+            };
+            watch.last_ready = poll_mask_to_epoll(ready_mask) & (watch.events | EPOLLERR | EPOLLHUP);
         }
     }
 }
@@ -467,6 +693,9 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> isize {
                     break;
                 }
             }
+            if total_written > 0 {
+                wake_poll_waiters();
+            }
             return total_written as isize;
         }
     }
@@ -497,6 +726,9 @@ pub fn sys_write(fd: usize, buf: *const u8, count: usize) -> isize {
                 };
                 console::putc(c);
                 written += 1;
+            }
+            if written > 0 {
+                wake_poll_waiters();
             }
             written as isize
         }
@@ -611,7 +843,12 @@ pub fn sys_read(fd: usize, buf: *mut u8, count: usize) -> isize {
                         return 0;
                     }
                     match uaccess::copy_to_user(buf, &tmp[..n]) {
-                        Ok(()) => return n as isize,
+                        Ok(()) => {
+                            let files_group = super::process::current_files_group();
+                            refresh_epoll_et_state_for_fd(files_group, fd as i32);
+                            wake_poll_waiters();
+                            return n as isize;
+                        }
                         Err(e) => return e,
                     }
                 }
@@ -823,6 +1060,7 @@ pub fn sys_close(fd: i32) -> isize {
                 Ok(()) => {
                     let files_group = super::process::current_files_group();
                     epoll_cleanup_for_closed_fd(files_group, fd);
+                    wake_poll_waiters();
                     0
                 }
                 Err(e) => vfs_error_to_errno(e),
@@ -1345,16 +1583,16 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
 
 /// sys_ppoll - 파일 디스크립터 이벤트 대기
 ///
-/// baseline:
-/// - POLLIN/POLLPRI/POLLOUT만 readiness를 보고한다.
-/// - timeout이 지정된 경우에만 sleep 대기한다.
-/// - sigmask/sigsetsize는 현재 미사용이다.
+/// 구현:
+/// - `POLLIN/POLLPRI/POLLOUT/POLLERR/POLLHUP/POLLNVAL` 반영
+/// - timeout `NULL`은 무기한 대기
+/// - `sigmask/sigsetsize` 임시 적용
 pub fn sys_ppoll(
     fds: *mut u8,
     nfds: usize,
     timeout: *const u8,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> isize {
     if nfds > PPOLL_MAX_FDS {
         return errno::EINVAL;
@@ -1367,11 +1605,20 @@ pub fn sys_ppoll(
         Ok(deadline) => deadline,
         Err(e) => return e,
     };
+    let temporary_sigmask = match parse_ppoll_sigmask(sigmask, sigsetsize) {
+        Ok(mask) => mask,
+        Err(e) => return e,
+    };
+    let _sigmask_guard = TemporarySignalMaskGuard::from_optional_mask(temporary_sigmask);
 
     let pollfds = fds as usize;
     let pollfd_size = core::mem::size_of::<LinuxPollFd>();
 
     loop {
+        if super::process::has_unmasked_pending_signal_current() {
+            return errno::EINTR;
+        }
+
         let table = match current_fd_table() {
             Ok(t) => t,
             Err(_) => return errno::EIO,
@@ -1390,18 +1637,15 @@ pub fn sys_ppoll(
             entry.revents = 0;
 
             if entry.fd >= 0 {
-                if table.get(entry.fd).is_err() {
-                    entry.revents = POLLNVAL;
-                } else {
-                    if entry.events & POLLIN != 0 {
-                        entry.revents |= POLLIN;
+                let requested = pollfd_events_to_mask(entry.events);
+                match query_fd_events(table.as_ref(), entry.fd, requested) {
+                    Ok(mask) => {
+                        entry.revents = poll_mask_to_revents(mask);
                     }
-                    if entry.events & POLLPRI != 0 {
-                        entry.revents |= POLLPRI;
+                    Err(e) if e == errno::EBADF => {
+                        entry.revents = POLLNVAL;
                     }
-                    if entry.events & POLLOUT != 0 {
-                        entry.revents |= POLLOUT;
-                    }
+                    Err(e) => return e,
                 }
             }
 
@@ -1424,29 +1668,46 @@ pub fn sys_ppoll(
                 if now_ns >= deadline_ns {
                     return 0;
                 }
+                let waiter_tid = register_current_poll_waiter();
                 let wake_reason = proc::sleep_current_until(deadline_ns);
-                if wake_reason == proc::SleepWakeReason::Signal {
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
+                }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
                     return errno::EINTR;
                 }
             }
-            None => return 0,
+            None => {
+                let waiter_tid = register_current_poll_waiter();
+                let wake_reason = proc::sleep_current_until(u64::MAX);
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
+                }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
+                    return errno::EINTR;
+                }
+            }
         }
     }
 }
 
 /// sys_pselect6 - fd_set 기반 이벤트 대기
 ///
-/// baseline:
-/// - readfds/writefds/exceptfds 모두 "요청된 valid FD는 즉시 ready" 모델을 사용한다.
-/// - invalid FD가 포함되면 `EBADF`를 반환한다.
-/// - sigmask(6번째 인자)는 현재 미사용이다.
+/// 구현:
+/// - fd_set 기반 read/write/except 이벤트 평가
+/// - timeout `NULL`은 무기한 대기
+/// - sigmask 인자(`struct { sigmask*, sigsetsize }`) 임시 적용
 pub fn sys_pselect6(
     nfds: i32,
     readfds: *mut u8,
     writefds: *mut u8,
     exceptfds: *mut u8,
     timeout: *const u8,
-    _sigmask_with_len: *const u8,
+    sigmask_with_len: *const u8,
 ) -> isize {
     if nfds < 0 {
         return errno::EINVAL;
@@ -1527,8 +1788,17 @@ pub fn sys_pselect6(
         Ok(deadline) => deadline,
         Err(e) => return e,
     };
+    let temporary_sigmask = match parse_pselect_sigmask(sigmask_with_len) {
+        Ok(mask) => mask,
+        Err(e) => return e,
+    };
+    let _sigmask_guard = TemporarySignalMaskGuard::from_optional_mask(temporary_sigmask);
 
     loop {
+        if super::process::has_unmasked_pending_signal_current() {
+            return errno::EINTR;
+        }
+
         if let Some(set) = read_out.as_mut() {
             set.fill(0);
         }
@@ -1563,24 +1833,29 @@ pub fn sys_pselect6(
                 continue;
             }
 
-            if table.get(fd as i32).is_err() {
-                return errno::EBADF;
-            }
+            let requested = mask_requested_for_fd(watch_read, watch_write, watch_except);
+            let ready_mask = match query_fd_events(table.as_ref(), fd as i32, requested) {
+                Ok(mask) => mask,
+                Err(e) if e == errno::EBADF => return errno::EBADF,
+                Err(e) => return e,
+            };
 
             let mut fd_ready = false;
-            if watch_read {
+            if watch_read && (ready_mask & POLL_EVENT_IN) != 0 {
                 if let Some(set) = read_out.as_mut() {
                     fdset_set(set, fd);
                 }
                 fd_ready = true;
             }
-            if watch_write {
+            if watch_write && (ready_mask & POLL_EVENT_OUT) != 0 {
                 if let Some(set) = write_out.as_mut() {
                     fdset_set(set, fd);
                 }
                 fd_ready = true;
             }
-            if watch_except {
+            if watch_except
+                && (ready_mask & (POLL_EVENT_PRI | POLL_EVENT_ERR | POLL_EVENT_HUP)) != 0
+            {
                 if let Some(set) = except_out.as_mut() {
                     fdset_set(set, fd);
                 }
@@ -1632,28 +1907,28 @@ pub fn sys_pselect6(
                     }
                     return 0;
                 }
+                let waiter_tid = register_current_poll_waiter();
                 let wake_reason = proc::sleep_current_until(deadline_ns);
-                if wake_reason == proc::SleepWakeReason::Signal {
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
+                }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
                     return errno::EINTR;
                 }
             }
             None => {
-                if let Some(set) = read_out.as_ref() {
-                    if let Err(e) = uaccess::copy_to_user(readfds, set) {
-                        return e;
-                    }
+                let waiter_tid = register_current_poll_waiter();
+                let wake_reason = proc::sleep_current_until(u64::MAX);
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
                 }
-                if let Some(set) = write_out.as_ref() {
-                    if let Err(e) = uaccess::copy_to_user(writefds, set) {
-                        return e;
-                    }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
+                    return errno::EINTR;
                 }
-                if let Some(set) = except_out.as_ref() {
-                    if let Err(e) = uaccess::copy_to_user(exceptfds, set) {
-                        return e;
-                    }
-                }
-                return 0;
             }
         }
     }
@@ -1727,7 +2002,13 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
             if instance.watches.iter().any(|watch| watch.fd == fd) {
                 return errno::EBUSY;
             }
-            instance.watches.push(EpollRegistration { fd, events, data });
+            instance.watches.push(EpollRegistration {
+                fd,
+                events,
+                data,
+                last_ready: 0,
+                oneshot_armed: true,
+            });
             0
         }
         EPOLL_CTL_MOD => {
@@ -1738,6 +2019,8 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
             if let Some(watch) = instance.watches.iter_mut().find(|watch| watch.fd == fd) {
                 watch.events = events;
                 watch.data = data;
+                watch.last_ready = 0;
+                watch.oneshot_armed = true;
                 0
             } else {
                 errno::ENOENT
@@ -1758,16 +2041,17 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const u8) -> isize {
 
 /// sys_epoll_pwait - epoll 이벤트 대기
 ///
-/// baseline:
-/// - `EPOLLIN/EPOLLPRI/EPOLLOUT` 요청 시 valid FD를 즉시 ready로 간주한다.
-/// - `sigmask/sigsetsize`는 현재 미사용이다.
+/// 구현:
+/// - level-triggered + edge-triggered(`EPOLLET`) 지원
+/// - timeout `-1`은 무기한 대기
+/// - `sigmask/sigsetsize` 임시 적용
 pub fn sys_epoll_pwait(
     epfd: i32,
     events: *mut u8,
     maxevents: i32,
     timeout: i32,
-    _sigmask: *const u8,
-    _sigsetsize: usize,
+    sigmask: *const u8,
+    sigsetsize: usize,
 ) -> isize {
     if epfd < 0 {
         return errno::EBADF;
@@ -1783,69 +2067,79 @@ pub fn sys_epoll_pwait(
     }
 
     let maxevents = maxevents as usize;
-    let timeout_deadline_ns = if timeout == -1 {
-        None
-    } else {
-        let timeout_ns = (timeout as u64).saturating_mul(1_000_000);
-        Some(crate::time::monotonic_now_ns().saturating_add(timeout_ns))
+    let timeout_deadline_ns = match parse_relative_timeout_ms_deadline(timeout) {
+        Ok(deadline) => deadline,
+        Err(e) => return e,
     };
+    let temporary_sigmask = match parse_ppoll_sigmask(sigmask, sigsetsize) {
+        Ok(mask) => mask,
+        Err(e) => return e,
+    };
+    let _sigmask_guard = TemporarySignalMaskGuard::from_optional_mask(temporary_sigmask);
 
     loop {
+        if super::process::has_unmasked_pending_signal_current() {
+            return errno::EINTR;
+        }
+
         let table = match current_fd_table() {
             Ok(t) => t,
             Err(_) => return errno::EIO,
         };
 
         let files_group = super::process::current_files_group();
-        let watches = {
-            let instances = EPOLL_INSTANCES.lock();
+        let mut ready_records: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut instances = EPOLL_INSTANCES.lock();
             let idx = match epoll_instance_index(&instances, files_group, epfd) {
                 Some(idx) => idx,
                 None => return errno::EINVAL,
             };
-            instances[idx].2.watches.clone()
-        };
 
-        let mut ready = 0usize;
-        for watch in watches.iter() {
-            if ready >= maxevents {
-                break;
+            for watch in instances[idx].2.watches.iter_mut() {
+                if ready_records.len() >= maxevents {
+                    break;
+                }
+                if (watch.events & EPOLLONESHOT) != 0 && !watch.oneshot_armed {
+                    continue;
+                }
+
+                let requested = epoll_interest_to_poll_mask(watch.events);
+                let ready_mask = match query_fd_events(table.as_ref(), watch.fd, requested) {
+                    Ok(mask) => mask,
+                    Err(e) if e == errno::EBADF => POLL_EVENT_ERR | POLL_EVENT_HUP,
+                    Err(e) => return e,
+                };
+                let current = poll_mask_to_epoll(ready_mask) & (watch.events | EPOLLERR | EPOLLHUP);
+
+                let emit = if (watch.events & EPOLLET) != 0 {
+                    current & !watch.last_ready
+                } else {
+                    current
+                };
+                watch.last_ready = current;
+
+                if emit != 0 {
+                    if (watch.events & EPOLLONESHOT) != 0 {
+                        watch.oneshot_armed = false;
+                    }
+                    ready_records.push((emit, watch.data));
+                }
             }
+        }
 
-            let mut revents = 0u32;
-            if table.get(watch.fd).is_err() {
-                revents |= EPOLLERR;
-            } else {
-                if watch.events & EPOLLIN != 0 {
-                    revents |= EPOLLIN;
-                }
-                if watch.events & EPOLLPRI != 0 {
-                    revents |= EPOLLPRI;
-                }
-                if watch.events & EPOLLOUT != 0 {
-                    revents |= EPOLLOUT;
-                }
-                if watch.events & EPOLLHUP != 0 {
-                    revents |= EPOLLHUP;
-                }
-            }
-
-            if revents == 0 {
-                continue;
-            }
-
-            let event_addr = match (events as usize).checked_add(ready * LINUX_EPOLL_EVENT_SIZE) {
+        for (idx, (mask, data)) in ready_records.iter().copied().enumerate() {
+            let event_addr = match (events as usize).checked_add(idx * LINUX_EPOLL_EVENT_SIZE) {
                 Some(addr) => addr as *mut u8,
                 None => return errno::EFAULT,
             };
-            if let Err(e) = write_linux_epoll_event(event_addr, revents, watch.data) {
+            if let Err(e) = write_linux_epoll_event(event_addr, mask, data) {
                 return e;
             }
-            ready += 1;
         }
 
-        if ready > 0 {
-            return ready as isize;
+        if !ready_records.is_empty() {
+            return ready_records.len() as isize;
         }
 
         match timeout_deadline_ns {
@@ -1854,12 +2148,29 @@ pub fn sys_epoll_pwait(
                 if now_ns >= deadline_ns {
                     return 0;
                 }
+                let waiter_tid = register_current_poll_waiter();
                 let wake_reason = proc::sleep_current_until(deadline_ns);
-                if wake_reason == proc::SleepWakeReason::Signal {
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
+                }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
                     return errno::EINTR;
                 }
             }
-            None => return 0,
+            None => {
+                let waiter_tid = register_current_poll_waiter();
+                let wake_reason = proc::sleep_current_until(u64::MAX);
+                if let Some(tid) = waiter_tid {
+                    unregister_poll_waiter(tid);
+                }
+                if wake_reason == proc::SleepWakeReason::Signal
+                    && super::process::has_unmasked_pending_signal_current()
+                {
+                    return errno::EINTR;
+                }
+            }
         }
     }
 }

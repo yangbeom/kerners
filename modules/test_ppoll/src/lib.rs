@@ -1,4 +1,4 @@
-//! ppoll(73) syscall 회귀 테스트 모듈
+//! ppoll/pselect6/epoll syscall 회귀 테스트 모듈
 
 #![no_std]
 #![no_main]
@@ -7,6 +7,16 @@ use core::panic::PanicInfo;
 
 unsafe extern "C" {
     fn kernel_print(s: *const u8, len: usize);
+    fn kernel_thread_spawn(
+        entry: extern "C" fn(usize),
+        arg: usize,
+        name: *const u8,
+        name_len: usize,
+    ) -> i32;
+    fn kernel_sleep_ticks(ticks: u32);
+    fn kernel_sys_pipe2(pipefd: *mut i32, flags: u32) -> i64;
+    fn kernel_sys_read(fd: i32, buf: *mut u8, len: usize) -> i64;
+    fn kernel_sys_write(fd: i32, buf: *const u8, len: usize) -> i64;
     fn kernel_sys_ppoll(
         fds: *mut u8,
         nfds: usize,
@@ -46,8 +56,11 @@ const POLLNVAL: i16 = 0x0020;
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
 const EPOLL_CTL_MOD: i32 = 3;
+
 const EPOLLIN: u32 = 0x0001;
 const EPOLLOUT: u32 = 0x0004;
+const EPOLLONESHOT: u32 = 1u32 << 30;
+const EPOLLET: u32 = 1u32 << 31;
 
 const FD_SET_BYTES: usize = 128;
 const EPOLL_EVENT_SIZE: usize = 12;
@@ -67,9 +80,22 @@ struct LinuxTimespec {
     tv_nsec: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxPselectSigmaskArg {
+    sigmask: usize,
+    sigsetsize: usize,
+}
+
 fn print(s: &str) {
     unsafe {
         kernel_print(s.as_ptr(), s.len());
+    }
+}
+
+fn close_fd(fd: i32) {
+    unsafe {
+        let _ = kernel_sys_close(fd);
     }
 }
 
@@ -98,6 +124,15 @@ fn decode_epoll_event(raw: &[u8; EPOLL_EVENT_SIZE]) -> (u32, u64) {
         raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
     ]);
     (events, data)
+}
+
+extern "C" fn delayed_pipe_writer(arg: usize) {
+    let fd = arg as i32;
+    let payload = [0x5Au8];
+    unsafe {
+        kernel_sleep_ticks(5);
+        let _ = kernel_sys_write(fd, payload.as_ptr(), payload.len());
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -184,7 +219,10 @@ pub extern "C" fn module_init() -> i32 {
         print("FAIL\n");
         return -4;
     }
-    if (fds[0].revents & POLLIN) == 0 || (fds[1].revents & POLLOUT) == 0 || (fds[2].revents & POLLOUT) == 0 {
+    if (fds[0].revents & POLLIN) == 0
+        || (fds[1].revents & POLLOUT) == 0
+        || (fds[2].revents & POLLOUT) == 0
+    {
         print("FAIL\n");
         return -5;
     }
@@ -236,6 +274,73 @@ pub extern "C" fn module_init() -> i32 {
     }
     print("PASS\n");
 
+    print("[test_ppoll] test: sigmask size validation -> EINVAL ... ");
+    let mut sigmask_dummy: u64 = 0;
+    let rc = unsafe {
+        kernel_sys_ppoll(
+            core::ptr::null_mut(),
+            0,
+            &zero_ts as *const LinuxTimespec as *const u8,
+            &mut sigmask_dummy as *mut u64 as *const u8,
+            4,
+        )
+    };
+    if rc != EINVAL {
+        print("FAIL\n");
+        return -8;
+    }
+    print("PASS\n");
+
+    print("[test_ppoll] test: blocking ppoll wakeup by pipe writer ... ");
+    let mut ppoll_pipe = [0i32; 2];
+    let rc = unsafe { kernel_sys_pipe2(ppoll_pipe.as_mut_ptr(), 0) };
+    if rc != 0 {
+        print("FAIL\n");
+        return -9;
+    }
+    let name = "ppw";
+    let tid = unsafe {
+        kernel_thread_spawn(
+            delayed_pipe_writer,
+            ppoll_pipe[1] as usize,
+            name.as_ptr(),
+            name.len(),
+        )
+    };
+    if tid <= 0 {
+        close_fd(ppoll_pipe[0]);
+        close_fd(ppoll_pipe[1]);
+        print("FAIL\n");
+        return -10;
+    }
+    let one_sec = LinuxTimespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    let mut wait_fd = [LinuxPollFd {
+        fd: ppoll_pipe[0],
+        events: POLLIN,
+        revents: 0,
+    }];
+    let rc = unsafe {
+        kernel_sys_ppoll(
+            wait_fd.as_mut_ptr().cast::<u8>(),
+            1,
+            &one_sec as *const LinuxTimespec as *const u8,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let mut read_buf = [0u8; 1];
+    let read_rc = unsafe { kernel_sys_read(ppoll_pipe[0], read_buf.as_mut_ptr(), read_buf.len()) };
+    close_fd(ppoll_pipe[0]);
+    close_fd(ppoll_pipe[1]);
+    if rc != 1 || (wait_fd[0].revents & POLLIN) == 0 || read_rc != 1 {
+        print("FAIL\n");
+        return -11;
+    }
+    print("PASS\n");
+
     print("[test_ppoll] === pselect6(72) Tests ===\n");
 
     print("[test_ppoll] test: nfds<0 -> EINVAL ... ");
@@ -251,7 +356,7 @@ pub extern "C" fn module_init() -> i32 {
     };
     if rc != EINVAL {
         print("FAIL\n");
-        return -8;
+        return -12;
     }
     print("PASS\n");
 
@@ -262,10 +367,6 @@ pub extern "C" fn module_init() -> i32 {
     fd_set(0, &mut readfds);
     fd_set(1, &mut writefds);
     fd_set(2, &mut exceptfds);
-    let zero_ts = LinuxTimespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
     let rc = unsafe {
         kernel_sys_pselect6(
             3,
@@ -278,7 +379,7 @@ pub extern "C" fn module_init() -> i32 {
     };
     if rc != 3 || !fd_isset(0, &readfds) || !fd_isset(1, &writefds) || !fd_isset(2, &exceptfds) {
         print("FAIL\n");
-        return -9;
+        return -13;
     }
     print("PASS\n");
 
@@ -297,7 +398,29 @@ pub extern "C" fn module_init() -> i32 {
     };
     if rc != EBADF {
         print("FAIL\n");
-        return -10;
+        return -14;
+    }
+    print("PASS\n");
+
+    print("[test_ppoll] test: pselect6 sigmask size validation -> EINVAL ... ");
+    let mut pselect_sigmask: u64 = 0;
+    let sigarg = LinuxPselectSigmaskArg {
+        sigmask: (&mut pselect_sigmask as *mut u64) as usize,
+        sigsetsize: 4,
+    };
+    let rc = unsafe {
+        kernel_sys_pselect6(
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &zero_ts as *const LinuxTimespec as *const u8,
+            &sigarg as *const LinuxPselectSigmaskArg as *const u8,
+        )
+    };
+    if rc != EINVAL {
+        print("FAIL\n");
+        return -15;
     }
     print("PASS\n");
 
@@ -307,25 +430,24 @@ pub extern "C" fn module_init() -> i32 {
     let rc = unsafe { kernel_sys_epoll_create1(1) };
     if rc != EINVAL {
         print("FAIL\n");
-        return -11;
+        return -16;
     }
     print("PASS\n");
 
     let epfd = unsafe { kernel_sys_epoll_create1(0) };
     if epfd < 0 {
         print("[test_ppoll] test: epoll_create1(0) ... FAIL\n");
-        return -12;
+        return -17;
     }
     let epfd = epfd as i32;
+
     print("[test_ppoll] test: epoll_ctl ADD + epoll_pwait ready ... ");
     let add_evt = encode_epoll_event(EPOLLOUT, 0x1122_3344_5566_7788u64);
     let rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_ADD, 1, add_evt.as_ptr()) };
     if rc != 0 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -13;
+        return -18;
     }
     let mut events = [[0u8; EPOLL_EVENT_SIZE]; 4];
     let rc = unsafe {
@@ -340,11 +462,9 @@ pub extern "C" fn module_init() -> i32 {
     };
     let (ev_mask, ev_data) = decode_epoll_event(&events[0]);
     if rc != 1 || (ev_mask & EPOLLOUT) == 0 || ev_data != 0x1122_3344_5566_7788u64 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -14;
+        return -19;
     }
     print("PASS\n");
 
@@ -352,11 +472,9 @@ pub extern "C" fn module_init() -> i32 {
     let mod_evt = encode_epoll_event(EPOLLIN, 0xAABB_CCDD_EEFF_0011u64);
     let rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_MOD, 1, mod_evt.as_ptr()) };
     if rc != 0 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -15;
+        return -20;
     }
     events = [[0u8; EPOLL_EVENT_SIZE]; 4];
     let rc = unsafe {
@@ -371,22 +489,18 @@ pub extern "C" fn module_init() -> i32 {
     };
     let (ev_mask, ev_data) = decode_epoll_event(&events[0]);
     if rc != 1 || (ev_mask & EPOLLIN) == 0 || ev_data != 0xAABB_CCDD_EEFF_0011u64 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -16;
+        return -21;
     }
     print("PASS\n");
 
     print("[test_ppoll] test: epoll_ctl DEL + timeout0 -> 0 ... ");
     let rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_DEL, 1, core::ptr::null()) };
     if rc != 0 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -17;
+        return -22;
     }
     events = [[0u8; EPOLL_EVENT_SIZE]; 4];
     let rc = unsafe {
@@ -400,17 +514,190 @@ pub extern "C" fn module_init() -> i32 {
         )
     };
     if rc != 0 {
+        close_fd(epfd);
         print("FAIL\n");
-        unsafe {
-            let _ = kernel_sys_close(epfd);
-        }
-        return -18;
+        return -23;
     }
     print("PASS\n");
 
-    unsafe {
-        let _ = kernel_sys_close(epfd);
+    print("[test_ppoll] test: epoll_pwait sigmask size validation -> EINVAL ... ");
+    let rc = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            &mut sigmask_dummy as *mut u64 as *const u8,
+            4,
+        )
+    };
+    if rc != EINVAL {
+        close_fd(epfd);
+        print("FAIL\n");
+        return -24;
     }
+    print("PASS\n");
+
+    print("[test_ppoll] test: epollet edge semantics on pipe ... ");
+    let mut edge_pipe = [0i32; 2];
+    let rc = unsafe { kernel_sys_pipe2(edge_pipe.as_mut_ptr(), 0) };
+    if rc != 0 {
+        close_fd(epfd);
+        print("FAIL\n");
+        return -25;
+    }
+    let edge_evt = encode_epoll_event(EPOLLIN | EPOLLET, 0xE1E2_E3E4_E5E6_E7E8u64);
+    let rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_ADD, edge_pipe[0], edge_evt.as_ptr()) };
+    if rc != 0 {
+        close_fd(edge_pipe[0]);
+        close_fd(edge_pipe[1]);
+        close_fd(epfd);
+        print("FAIL\n");
+        return -26;
+    }
+
+    events = [[0u8; EPOLL_EVENT_SIZE]; 4];
+    let rc0 = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let payload = [0x11u8];
+    let wr1 = unsafe { kernel_sys_write(edge_pipe[1], payload.as_ptr(), payload.len()) };
+    let rc1 = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let (edge_mask1, edge_data1) = decode_epoll_event(&events[0]);
+    let rc2 = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let mut edge_buf = [0u8; 1];
+    let rd1 = unsafe { kernel_sys_read(edge_pipe[0], edge_buf.as_mut_ptr(), edge_buf.len()) };
+    let wr2 = unsafe { kernel_sys_write(edge_pipe[1], payload.as_ptr(), payload.len()) };
+    let rc3 = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let del_edge = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_DEL, edge_pipe[0], core::ptr::null()) };
+    close_fd(edge_pipe[0]);
+    close_fd(edge_pipe[1]);
+    if rc0 != 0
+        || wr1 != 1
+        || rc1 != 1
+        || (edge_mask1 & EPOLLIN) == 0
+        || edge_data1 != 0xE1E2_E3E4_E5E6_E7E8u64
+        || rc2 != 0
+        || rd1 != 1
+        || wr2 != 1
+        || rc3 != 1
+        || del_edge != 0
+    {
+        close_fd(epfd);
+        print("FAIL\n");
+        return -27;
+    }
+    print("PASS\n");
+
+    print("[test_ppoll] test: epoll oneshot rearm semantics ... ");
+    let mut oneshot_pipe = [0i32; 2];
+    let rc = unsafe { kernel_sys_pipe2(oneshot_pipe.as_mut_ptr(), 0) };
+    if rc != 0 {
+        close_fd(epfd);
+        print("FAIL\n");
+        return -28;
+    }
+    let add_oneshot = encode_epoll_event(EPOLLIN | EPOLLONESHOT, 0x0102_0304_0506_0708u64);
+    let rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_ADD, oneshot_pipe[0], add_oneshot.as_ptr()) };
+    if rc != 0 {
+        close_fd(oneshot_pipe[0]);
+        close_fd(oneshot_pipe[1]);
+        close_fd(epfd);
+        print("FAIL\n");
+        return -29;
+    }
+
+    let wr = unsafe { kernel_sys_write(oneshot_pipe[1], payload.as_ptr(), payload.len()) };
+    events = [[0u8; EPOLL_EVENT_SIZE]; 4];
+    let rc_first = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let (oneshot_mask1, oneshot_data1) = decode_epoll_event(&events[0]);
+    let rc_second = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let mod_oneshot = encode_epoll_event(EPOLLIN | EPOLLONESHOT, 0x1020_3040_5060_7080u64);
+    let mod_rc = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_MOD, oneshot_pipe[0], mod_oneshot.as_ptr()) };
+    let rc_third = unsafe {
+        kernel_sys_epoll_pwait(
+            epfd,
+            events.as_mut_ptr().cast::<u8>(),
+            events.len() as i32,
+            0,
+            core::ptr::null(),
+            0,
+        )
+    };
+    let (oneshot_mask2, oneshot_data2) = decode_epoll_event(&events[0]);
+    let del_oneshot = unsafe { kernel_sys_epoll_ctl(epfd, EPOLL_CTL_DEL, oneshot_pipe[0], core::ptr::null()) };
+    close_fd(oneshot_pipe[0]);
+    close_fd(oneshot_pipe[1]);
+    if wr != 1
+        || rc_first != 1
+        || (oneshot_mask1 & EPOLLIN) == 0
+        || oneshot_data1 != 0x0102_0304_0506_0708u64
+        || rc_second != 0
+        || mod_rc != 0
+        || rc_third != 1
+        || (oneshot_mask2 & EPOLLIN) == 0
+        || oneshot_data2 != 0x1020_3040_5060_7080u64
+        || del_oneshot != 0
+    {
+        close_fd(epfd);
+        print("FAIL\n");
+        return -30;
+    }
+    print("PASS\n");
+
+    close_fd(epfd);
 
     print("[test_ppoll] All tests passed\n");
     0
@@ -428,7 +715,7 @@ pub extern "C" fn module_name() -> *const u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn module_version() -> *const u8 {
-    b"0.1.0\0".as_ptr()
+    b"0.2.0\0".as_ptr()
 }
 
 #[panic_handler]

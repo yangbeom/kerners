@@ -8,7 +8,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::Mutex;
 
-use super::{FileMode, Stat, VfsError, VfsResult, VNode, VNodeType};
+use super::{
+    FileMode, PollEvents, Stat, VfsError, VfsResult, VNode, VNodeType, POLL_EVENT_ERR,
+    POLL_EVENT_HUP, POLL_EVENT_IN, POLL_EVENT_OUT, POLL_EVENT_PRI,
+};
 
 const PIPE_CAPACITY: usize = 64 * 1024;
 
@@ -72,6 +75,18 @@ impl VNode for PipeReadEnd {
         Err(VfsError::PermissionDenied)
     }
 
+    fn poll_events(&self, requested: PollEvents) -> VfsResult<PollEvents> {
+        let mut ready = 0u32;
+        let buf = self.shared.buf.lock();
+        if requested & (POLL_EVENT_IN | POLL_EVENT_PRI) != 0 && !buf.is_empty() {
+            ready |= requested & (POLL_EVENT_IN | POLL_EVENT_PRI);
+        }
+        if self.shared.writers.load(Ordering::Acquire) == 0 {
+            ready |= POLL_EVENT_HUP;
+        }
+        Ok(ready)
+    }
+
     fn stat(&self) -> VfsResult<Stat> {
         let size = self.shared.buf.lock().len() as u64;
         Ok(Stat {
@@ -122,6 +137,20 @@ impl VNode for PipeWriteEnd {
             buf.push_back(*byte);
         }
         Ok(to_write)
+    }
+
+    fn poll_events(&self, requested: PollEvents) -> VfsResult<PollEvents> {
+        let mut ready = 0u32;
+        let readers = self.shared.readers.load(Ordering::Acquire);
+        let buf = self.shared.buf.lock();
+        if readers == 0 {
+            ready |= POLL_EVENT_ERR | POLL_EVENT_HUP;
+            return Ok(ready);
+        }
+        if requested & POLL_EVENT_OUT != 0 && buf.len() < PIPE_CAPACITY {
+            ready |= POLL_EVENT_OUT;
+        }
+        Ok(ready)
     }
 
     fn stat(&self) -> VfsResult<Stat> {

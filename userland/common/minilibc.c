@@ -1,10 +1,16 @@
 #include "minilibc.h"
 
+#define KU_SYS_EPOLL_CREATE1 20
+#define KU_SYS_EPOLL_CTL 21
+#define KU_SYS_EPOLL_PWAIT 22
 #define KU_SYS_OPENAT 56
 #define KU_SYS_CLOSE 57
+#define KU_SYS_PIPE2 59
 #define KU_SYS_READ 63
 #define KU_SYS_WRITE 64
 #define KU_SYS_GETDENTS64 61
+#define KU_SYS_PSELECT6 72
+#define KU_SYS_PPOLL 73
 #define KU_SYS_MKDIRAT 34
 #define KU_SYS_UNLINKAT 35
 #define KU_SYS_GETPID 172
@@ -81,6 +87,10 @@ ku_s64 ku_write(int fd, const void *buf, ku_u64 len) {
     return ku_raw_syscall6(KU_SYS_WRITE, (ku_u64)(ku_s64)fd, (ku_u64)buf, len, 0, 0, 0);
 }
 
+ku_s64 ku_pipe2(int pipefd[2], ku_u64 flags) {
+    return ku_raw_syscall6(KU_SYS_PIPE2, (ku_u64)pipefd, flags, 0, 0, 0, 0);
+}
+
 ku_s64 ku_getdents64(int fd, void *buf, ku_u64 len) {
     return ku_raw_syscall6(KU_SYS_GETDENTS64, (ku_u64)(ku_s64)fd, (ku_u64)buf, len, 0, 0, 0);
 }
@@ -91,6 +101,78 @@ ku_s64 ku_mkdirat(int dirfd, const char *path, ku_u64 mode) {
 
 ku_s64 ku_unlinkat(int dirfd, const char *path, ku_u64 flags) {
     return ku_raw_syscall6(KU_SYS_UNLINKAT, (ku_u64)(ku_s64)dirfd, (ku_u64)path, flags, 0, 0, 0);
+}
+
+ku_s64 ku_ppoll(
+    struct ku_pollfd *fds,
+    ku_u64 nfds,
+    const struct ku_timespec *timeout,
+    const ku_u64 *sigmask,
+    ku_u64 sigsetsize
+) {
+    return ku_raw_syscall6(
+        KU_SYS_PPOLL,
+        (ku_u64)fds,
+        nfds,
+        (ku_u64)timeout,
+        (ku_u64)sigmask,
+        sigsetsize,
+        0
+    );
+}
+
+ku_s64 ku_pselect6(
+    int nfds,
+    void *readfds,
+    void *writefds,
+    void *exceptfds,
+    const struct ku_timespec *timeout,
+    const struct ku_pselect_sigmask_arg *sigmask_arg
+) {
+    return ku_raw_syscall6(
+        KU_SYS_PSELECT6,
+        (ku_u64)(ku_s64)nfds,
+        (ku_u64)readfds,
+        (ku_u64)writefds,
+        (ku_u64)exceptfds,
+        (ku_u64)timeout,
+        (ku_u64)sigmask_arg
+    );
+}
+
+ku_s64 ku_epoll_create1(ku_u64 flags) {
+    return ku_raw_syscall6(KU_SYS_EPOLL_CREATE1, flags, 0, 0, 0, 0, 0);
+}
+
+ku_s64 ku_epoll_ctl(int epfd, int op, int fd, const struct ku_epoll_event *event) {
+    return ku_raw_syscall6(
+        KU_SYS_EPOLL_CTL,
+        (ku_u64)(ku_s64)epfd,
+        (ku_u64)(ku_s64)op,
+        (ku_u64)(ku_s64)fd,
+        (ku_u64)event,
+        0,
+        0
+    );
+}
+
+ku_s64 ku_epoll_pwait(
+    int epfd,
+    struct ku_epoll_event *events,
+    int maxevents,
+    int timeout_ms,
+    const ku_u64 *sigmask,
+    ku_u64 sigsetsize
+) {
+    return ku_raw_syscall6(
+        KU_SYS_EPOLL_PWAIT,
+        (ku_u64)(ku_s64)epfd,
+        (ku_u64)events,
+        (ku_u64)(ku_s64)maxevents,
+        (ku_u64)(ku_s64)timeout_ms,
+        (ku_u64)sigmask,
+        sigsetsize
+    );
 }
 
 ku_s64 ku_getpid(void) {
